@@ -1,7 +1,8 @@
 name: "Build deb packages (Debian trixie)"
 
 # Builds binary .deb packages for the core daemon and selected language
-# modules on Debian trixie, then publishes them as GitHub Release assets.
+# modules on Debian trixie, smoke-tests the installed packages, then
+# publishes them as GitHub Release assets.
 #
 #   * unit            - core daemon (njs + otel, built from pkg/contrib + rust)
 #   * unit-php8.3      - PHP 8.3 module (from deb.sury.org)
@@ -11,7 +12,8 @@ name: "Build deb packages (Debian trixie)"
 # Trigger manually (workflow_dispatch) to produce build artifacts, or push a
 # version tag to additionally attach the .deb files to the matching GitHub
 # Release. Tag patterns cover the upstream "X.Y.Z" scheme plus fork-specific
-# build/patch/revision suffixes (e.g. 1.35.5b-1).
+# build/patch/revision suffixes (e.g. 1.35.5b-1). The release job runs only
+# after the smoke test passes.
 
 on:
   workflow_dispatch:
@@ -32,6 +34,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies (incl. deb.sury.org PHP)
         env:
@@ -71,8 +75,107 @@ jobs:
           path: pkg/deb/debs/*.deb
           if-no-files-found: error
 
-  release:
+  smoke-test:
     needs: build-trixie
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+
+    steps:
+      - name: Download built .deb packages
+        uses: actions/download-artifact@v4
+        with:
+          name: freeunit-trixie-debs
+          path: debs
+
+      - name: Install built packages (incl. deb.sury.org PHP runtime)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          # Prevent maintainer scripts from trying to start the service:
+          # there is no init system in the build container.
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+          chmod +x /usr/sbin/policy-rc.d
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg lsb-release
+          curl -fsSL https://packages.sury.org/php/apt.gpg \
+            -o /usr/share/keyrings/sury-php.gpg
+          echo "deb [signed-by=/usr/share/keyrings/sury-php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" \
+            > /etc/apt/sources.list.d/sury-php.list
+          apt-get update
+          # apt pulls each package's runtime deps (libphp8.x-embed, python3.13)
+          # from the repos; the unit-r<ver> Provides/Depends chain resolves locally.
+          apt-get install -y --no-install-recommends ./debs/*.deb
+
+      - name: Serve a request through each module
+        run: |
+          set -eux
+
+          # Start the packaged daemon (compiled-in defaults: control socket at
+          # unix:/var/run/control.unit.sock, modules at /usr/lib/unit/modules).
+          /usr/sbin/unitd
+          for _ in $(seq 1 30); do
+            [ -S /var/run/control.unit.sock ] && break
+            sleep 0.5
+          done
+          test -S /var/run/control.unit.sock
+
+          # Minimal apps, one per module.
+          mkdir -p /tmp/php83 /tmp/php84 /tmp/py313
+          printf '<?php echo "OK-PHP-".PHP_VERSION;\n' > /tmp/php83/index.php
+          printf '<?php echo "OK-PHP-".PHP_VERSION;\n' > /tmp/php84/index.php
+          cat > /tmp/py313/wsgi.py <<'PY'
+          import sys
+
+
+          def application(environ, start_response):
+              start_response("200 OK", [("Content-Type", "text/plain")])
+              body = "OK-PY-%d.%d" % (sys.version_info[0], sys.version_info[1])
+              return [body.encode()]
+          PY
+          chmod -R a+rX /tmp/php83 /tmp/php84 /tmp/py313
+
+          # One config exercising all three modules; the versioned "php 8.x"
+          # type proves both PHP modules coexist and are selectable by version.
+          curl -fsS -X PUT --unix-socket /var/run/control.unit.sock \
+            --data-binary '{
+              "listeners": {
+                "*:8083": {"pass": "applications/php83"},
+                "*:8084": {"pass": "applications/php84"},
+                "*:8013": {"pass": "applications/py313"}
+              },
+              "applications": {
+                "php83": {"type": "php 8.3", "root": "/tmp/php83", "script": "index.php"},
+                "php84": {"type": "php 8.4", "root": "/tmp/php84", "script": "index.php"},
+                "py313": {"type": "python 3.13", "path": "/tmp/py313", "module": "wsgi"}
+              }
+            }' http://localhost/config
+
+          check() {
+            url=$1; want=$2; out=
+            for _ in $(seq 1 20); do
+              if out=$(curl -fsS "$url" 2>/dev/null) && printf '%s' "$out" | grep -q "$want"; then
+                echo "PASS $url -> $out"
+                return 0
+              fi
+              sleep 1
+            done
+            echo "FAIL $url (expected '$want'), last response: '${out:-<none>}'"
+            return 1
+          }
+
+          check http://localhost:8083/ OK-PHP-8.3
+          check http://localhost:8084/ OK-PHP-8.4
+          check http://localhost:8013/ OK-PY-3.13
+
+      - name: Dump unit log on failure
+        if: failure()
+        run: cat /var/log/unit.log || true
+
+  release:
+    needs: [build-trixie, smoke-test]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
