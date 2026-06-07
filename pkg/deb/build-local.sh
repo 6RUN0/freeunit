@@ -18,10 +18,10 @@
 #   -s         Smoke only — skip the build, test the existing pkg/deb/debs/*.deb.
 #   -c         Combined smoke — serve all modules from a single container
 #              instead of one isolated container per module. NOTE: the PHP embed
-#              SAPI exposes an unversioned libphp.so, so unit-php8.3 and
-#              unit-php8.4 cannot coexist in one instance; use -c only with a
-#              single PHP version (or python alone). Default is isolated, which
-#              is what CI does.
+#              SAPI exposes an unversioned libphp.so, so the unit-php8.x modules
+#              cannot coexist in one instance; use -c only with a single PHP
+#              version (or python alone). Default is isolated, which is what
+#              CI does.
 #   -k         Keep build state — skip the pre-build clean of generated
 #              artifacts (debuild*/debs/symlinks). Useful for incremental runs.
 #   -I IMAGE   Base image (default: debian:trixie).
@@ -71,6 +71,7 @@ SMOKE_MATRIX=(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+    "unit-php8.5|php|php|8085|OK-PHP-8.5"
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 info() { log "INFO  $*"; }
 warn() { log "WARN  $*"; }
@@ -114,9 +115,9 @@ fi
 
 # Build target list for the Makefile.
 if $MODULES_ONLY; then
-    BUILD_TARGETS="unit-php83 unit-php84 unit-python313"
+    BUILD_TARGETS="unit-php83 unit-php84 unit-php85 unit-python313"
 else
-    BUILD_TARGETS="unit unit-php83 unit-php84 unit-python313"
+    BUILD_TARGETS="unit unit-php83 unit-php84 unit-php85 unit-python313"
 fi
 
 info "============================================================"
@@ -145,12 +146,13 @@ git config --global --add safe.directory /unit 2>/dev/null || true
 if [ "$CLEAN" = "true" ]; then
     if [ "$MODULES_ONLY" = "true" ]; then
         rm -rf pkg/deb/debuild-* \
-               pkg/deb/unit-php83 pkg/deb/unit-php84 pkg/deb/unit-python313 \
+               pkg/deb/unit-php83 pkg/deb/unit-php84 pkg/deb/unit-php85 \
+               pkg/deb/unit-python313 \
                pkg/deb/check-build-depends-php83 \
                pkg/deb/check-build-depends-php84 \
                pkg/deb/check-build-depends-python313
         rm -f pkg/deb/debs/unit-php8.3* pkg/deb/debs/unit-php8.4* \
-              pkg/deb/debs/unit-python3.13*
+              pkg/deb/debs/unit-php8.5* pkg/deb/debs/unit-python3.13*
     else
         rm -rf pkg/deb/debuild pkg/deb/debuild-* pkg/deb/debs \
                pkg/deb/unit pkg/deb/unit-* pkg/deb/check-build-depends-*
@@ -178,6 +180,7 @@ echo "=== produced debs ==="
 ls -la pkg/deb/debs/
 EOS
 
+               pkg/deb/check-build-depends-php85 \
 # Isolated smoke script — one module next to the core. Consumes env:
 # MODULE, APP_KIND, APP_TYPE, PORT, EXPECT, VERSION.
 read -r -d '' SMOKE_ONE_SCRIPT <<'EOS' || true
@@ -200,6 +203,7 @@ apt-get install -y --no-install-recommends /debs/unit_*.deb "/debs/${MODULE}_${V
 /usr/sbin/unitd
 for _ in $(seq 1 30); do [ -S /var/run/control.unit.sock ] && break; sleep 0.5; done
 test -S /var/run/control.unit.sock
+    php8.5-dev libphp8.5-embed \
 
 mkdir -p /tmp/app
 if [ "$APP_KIND" = php ]; then
@@ -260,7 +264,7 @@ ls -la /usr/lib/unit/modules/ || true
 for _ in $(seq 1 30); do [ -S /var/run/control.unit.sock ] && break; sleep 0.5; done
 test -S /var/run/control.unit.sock
 
-mkdir -p /tmp/php83 /tmp/php84 /tmp/py313
+mkdir -p /tmp/php83 /tmp/php84 /tmp/php85 /tmp/py313
 printf '<?php echo "OK-PHP-".PHP_VERSION;\n' > /tmp/php83/index.php
 printf '<?php echo "OK-PHP-".PHP_VERSION;\n' > /tmp/php84/index.php
 cat > /tmp/py313/wsgi.py <<'PY'
@@ -272,7 +276,7 @@ def application(environ, start_response):
     body = "OK-PY-%d.%d" % (sys.version_info[0], sys.version_info[1])
     return [body.encode()]
 PY
-chmod -R a+rX /tmp/php83 /tmp/php84 /tmp/py313
+chmod -R a+rX /tmp/php83 /tmp/php84 /tmp/php85 /tmp/py313
 
 curl -fsS -X PUT --unix-socket /var/run/control.unit.sock \
     --data-binary '{
@@ -293,6 +297,7 @@ check() {
     for _ in $(seq 1 20); do
         if out=$(curl -fsS "$url" 2>/dev/null) && printf '%s' "$out" | grep -q "$want"; then
             echo "PASS $url -> $out"
+printf '<?php echo "OK-PHP-".PHP_VERSION;\n' > /tmp/php85/index.php
             return 0
         fi
         sleep 1
@@ -309,11 +314,13 @@ echo "ALL SMOKE CHECKS PASSED"
 EOS
 
 # ---------------------------------------------------------------------------
+        "*:8085": {"pass": "applications/php85"},
 # Build phase
 # ---------------------------------------------------------------------------
 if $DO_BUILD; then
     info "Building .deb packages (${BUILD_TARGETS}) ..."
     if $DRY_RUN; then
+        "php85": {"type": "php 8.5", "root": "/tmp/php85", "script": "index.php"},
         info "DRY-RUN: docker run --rm -v ${REPO_ROOT}:/unit -w /unit \\"
         info "         -e TARGETS=\"${BUILD_TARGETS}\" -e CLEAN=${CLEAN} -e MODULES_ONLY=${MODULES_ONLY} \\"
         info "         ${IMAGE} bash -s   <<< (build script)"
@@ -334,6 +341,7 @@ fi
 if $DO_SMOKE; then
     DEBS_DIR="${REPO_ROOT}/pkg/deb/debs"
     if ! $DRY_RUN && [[ ! -d "$DEBS_DIR" ]]; then
+check http://localhost:8085/ OK-PHP-8.5
         err "no debs directory at ${DEBS_DIR} — build first (drop -s)"; exit 1
     fi
 

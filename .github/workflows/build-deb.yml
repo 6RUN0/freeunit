@@ -7,6 +7,7 @@ name: "Build deb packages (Debian trixie)"
 #   * unit            - core daemon (njs + otel, built from pkg/contrib + rust)
 #   * unit-php8.3      - PHP 8.3 module (from deb.sury.org)
 #   * unit-php8.4      - PHP 8.4 module (from deb.sury.org)
+#   * unit-php8.5      - PHP 8.5 module (from deb.sury.org)
 #   * unit-python3.13  - Python 3.13 module (native trixie)
 #
 # Trigger manually (workflow_dispatch) to produce build artifacts, or push a
@@ -58,6 +59,7 @@ jobs:
             cargo rustc \
             php8.3-dev libphp8.3-embed \
             php8.4-dev libphp8.4-embed \
+            php8.5-dev libphp8.5-embed \
             python3.13-dev
 
       - name: Build .deb packages
@@ -65,7 +67,7 @@ jobs:
           set -eux
           # debuild would otherwise gate the build on lintian findings
           echo 'DEBUILD_LINTIAN=no' > "$HOME/.devscripts"
-          make -C pkg/deb unit unit-php83 unit-php84 unit-python313
+          make -C pkg/deb unit unit-php83 unit-php84 unit-php85 unit-python313
           ls -la pkg/deb/debs/
 
       - name: Upload .deb as workflow artifact
@@ -90,6 +92,7 @@ jobs:
         include:
           - { module: unit-php8.3,     kind: php, type: "php",          port: "8083", expect: "OK-PHP-8.3" }
           - { module: unit-php8.4,     kind: php, type: "php",          port: "8084", expect: "OK-PHP-8.4" }
+          - { module: unit-php8.5,     kind: php, type: "php",          port: "8085", expect: "OK-PHP-8.5" }
           - { module: unit-python3.13, kind: py,  type: "python 3.13",  port: "8013", expect: "OK-PY-3.13" }
 
     steps:
