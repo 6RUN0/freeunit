@@ -93,6 +93,12 @@ FreeUnit updated to 1.35.5.
 </para>
 </change>
 
+<change type="feature">
+<para>
+Debian trixie packages are now built for php8.3, php8.4 and python3.13.
+</para>
+</change>
+
 </changes>
 
 
