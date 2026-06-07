@@ -10,15 +10,17 @@ name: "Build deb packages (Debian trixie)"
 #   * unit-php8.5      - PHP 8.5 module (from deb.sury.org)
 #   * unit-python3.13  - Python 3.13 module (native trixie)
 #
-# Trigger manually (workflow_dispatch) to produce build artifacts, or push a
-# version tag to additionally attach the .deb files to the matching GitHub
-# Release. Tag patterns cover the upstream "X.Y.Z" scheme plus fork-specific
+# Trigger manually (workflow_dispatch) or by pushing one of the fork's
+# development branches to produce build artifacts, or push a version tag to
+# additionally attach the .deb files to the matching GitHub Release. Tag
+# patterns cover the upstream "X.Y.Z" scheme plus fork-specific
 # build/patch/revision suffixes (e.g. 1.35.5b-1). The release job runs only
 # after the smoke tests pass.
 
 on:
   workflow_dispatch:
   push:
+    branches: [ current, stable, develop ]
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
       - '[0-9]+.[0-9]+.[0-9]+[brp]-?[0-9]+'
