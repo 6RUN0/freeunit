@@ -36,6 +36,17 @@ jobs:
       image: debian:trixie
 
     steps:
+      # The debian:trixie image ships without git, so actions/checkout would
+      # fall back to the REST API and leave the workspace unpopulated. Install
+      # git first so checkout performs a real git checkout.
+      - name: Install git for actions/checkout
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd   # v5
         with:
           persist-credentials: false
