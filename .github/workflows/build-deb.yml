@@ -118,8 +118,10 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/sury-php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" \
             > /etc/apt/sources.list.d/sury-php.list
           apt-get update
-          # core + exactly one module (single PHP version per instance)
-          apt-get install -y --no-install-recommends ./debs/unit_*.deb "./debs/${MODULE}_1.35.5"*.deb
+          # core + exactly one module (single PHP version per instance).
+          # The artifact holds exactly one build's debs, so a version-agnostic
+          # glob installs the right pair without coupling to a literal version.
+          apt-get install -y --no-install-recommends ./debs/unit_*.deb "./debs/${MODULE}_"*.deb
 
           /usr/sbin/unitd
           for _ in $(seq 1 30); do [ -S /var/run/control.unit.sock ] && break; sleep 0.5; done
