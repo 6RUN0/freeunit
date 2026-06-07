@@ -81,6 +81,8 @@ endif
 # Debian 13
 ifeq ($(CODENAME),trixie)
 include Makefile.php
+include Makefile.php83
+include Makefile.php84
 include Makefile.python312
 include Makefile.python313
 include Makefile.go
