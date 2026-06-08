@@ -37,7 +37,7 @@ permissions:
 
 # sury mode for the build/smoke jobs. workflow_dispatch can override it; pushes
 # default to auto, which enables deb.sury.org only when a requested
-# libphpX.Y-embed is missing from base apt (see the setup_sury helper below).
+# libphpX.Y-embed is missing from base apt (see pkg/deb/sury-setup.sh).
 env:
   SURY: ${{ github.event.inputs.sury || 'auto' }}
 
@@ -68,40 +68,11 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -eux
+          . ./pkg/deb/sury-setup.sh
           apt-get update
-          # setup_sury <php versions> — enable deb.sury.org only when a requested
-          # libphpX.Y-embed is missing from base apt. Honors $SURY (auto|on|off).
-          setup_sury() {
-            local need="$1" mode="${SURY:-auto}" v cand missing=0
-            case "$mode" in
-              off) echo "sury: disabled"; return 0 ;;
-              on)  echo "sury: forced on" ;;
-              auto)
-                for v in $need; do
-                  cand=$(apt-cache policy "libphp${v}-embed" 2>/dev/null \
-                         | awk '/Candidate:/ {print $2}')
-                  if [ -z "$cand" ] || [ "$cand" = "(none)" ]; then
-                    echo "sury: libphp${v}-embed absent from base sources -> enabling"
-                    missing=1
-                  fi
-                done
-                [ "$missing" -eq 0 ] && { echo "sury: PHP runtimes already available"; return 0; } ;;
-              *) echo "sury: invalid SURY='$mode'" >&2; return 1 ;;
-            esac
-            apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
-            install -d /usr/share/keyrings
-            curl -fsSL https://packages.sury.org/php/apt.gpg \
-              -o /usr/share/keyrings/sury-php.gpg
-            cat > /etc/apt/sources.list.d/sury-php.sources <<SURYSRC
-          Types: deb
-          URIs: https://packages.sury.org/php/
-          Suites: $(lsb_release -sc)
-          Components: main
-          Signed-By: /usr/share/keyrings/sury-php.gpg
-          SURYSRC
-            apt-get update
-          }
-          setup_sury "8.3 8.4 8.5"
+          # Enable deb.sury.org only when a requested libphpX.Y-embed runtime is
+          # missing from base apt (honors $SURY: auto|on|off). See sury-setup.sh.
+          setup_sury_if_needed "8.3 8.4 8.5"
           apt-get install -y --no-install-recommends \
             build-essential debhelper devscripts fakeroot lintian \
             libxml2-utils xsltproc pkg-config git \
@@ -128,9 +99,10 @@ jobs:
           if-no-files-found: error
 
   # Each module is smoke-tested on its own clean container, installed next to
-  # the core only. This mirrors real usage: the PHP embed SAPI exposes an
-  # unversioned libphp.so, so unit-php8.3 and unit-php8.4 cannot run in the
-  # same instance — one PHP version per image.
+  # the core only. This mirrors real usage: each unit-php8.x package bundles its
+  # own PHP embed runtime (libphpX.Y-embed), and running several PHP embed
+  # runtimes in one Unit instance is unsupported, so we validate one PHP version
+  # per image.
   smoke-test:
     needs: build-trixie
     runs-on: ubuntu-latest
@@ -146,6 +118,21 @@ jobs:
           - { module: unit-python3.13, kind: py,  type: "python 3.13",  port: "8013", expect: "OK-PY-3.13" }
 
     steps:
+      # Need the repo for pkg/deb/sury-setup.sh (sourced by the run step below).
+      # As in build-trixie, install git first or checkout falls back to the REST
+      # API and leaves the workspace unpopulated.
+      - name: Install git for actions/checkout
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd   # v5
+        with:
+          persist-credentials: false
+
       - name: Download built .deb packages
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
         with:
@@ -162,47 +149,19 @@ jobs:
           EXPECT: ${{ matrix.expect }}
         run: |
           set -eux
+          . ./pkg/deb/sury-setup.sh
           # No init system in the container; stop maintainer scripts starting it.
           printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
           chmod +x /usr/sbin/policy-rc.d
           apt-get update
-          # setup_sury <php versions> — enable deb.sury.org only when a requested
-          # libphpX.Y-embed is missing from base apt. Honors $SURY (auto|on|off).
-          setup_sury() {
-            local need="$1" mode="${SURY:-auto}" v cand missing=0
-            case "$mode" in
-              off) echo "sury: disabled"; return 0 ;;
-              on)  echo "sury: forced on" ;;
-              auto)
-                for v in $need; do
-                  cand=$(apt-cache policy "libphp${v}-embed" 2>/dev/null \
-                         | awk '/Candidate:/ {print $2}')
-                  if [ -z "$cand" ] || [ "$cand" = "(none)" ]; then
-                    echo "sury: libphp${v}-embed absent from base sources -> enabling"
-                    missing=1
-                  fi
-                done
-                [ "$missing" -eq 0 ] && { echo "sury: PHP runtimes already available"; return 0; } ;;
-              *) echo "sury: invalid SURY='$mode'" >&2; return 1 ;;
-            esac
-            apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
-            install -d /usr/share/keyrings
-            curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
-            cat > /etc/apt/sources.list.d/sury-php.sources <<SURYSRC
-          Types: deb
-          URIs: https://packages.sury.org/php/
-          Suites: $(lsb_release -sc)
-          Components: main
-          Signed-By: /usr/share/keyrings/sury-php.gpg
-          SURYSRC
-            apt-get update
-          }
           # This module's PHP version (empty for python -> no sury).
           case "$MODULE" in
             unit-php*) NEED_PHP="${MODULE#unit-php}" ;;
             *)         NEED_PHP="" ;;
           esac
-          setup_sury "$NEED_PHP"
+          # Enable deb.sury.org only when libphp${NEED_PHP}-embed is missing from
+          # base apt (honors $SURY: auto|on|off). See sury-setup.sh.
+          setup_sury_if_needed "$NEED_PHP"
           # core + exactly one module (single PHP version per instance).
           # The artifact holds exactly one build's debs, so a version-agnostic
           # glob installs the right pair without coupling to a literal version.

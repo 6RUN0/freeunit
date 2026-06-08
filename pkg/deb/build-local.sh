@@ -2,8 +2,8 @@
 # build-local.sh — locally build and smoke-test the Debian trixie .deb packages,
 # mirroring .github/workflows/build-deb.yml (build-trixie + smoke-test jobs).
 #
-# It builds the core + php8.3 / php8.4 / python3.13 packages inside a clean
-# debian:trixie container (source mounted at /unit), then smoke-tests each
+# It builds the core + php8.3 / php8.4 / php8.5 / python3.13 packages inside a
+# clean debian:trixie container (source mounted at /unit), then smoke-tests each
 # module on its own fresh container — installing it next to the core only,
 # exactly as the workflow does. The container scripts are streamed over stdin,
 # so nothing is written to /tmp and there are no host-specific paths.
@@ -183,54 +183,16 @@ info "============================================================"
 # Container scripts (streamed over stdin; quoted heredocs — no host expansion)
 # ---------------------------------------------------------------------------
 
-# Shared shell functions prepended to every container script. Consumes env: SURY.
-read -r -d '' COMMON_FUNCS <<'EOS' || true
-# setup_sury_if_needed "<php versions, e.g. 8.3 8.4>" — enable deb.sury.org only
-# when a requested libphpX.Y-embed runtime is not already available from the base
-# apt sources. Honors SURY: auto (default, detect per version), on (always),
-# off (never). Debian trixie main ships a single PHP line, so multi-version PHP
-# normally needs sury; a release that carries the version natively makes auto a
-# no-op without touching this script.
-setup_sury_if_needed() {
-    local need="${1:-}" mode="${SURY:-auto}" v cand missing=0
-
-    case "$mode" in
-        off) echo "sury: disabled (SURY=off)"; return 0 ;;
-        on)  echo "sury: forced on (SURY=on)" ;;
-        auto)
-            for v in $need; do
-                cand=$(apt-cache policy "libphp${v}-embed" 2>/dev/null \
-                       | awk '/Candidate:/ {print $2}')
-                if [ -z "$cand" ] || [ "$cand" = "(none)" ]; then
-                    echo "sury: libphp${v}-embed absent from base sources -> enabling"
-                    missing=1
-                fi
-            done
-            if [ "$missing" -eq 0 ]; then
-                echo "sury: requested PHP runtimes already available -> not enabling"
-                return 0
-            fi ;;
-        *) echo "sury: invalid SURY='$mode' (auto|on|off)" >&2; return 1 ;;
-    esac
-
-    apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
-    install -d /usr/share/keyrings
-    curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
-    cat > /etc/apt/sources.list.d/sury-php.sources <<SURY
-Types: deb
-URIs: https://packages.sury.org/php/
-Suites: $(lsb_release -sc)
-Components: main
-Signed-By: /usr/share/keyrings/sury-php.gpg
-SURY
-    apt-get update
-}
-EOS
+# The deb.sury.org enablement helper (setup_sury_if_needed) lives in
+# pkg/deb/sury-setup.sh and is bind-mounted into every container at
+# /sury-setup.sh, then sourced at the top of each script below. Keeping it in one
+# file is what stops the CI workflow copy and this one from drifting apart.
 
 # Build script. Consumes env: TARGETS, CLEAN, MODULES_ONLY, SURY, NEED_PHP.
 read -r -d '' BUILD_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
+. /sury-setup.sh
 
 # git may run against the host-owned tree under a root container.
 git config --global --add safe.directory /unit 2>/dev/null || true
@@ -278,6 +240,7 @@ EOS
 read -r -d '' SMOKE_ONE_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
+. /sury-setup.sh
 
 # No init system in the container; stop maintainer scripts starting it.
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
@@ -336,6 +299,7 @@ EOS
 read -r -d '' SMOKE_ALL_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
+. /sury-setup.sh
 
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
@@ -404,11 +368,6 @@ check http://localhost:8013/ OK-PY-3.13
 echo "ALL SMOKE CHECKS PASSED"
 EOS
 
-# Prepend the shared functions to every container script.
-BUILD_SCRIPT="${COMMON_FUNCS}"$'\n'"${BUILD_SCRIPT}"
-SMOKE_ONE_SCRIPT="${COMMON_FUNCS}"$'\n'"${SMOKE_ONE_SCRIPT}"
-SMOKE_ALL_SCRIPT="${COMMON_FUNCS}"$'\n'"${SMOKE_ALL_SCRIPT}"
-
 # ---------------------------------------------------------------------------
 # Build phase
 # ---------------------------------------------------------------------------
@@ -416,12 +375,14 @@ if $DO_BUILD; then
     info "Building .deb packages (${BUILD_TARGETS}) ..."
     if $DRY_RUN; then
         info "DRY-RUN: docker run --rm -v ${REPO_ROOT}:/unit -w /unit \\"
+        info "         -v ${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro \\"
         info "         -e TARGETS=\"${BUILD_TARGETS}\" -e CLEAN=${CLEAN} -e MODULES_ONLY=${MODULES_ONLY} \\"
         info "         -e SURY=${SURY_MODE} -e NEED_PHP=\"${PHP_VERSIONS}\" \\"
         info "         ${IMAGE} bash -s   <<< (build script)"
     else
         printf '%s' "$BUILD_SCRIPT" | docker run --rm -i \
             -v "${REPO_ROOT}:/unit" -w /unit \
+            -v "${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro" \
             -e TARGETS="${BUILD_TARGETS}" \
             -e CLEAN="${CLEAN}" \
             -e MODULES_ONLY="${MODULES_ONLY}" \
@@ -445,11 +406,13 @@ if $DO_SMOKE; then
         info "Smoke-testing all modules in one container ..."
         if $DRY_RUN; then
             info "DRY-RUN: docker run --rm -v ${DEBS_DIR}:/debs:ro \\"
+            info "         -v ${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro \\"
             info "         -e SURY=${SURY_MODE} -e NEED_PHP=\"${PHP_VERSIONS}\" \\"
             info "         ${IMAGE} bash -s  <<< (combined smoke)"
         else
             printf '%s' "$SMOKE_ALL_SCRIPT" | docker run --rm -i \
                 -v "${DEBS_DIR}:/debs:ro" \
+                -v "${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro" \
                 -e SURY="${SURY_MODE}" \
                 -e NEED_PHP="${PHP_VERSIONS}" \
                 "${IMAGE}" bash -s
@@ -461,6 +424,7 @@ if $DO_SMOKE; then
             info "Smoke-testing ${module} (isolated) ..."
             if $DRY_RUN; then
                 info "DRY-RUN: docker run --rm -v ${DEBS_DIR}:/debs:ro \\"
+                info "         -v ${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro \\"
                 info "         -e MODULE=${module} -e APP_KIND=${kind} -e APP_TYPE=\"${type}\" \\"
                 info "         -e PORT=${port} -e EXPECT=${expect} -e VERSION=${VERSION} \\"
                 info "         -e SURY=${SURY_MODE} \\"
@@ -469,6 +433,7 @@ if $DO_SMOKE; then
             fi
             if printf '%s' "$SMOKE_ONE_SCRIPT" | docker run --rm -i \
                 -v "${DEBS_DIR}:/debs:ro" \
+                -v "${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro" \
                 -e MODULE="${module}" \
                 -e APP_KIND="${kind}" \
                 -e APP_TYPE="${type}" \
