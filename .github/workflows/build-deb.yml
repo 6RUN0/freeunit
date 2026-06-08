@@ -200,7 +200,85 @@ jobs:
           name: freeunit-trixie-debs
           path: debs
 
+      - name: Generate checksums and release notes
+        run: |
+          set -eux
+          # SHA256SUMS lists every published .deb; users verify with
+          # `sha256sum -c`. Paths are stored relative to debs/ so the
+          # checksum file works next to the downloaded packages.
+          ( cd debs && sha256sum -- *.deb > SHA256SUMS )
+          # The asset version (e.g. 1.35.5-1.trixie) is the .deb file
+          # name, which GitHub derives from the package version by
+          # replacing the '~' of "1.35.5-1~trixie" with a '.'.
+          core=(debs/unit_*_amd64.deb)
+          DEB="$(basename "${core[0]}" \
+            | sed -E 's#^unit_(.+)_amd64\.deb$#\1#')"
+          sed -e "s/@TAG@/${GITHUB_REF_NAME}/g" -e "s/@DEB@/${DEB}/g" \
+            > RELEASE_NOTES.md <<'NOTES'
+          ## Debian trixie packages
+
+          Binary `.deb` packages for FreeUnit on Debian **trixie**
+          (amd64 only): install the core daemon plus exactly one language
+          module — the PHP embed SAPI allows only one PHP version per
+          instance.
+
+          ### 1. Enable deb.sury.org (PHP modules only)
+
+          PHP modules depend on `libphpX.Y-embed` from deb.sury.org. Skip
+          this step if you only install the Python module.
+
+          ```bash
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg lsb-release
+          sudo curl -fsSL https://packages.sury.org/php/apt.gpg \
+            -o /usr/share/keyrings/sury-php.gpg
+          sudo tee /etc/apt/sources.list.d/sury-php.sources >/dev/null <<'SURY'
+          Types: deb
+          URIs: https://packages.sury.org/php/
+          Suites: $(lsb_release -sc)
+          Components: main
+          Signed-By: /usr/share/keyrings/sury-php.gpg
+          SURY
+          sudo apt-get update
+          ```
+
+          ### 2. Download, verify checksums, install
+
+          ```bash
+          DEB=@DEB@                 # version inside the .deb file names
+          MOD=php8.4                # php8.3 | php8.4 | php8.5 | python3.13
+          BASE="https://github.com/6RUN0/freeunit/releases/download/@TAG@"
+
+          curl -fLO "$BASE/SHA256SUMS"
+          curl -fLO "$BASE/unit_${DEB}_amd64.deb"
+          curl -fLO "$BASE/unit-${MOD}_${DEB}_amd64.deb"
+
+          sha256sum -c --ignore-missing SHA256SUMS
+          sudo apt-get install -y \
+            "./unit_${DEB}_amd64.deb" "./unit-${MOD}_${DEB}_amd64.deb"
+          ```
+
+          `sha256sum -c --ignore-missing` checks only the files you
+          downloaded and fails if any digest does not match.
+
+          ### 3. Run
+
+          ```bash
+          sudo systemctl enable --now unit
+          systemctl status unit
+          ```
+
+          Optional `-dbg` (debug symbols) and `-dev` packages are attached
+          to this release. `SHA256SUMS` provides integrity only, not
+          authenticity. The installed package version is `X.Y.Z-1~trixie`
+          (the `.` in the asset file name is GitHub's renaming of `~`).
+          NOTES
+
       - name: Attach .deb to GitHub Release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda   # v3.0.0
         with:
-          files: debs/*.deb
+          body_path: RELEASE_NOTES.md
+          files: |
+            debs/*.deb
+            debs/SHA256SUMS
