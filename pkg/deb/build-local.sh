@@ -29,6 +29,11 @@
 #              smoke-testing. Runs the removal inside a container as root, since
 #              the build writes those files as root into the mounted tree.
 #   -I IMAGE   Base image (default: debian:trixie).
+#   -S MODE    deb.sury.org PHP repo: auto (default) | on | off. In auto mode
+#              sury is enabled only when a requested libphpX.Y-embed runtime is
+#              missing from the base apt sources (Debian trixie main ships one
+#              PHP line, so multi-version PHP normally needs it). Use off to
+#              build against base sources only, on to force-enable.
 #   -n         Dry-run — print the docker commands, do not execute.
 #   -h         Show this help.
 #
@@ -40,7 +45,8 @@
 #   ./build-local.sh -C              # remove all generated artifacts and exit
 #   ./build-local.sh -n              # show what would run
 #
-# Requirements: docker, network access (apt + sury repo + Rust crates for otel).
+# Requirements: docker, network access (apt + Rust crates for otel, plus the
+# sury repo when it is enabled — see -S).
 # The build runs as root inside the container and writes generated artifacts
 # (debuild*/debs/) into the mounted tree; the default pre-build clean keeps
 # repeated runs reproducible.
@@ -62,6 +68,7 @@ COMBINED_SMOKE=false
 CLEAN=true
 CLEAN_ONLY=false
 DRY_RUN=false
+SURY_MODE="auto"
 
 # Read the version the Makefile will stamp into the .deb names.
 VERSION="$(grep -m1 '^NXT_VERSION=' "${REPO_ROOT}/version" | cut -d= -f2)"
@@ -74,6 +81,10 @@ SMOKE_MATRIX=(
     "unit-php8.5|php|php|8085|OK-PHP-8.5"
     "unit-python3.13|py|python 3.13|8013|OK-PY-3.13"
 )
+
+# PHP versions packaged here — drives the sury auto-detect (each needs a
+# matching libphpX.Y-embed runtime). Matches the php targets above.
+PHP_VERSIONS="8.3 8.4 8.5"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -91,7 +102,7 @@ usage() {
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-while getopts ":mBscCkI:nh" opt; do
+while getopts ":mBscCkI:S:nh" opt; do
     case $opt in
         m) MODULES_ONLY=true ;;
         B) DO_SMOKE=false ;;
@@ -100,12 +111,18 @@ while getopts ":mBscCkI:nh" opt; do
         C) CLEAN_ONLY=true ;;
         k) CLEAN=false ;;
         I) IMAGE="$OPTARG" ;;
+        S) SURY_MODE="$OPTARG" ;;
         n) DRY_RUN=true ;;
         h) usage ;;
         :) err "Option -$OPTARG requires an argument."; exit 1 ;;
        \?) err "Unknown option: -$OPTARG"; exit 1 ;;
     esac
 done
+
+case "$SURY_MODE" in
+    auto|on|off) ;;
+    *) err "invalid -S '$SURY_MODE' (expected auto|on|off)"; exit 1 ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks
@@ -157,6 +174,7 @@ info "  Version  : ${VERSION}"
 info "  Image    : ${IMAGE}"
 info "  Build    : ${DO_BUILD} (modules-only: ${MODULES_ONLY}, targets: ${BUILD_TARGETS})"
 info "  Smoke    : ${DO_SMOKE} (combined: ${COMBINED_SMOKE})"
+info "  Sury     : ${SURY_MODE} (php: ${PHP_VERSIONS})"
 info "  Clean    : ${CLEAN}"
 info "  Dry-run  : ${DRY_RUN}"
 info "============================================================"
@@ -165,7 +183,51 @@ info "============================================================"
 # Container scripts (streamed over stdin; quoted heredocs — no host expansion)
 # ---------------------------------------------------------------------------
 
-# Build script. Consumes env: TARGETS, CLEAN, MODULES_ONLY.
+# Shared shell functions prepended to every container script. Consumes env: SURY.
+read -r -d '' COMMON_FUNCS <<'EOS' || true
+# setup_sury_if_needed "<php versions, e.g. 8.3 8.4>" — enable deb.sury.org only
+# when a requested libphpX.Y-embed runtime is not already available from the base
+# apt sources. Honors SURY: auto (default, detect per version), on (always),
+# off (never). Debian trixie main ships a single PHP line, so multi-version PHP
+# normally needs sury; a release that carries the version natively makes auto a
+# no-op without touching this script.
+setup_sury_if_needed() {
+    local need="${1:-}" mode="${SURY:-auto}" v cand missing=0
+
+    case "$mode" in
+        off) echo "sury: disabled (SURY=off)"; return 0 ;;
+        on)  echo "sury: forced on (SURY=on)" ;;
+        auto)
+            for v in $need; do
+                cand=$(apt-cache policy "libphp${v}-embed" 2>/dev/null \
+                       | awk '/Candidate:/ {print $2}')
+                if [ -z "$cand" ] || [ "$cand" = "(none)" ]; then
+                    echo "sury: libphp${v}-embed absent from base sources -> enabling"
+                    missing=1
+                fi
+            done
+            if [ "$missing" -eq 0 ]; then
+                echo "sury: requested PHP runtimes already available -> not enabling"
+                return 0
+            fi ;;
+        *) echo "sury: invalid SURY='$mode' (auto|on|off)" >&2; return 1 ;;
+    esac
+
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
+    install -d /usr/share/keyrings
+    curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
+    cat > /etc/apt/sources.list.d/sury-php.sources <<SURY
+Types: deb
+URIs: https://packages.sury.org/php/
+Suites: $(lsb_release -sc)
+Components: main
+Signed-By: /usr/share/keyrings/sury-php.gpg
+SURY
+    apt-get update
+}
+EOS
+
+# Build script. Consumes env: TARGETS, CLEAN, MODULES_ONLY, SURY, NEED_PHP.
 read -r -d '' BUILD_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
@@ -191,16 +253,10 @@ if [ "$CLEAN" = "true" ]; then
 fi
 
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
-curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
-cat > /etc/apt/sources.list.d/sury-php.sources <<EOF
-Types: deb
-URIs: https://packages.sury.org/php/
-Suites: $(lsb_release -sc)
-Components: main
-Signed-By: /usr/share/keyrings/sury-php.gpg
-EOF
-apt-get update
+# ca-certificates is needed for the otel Rust crate fetch over https.
+apt-get install -y --no-install-recommends ca-certificates
+# Enable sury only when the requested PHP runtimes are missing from base apt.
+setup_sury_if_needed "${NEED_PHP:-8.3 8.4 8.5}"
 # Core needs the Rust toolchain (--otel); modules reuse the common core config
 # without it, but installing cargo/rustc unconditionally keeps this one path.
 apt-get install -y --no-install-recommends \
@@ -228,16 +284,12 @@ printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
-curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
-cat > /etc/apt/sources.list.d/sury-php.sources <<EOF
-Types: deb
-URIs: https://packages.sury.org/php/
-Suites: $(lsb_release -sc)
-Components: main
-Signed-By: /usr/share/keyrings/sury-php.gpg
-EOF
-apt-get update
+# Derive the PHP version this module needs (empty for python -> no sury).
+case "$MODULE" in
+    unit-php*) NEED_PHP="${MODULE#unit-php}" ;;
+    *)         NEED_PHP="" ;;
+esac
+setup_sury_if_needed "$NEED_PHP"
 # core + exactly one module (single PHP version per instance)
 apt-get install -y --no-install-recommends /debs/unit_*.deb "/debs/${MODULE}_${VERSION}"*.deb
 
@@ -289,16 +341,7 @@ printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
-curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
-cat > /etc/apt/sources.list.d/sury-php.sources <<EOF
-Types: deb
-URIs: https://packages.sury.org/php/
-Suites: $(lsb_release -sc)
-Components: main
-Signed-By: /usr/share/keyrings/sury-php.gpg
-EOF
-apt-get update
+setup_sury_if_needed "${NEED_PHP:-8.3 8.4 8.5}"
 apt-get install -y --no-install-recommends /debs/*.deb
 
 echo "=== installed unit packages ==="
@@ -361,6 +404,11 @@ check http://localhost:8013/ OK-PY-3.13
 echo "ALL SMOKE CHECKS PASSED"
 EOS
 
+# Prepend the shared functions to every container script.
+BUILD_SCRIPT="${COMMON_FUNCS}"$'\n'"${BUILD_SCRIPT}"
+SMOKE_ONE_SCRIPT="${COMMON_FUNCS}"$'\n'"${SMOKE_ONE_SCRIPT}"
+SMOKE_ALL_SCRIPT="${COMMON_FUNCS}"$'\n'"${SMOKE_ALL_SCRIPT}"
+
 # ---------------------------------------------------------------------------
 # Build phase
 # ---------------------------------------------------------------------------
@@ -369,6 +417,7 @@ if $DO_BUILD; then
     if $DRY_RUN; then
         info "DRY-RUN: docker run --rm -v ${REPO_ROOT}:/unit -w /unit \\"
         info "         -e TARGETS=\"${BUILD_TARGETS}\" -e CLEAN=${CLEAN} -e MODULES_ONLY=${MODULES_ONLY} \\"
+        info "         -e SURY=${SURY_MODE} -e NEED_PHP=\"${PHP_VERSIONS}\" \\"
         info "         ${IMAGE} bash -s   <<< (build script)"
     else
         printf '%s' "$BUILD_SCRIPT" | docker run --rm -i \
@@ -376,6 +425,8 @@ if $DO_BUILD; then
             -e TARGETS="${BUILD_TARGETS}" \
             -e CLEAN="${CLEAN}" \
             -e MODULES_ONLY="${MODULES_ONLY}" \
+            -e SURY="${SURY_MODE}" \
+            -e NEED_PHP="${PHP_VERSIONS}" \
             "${IMAGE}" bash -s
     fi
     info "Build phase done — debs in ${REPO_ROOT}/pkg/deb/debs/"
@@ -393,10 +444,15 @@ if $DO_SMOKE; then
     if $COMBINED_SMOKE; then
         info "Smoke-testing all modules in one container ..."
         if $DRY_RUN; then
-            info "DRY-RUN: docker run --rm -v ${DEBS_DIR}:/debs:ro ${IMAGE} bash -s  <<< (combined smoke)"
+            info "DRY-RUN: docker run --rm -v ${DEBS_DIR}:/debs:ro \\"
+            info "         -e SURY=${SURY_MODE} -e NEED_PHP=\"${PHP_VERSIONS}\" \\"
+            info "         ${IMAGE} bash -s  <<< (combined smoke)"
         else
             printf '%s' "$SMOKE_ALL_SCRIPT" | docker run --rm -i \
-                -v "${DEBS_DIR}:/debs:ro" "${IMAGE}" bash -s
+                -v "${DEBS_DIR}:/debs:ro" \
+                -e SURY="${SURY_MODE}" \
+                -e NEED_PHP="${PHP_VERSIONS}" \
+                "${IMAGE}" bash -s
         fi
     else
         FAILED=()
@@ -407,6 +463,7 @@ if $DO_SMOKE; then
                 info "DRY-RUN: docker run --rm -v ${DEBS_DIR}:/debs:ro \\"
                 info "         -e MODULE=${module} -e APP_KIND=${kind} -e APP_TYPE=\"${type}\" \\"
                 info "         -e PORT=${port} -e EXPECT=${expect} -e VERSION=${VERSION} \\"
+                info "         -e SURY=${SURY_MODE} \\"
                 info "         ${IMAGE} bash -s   <<< (isolated smoke)"
                 continue
             fi
@@ -418,6 +475,7 @@ if $DO_SMOKE; then
                 -e PORT="${port}" \
                 -e EXPECT="${expect}" \
                 -e VERSION="${VERSION}" \
+                -e SURY="${SURY_MODE}" \
                 "${IMAGE}" bash -s; then
                 info "${module}: PASS"
             else
