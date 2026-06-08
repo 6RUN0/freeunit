@@ -19,27 +19,36 @@ curated set of language modules:
 | Package | Contents |
 |---------|----------|
 | `unit` | core daemon with njs and OTel |
-| `unit-php8.3` | PHP 8.3 module (from deb.sury.org) |
-| `unit-php8.4` | PHP 8.4 module (from deb.sury.org) |
-| `unit-php8.5` | PHP 8.5 module (from deb.sury.org) |
+| `unit-php8.3` | PHP 8.3 module (runtime from deb.sury.org) |
+| `unit-php8.4` | PHP 8.4 module (runtime native to trixie) |
+| `unit-php8.5` | PHP 8.5 module (runtime from deb.sury.org) |
 | `unit-python3.13` | Python 3.13 module (native trixie) |
 
 The packaging lives in `pkg/deb/` — one `Makefile.<lang><version>` per module,
 included from `pkg/deb/Makefile` under the `trixie` codename, following the
-upstream packaging convention. The PHP embed SAPI exposes an unversioned
-`libphp.so`, so only one PHP version can run in a single instance; each module
-is therefore built and smoke-tested independently.
+upstream packaging convention. Each `unit-phpX.Y` package bundles its own PHP
+embed runtime (`libphpX.Y-embed`), and running several PHP embed runtimes in one
+Unit instance is unsupported, so each module is built and smoke-tested
+independently — one PHP version per instance.
 
-**PHP comes from deb.sury.org.** Debian trixie ships a single PHP version
-(8.4) in its main archive, so the 8.3 and 8.5 modules cannot be built against
-it. All three PHP modules are therefore built against
+**Where PHP comes from.** Debian trixie ships a single PHP line — **8.4** — in
+its main archive, so `unit-php8.4` resolves its `libphp8.4-embed` runtime
+natively. The 8.3 and 8.5 lines are absent from trixie; those modules depend on
+`libphp8.3-embed` / `libphp8.5-embed` from
 [deb.sury.org](https://deb.sury.org) — Ondřej Surý's long-standing PHP
-packaging, which carries every maintained PHP line in parallel — keeping the
-modules on one consistent runtime source. Each `unit-phpX.Y` package declares
-a runtime dependency on the matching `libphpX.Y-embed` from that repository,
-so deb.sury.org must be enabled on the target host before installing a PHP
-module. The Python 3.13 module uses trixie's native `python3.13` and needs no
-extra repository.
+packaging, which carries every maintained PHP line in parallel. The build
+enables deb.sury.org **only when a requested `libphpX.Y-embed` is absent from
+the base apt sources**; that logic lives in one place, `pkg/deb/sury-setup.sh`,
+shared by CI and the local build script and tunable with `SURY=auto|on|off`
+(default `auto`). When enabled, deb.sury.org is pinned above the Debian archive
+so the build resolves every PHP line from one consistent source deterministically
+(this only affects 8.4, the line trixie also carries); because each `unit-phpX.Y`
+declares its runtime dependency by package name without a version, the pin stays
+a build-time detail and never changes what users install. On the target host,
+deb.sury.org must therefore be enabled before installing the 8.3 or 8.5 module —
+`php8.4` resolves `libphp8.4-embed` from trixie and needs nothing extra. The
+Python 3.13 module uses trixie's native `python3.13` and needs no extra
+repository either.
 
 ## Installing the packages
 
@@ -49,11 +58,12 @@ The packages are published as assets on each
 on **amd64** only. Install the core daemon plus exactly one language module —
 the PHP embed SAPI allows only one PHP version per instance.
 
-### Enable deb.sury.org (PHP modules only)
+### Enable deb.sury.org (PHP 8.3 / 8.5 only)
 
-First enable deb.sury.org so apt can resolve the PHP runtime dependency
-(`libphpX.Y-embed`). Skip this step if you only install the Python module.
-Trixie uses the deb822 `.sources` format:
+The `libphp8.3-embed` / `libphp8.5-embed` runtimes live in deb.sury.org, so
+enable it before installing the 8.3 or 8.5 module. **Skip this step for
+`php8.4`** (native to trixie) **or the Python module.** Trixie uses the deb822
+`.sources` format:
 
 ```bash
 sudo apt-get update
@@ -75,8 +85,8 @@ sudo apt-get update
 
 The snippet below resolves the latest release automatically, reads the
 package version from `SHA256SUMS`, verifies the downloads, then lets apt pull
-the runtime dependencies (`libphpX.Y-embed` from sury). Pick one module via
-`MOD`:
+the runtime dependencies (`libphpX.Y-embed` — native trixie for 8.4, sury for
+8.3/8.5). Pick one module via `MOD`:
 
 ```bash
 REPO=6RUN0/freeunit
@@ -141,8 +151,9 @@ at `/unit`, mirroring CI:
 ```
 
 These are the common flags; `-h` prints the full list (including `-n`
-dry-run and `-I` image override). Built `.deb` files land in
-`pkg/deb/debs/`.
+dry-run and `-I` image override). The `SURY=auto|on|off` environment variable
+controls deb.sury.org enablement via the shared `pkg/deb/sury-setup.sh` helper,
+exactly as CI does. Built `.deb` files land in `pkg/deb/debs/`.
 
 ## Continuous integration
 
@@ -169,7 +180,8 @@ least-privilege permissions (only the release job elevates to `contents: write`)
 To keep merge friction low, upstream files are left untouched wherever possible.
 The fork-specific additions are confined to:
 
-- `pkg/deb/` — packaging makefiles, example configs, `build-local.sh`;
+- `pkg/deb/` — packaging makefiles, example configs, `build-local.sh`, the
+  shared `sury-setup.sh` helper;
 - `.github/workflows/build-deb.yml` — the packaging CI;
 - the fork banner at the top of `README.md` (a self-contained block above the
   upstream content) and this `FORK.md`.
