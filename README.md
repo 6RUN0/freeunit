@@ -1,3 +1,13 @@
+<!-- fork-banner:start -->
+> **Downstream packaging fork of [FreeUnit](https://github.com/freeunitorg/freeunit).**
+> It tracks upstream and adds only Debian (trixie) package builds plus CI for
+> PHP 8.3 / 8.4 / 8.5 and Python 3.13 — no source patches beyond packaging.
+> For the application server itself, issues, and documentation, use upstream.
+> Fork scope and build instructions: [FORK.md](FORK.md).
+<!-- fork-banner:end -->
+
+---
+
 # FreeUnit — Community LTS fork of Unit
 
 [![Project Status: Active – The project has reached a stable, usable state and is being actively developed.](https://www.repostatus.org/badges/latest/active.svg)](https://www.repostatus.org/#active)
