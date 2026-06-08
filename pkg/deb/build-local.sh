@@ -253,6 +253,10 @@ printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 
 apt-get update
+# curl drives the control API and health probes; the unit packages do not pull
+# it in, and sury setup (its only other installer) is skipped for native php8.4
+# and python, so install it explicitly.
+apt-get install -y --no-install-recommends curl
 # Derive the PHP version this module needs (empty for python -> no sury).
 case "$MODULE" in
     unit-php*) NEED_PHP="${MODULE#unit-php}" ;;
@@ -315,6 +319,9 @@ printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 
 apt-get update
+# curl drives the control API and health probes; install it explicitly since the
+# native-php8.4 path skips sury setup (its only other installer).
+apt-get install -y --no-install-recommends curl
 setup_sury_if_needed "$COMBINED_PHP"
 apt-get install -y --no-install-recommends \
     /debs/unit_*.deb \

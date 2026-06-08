@@ -154,6 +154,10 @@ jobs:
           printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
           chmod +x /usr/sbin/policy-rc.d
           apt-get update
+          # curl drives the control API and health probes; install it explicitly
+          # since sury setup (its only other installer) is skipped for native
+          # php8.4 and python.
+          apt-get install -y --no-install-recommends curl
           # This module's PHP version (empty for python -> no sury).
           case "$MODULE" in
             unit-php*) NEED_PHP="${MODULE#unit-php}" ;;
