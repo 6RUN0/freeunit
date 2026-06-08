@@ -16,12 +16,13 @@
 #              already-built core deb (pkg/deb/debs/unit_*.deb). Faster.
 #   -B         Build only — skip the smoke test.
 #   -s         Smoke only — skip the build, test the existing pkg/deb/debs/*.deb.
-#   -c         Combined smoke — serve all modules from a single container
-#              instead of one isolated container per module. NOTE: the PHP embed
-#              SAPI exposes an unversioned libphp.so, so the unit-php8.x modules
-#              cannot coexist in one instance; use -c only with a single PHP
-#              version (or python alone). Default is isolated, which is what
-#              CI does.
+#   -c         Combined smoke — serve the modules from a single container
+#              instead of one isolated container per module. Each unit-php8.x
+#              package bundles its own PHP embed runtime, and running several of
+#              them in one instance is unsupported, so combined mode runs exactly
+#              one PHP version (the Debian trixie native php8.4 by default, so no
+#              sury is needed) alongside python; the other PHP versions are
+#              covered only by the default isolated mode, which is what CI does.
 #   -k         Keep build state — skip the pre-build clean of generated
 #              artifacts (debuild*/debs/symlinks). Useful for incremental runs.
 #   -C         Clean only — remove all generated artifacts (debuild*/debs/
@@ -85,6 +86,11 @@ SMOKE_MATRIX=(
 # PHP versions packaged here — drives the sury auto-detect (each needs a
 # matching libphpX.Y-embed runtime). Matches the php targets above.
 PHP_VERSIONS="8.3 8.4 8.5"
+
+# PHP version the combined smoke (-c) runs: one instance hosts a single PHP embed
+# runtime. Default to the Debian trixie native line (php8.4 — present in base
+# apt, no sury round-trip); isolated mode still covers 8.3 and 8.5.
+COMBINED_PHP_DEFAULT="8.4"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -295,7 +301,11 @@ cat /var/log/unit.log || true
 exit 1
 EOS
 
-# Combined smoke script — all modules in one container (see -c caveat).
+# Combined smoke script — core + one PHP version + python in one container.
+# The PHP embed runtimes are not validated side by side, so this installs only
+# the single PHP version named by $COMBINED_PHP (the caller picks the trixie-
+# native one); isolated mode is what covers every PHP version. Consumes env:
+# SURY, COMBINED_PHP.
 read -r -d '' SMOKE_ALL_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
@@ -305,8 +315,11 @@ printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 
 apt-get update
-setup_sury_if_needed "${NEED_PHP:-8.3 8.4 8.5}"
-apt-get install -y --no-install-recommends /debs/*.deb
+setup_sury_if_needed "$COMBINED_PHP"
+apt-get install -y --no-install-recommends \
+    /debs/unit_*.deb \
+    "/debs/unit-php${COMBINED_PHP}_"*.deb \
+    /debs/unit-python3.13_*.deb
 
 echo "=== installed unit packages ==="
 dpkg -l 'unit*' | grep '^ii' || true
@@ -316,10 +329,10 @@ ls -la /usr/lib/unit/modules/ || true
 for _ in $(seq 1 30); do [ -S /var/run/control.unit.sock ] && break; sleep 0.5; done
 test -S /var/run/control.unit.sock
 
-mkdir -p /tmp/php83 /tmp/php84 /tmp/php85 /tmp/py313
-printf '<?php echo "OK-PHP-".PHP_VERSION;\n' > /tmp/php83/index.php
-printf '<?php echo "OK-PHP-".PHP_VERSION;\n' > /tmp/php84/index.php
-printf '<?php echo "OK-PHP-".PHP_VERSION;\n' > /tmp/php85/index.php
+# php8.3 -> 8083, php8.4 -> 8084, php8.5 -> 8085 (matches the isolated matrix).
+php_port="80${COMBINED_PHP//./}"
+mkdir -p /tmp/php /tmp/py313
+printf '<?php echo "OK-PHP-".PHP_VERSION;\n' > /tmp/php/index.php
 cat > /tmp/py313/wsgi.py <<'PY'
 import sys
 
@@ -329,23 +342,19 @@ def application(environ, start_response):
     body = "OK-PY-%d.%d" % (sys.version_info[0], sys.version_info[1])
     return [body.encode()]
 PY
-chmod -R a+rX /tmp/php83 /tmp/php84 /tmp/php85 /tmp/py313
+chmod -R a+rX /tmp/php /tmp/py313
 
 curl -fsS -X PUT --unix-socket /var/run/control.unit.sock \
-    --data-binary '{
-      "listeners": {
-        "*:8083": {"pass": "applications/php83"},
-        "*:8084": {"pass": "applications/php84"},
-        "*:8085": {"pass": "applications/php85"},
-        "*:8013": {"pass": "applications/py313"}
+    --data-binary "{
+      \"listeners\": {
+        \"*:${php_port}\": {\"pass\": \"applications/php\"},
+        \"*:8013\": {\"pass\": \"applications/py313\"}
       },
-      "applications": {
-        "php83": {"type": "php 8.3", "root": "/tmp/php83", "script": "index.php"},
-        "php84": {"type": "php 8.4", "root": "/tmp/php84", "script": "index.php"},
-        "php85": {"type": "php 8.5", "root": "/tmp/php85", "script": "index.php"},
-        "py313": {"type": "python 3.13", "path": "/tmp/py313", "module": "wsgi"}
+      \"applications\": {
+        \"php\": {\"type\": \"php\", \"root\": \"/tmp/php\", \"script\": \"index.php\"},
+        \"py313\": {\"type\": \"python 3.13\", \"path\": \"/tmp/py313\", \"module\": \"wsgi\"}
       }
-    }' http://localhost/config
+    }" http://localhost/config
 
 check() {
     url=$1; want=$2; out=
@@ -361,9 +370,7 @@ check() {
     return 1
 }
 
-check http://localhost:8083/ OK-PHP-8.3
-check http://localhost:8084/ OK-PHP-8.4
-check http://localhost:8085/ OK-PHP-8.5
+check "http://localhost:${php_port}/" "OK-PHP-${COMBINED_PHP}"
 check http://localhost:8013/ OK-PY-3.13
 echo "ALL SMOKE CHECKS PASSED"
 EOS
@@ -403,18 +410,29 @@ if $DO_SMOKE; then
     fi
 
     if $COMBINED_SMOKE; then
-        info "Smoke-testing all modules in one container ..."
+        # One container can host only one PHP embed runtime, so combined mode
+        # tests a single PHP (the trixie-native php8.4 by default, no sury) plus
+        # python; isolated mode covers every version.
+        COMBINED_PHP="$COMBINED_PHP_DEFAULT"
+        SKIPPED_PHP=""
+        for v in $PHP_VERSIONS; do
+            [[ "$v" == "$COMBINED_PHP" ]] || SKIPPED_PHP+="${SKIPPED_PHP:+ }$v"
+        done
+        info "Combined smoke: core + php${COMBINED_PHP} + python3.13 in one container ..."
+        if [[ "$SKIPPED_PHP" != "$COMBINED_PHP" ]]; then
+            info "Combined smoke SKIPS php: ${SKIPPED_PHP} (isolated mode covers every version)."
+        fi
         if $DRY_RUN; then
             info "DRY-RUN: docker run --rm -v ${DEBS_DIR}:/debs:ro \\"
             info "         -v ${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro \\"
-            info "         -e SURY=${SURY_MODE} -e NEED_PHP=\"${PHP_VERSIONS}\" \\"
+            info "         -e SURY=${SURY_MODE} -e COMBINED_PHP=${COMBINED_PHP} \\"
             info "         ${IMAGE} bash -s  <<< (combined smoke)"
         else
             printf '%s' "$SMOKE_ALL_SCRIPT" | docker run --rm -i \
                 -v "${DEBS_DIR}:/debs:ro" \
                 -v "${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro" \
                 -e SURY="${SURY_MODE}" \
-                -e NEED_PHP="${PHP_VERSIONS}" \
+                -e COMBINED_PHP="${COMBINED_PHP}" \
                 "${IMAGE}" bash -s
         fi
     else
