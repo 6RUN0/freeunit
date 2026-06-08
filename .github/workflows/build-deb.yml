@@ -270,7 +270,7 @@ jobs:
           ```bash
           DEB=@DEB@                 # version inside the .deb file names
           MOD=php8.4                # php8.3 | php8.4 | php8.5 | python3.13
-          BASE="https://github.com/6RUN0/freeunit/releases/download/@TAG@"
+          BASE="https://github.com/${{ github.repository }}/releases/download/@TAG@"
 
           curl -fLO "$BASE/SHA256SUMS"
           curl -fLO "$BASE/unit_${DEB}_amd64.deb"
