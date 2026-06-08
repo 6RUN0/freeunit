@@ -193,8 +193,13 @@ fi
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
 curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
-echo "deb [signed-by=/usr/share/keyrings/sury-php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" \
-    > /etc/apt/sources.list.d/sury-php.list
+cat > /etc/apt/sources.list.d/sury-php.sources <<EOF
+Types: deb
+URIs: https://packages.sury.org/php/
+Suites: $(lsb_release -sc)
+Components: main
+Signed-By: /usr/share/keyrings/sury-php.gpg
+EOF
 apt-get update
 # Core needs the Rust toolchain (--otel); modules reuse the common core config
 # without it, but installing cargo/rustc unconditionally keeps this one path.
@@ -225,8 +230,13 @@ chmod +x /usr/sbin/policy-rc.d
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
 curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
-echo "deb [signed-by=/usr/share/keyrings/sury-php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" \
-    > /etc/apt/sources.list.d/sury-php.list
+cat > /etc/apt/sources.list.d/sury-php.sources <<EOF
+Types: deb
+URIs: https://packages.sury.org/php/
+Suites: $(lsb_release -sc)
+Components: main
+Signed-By: /usr/share/keyrings/sury-php.gpg
+EOF
 apt-get update
 # core + exactly one module (single PHP version per instance)
 apt-get install -y --no-install-recommends /debs/unit_*.deb "/debs/${MODULE}_${VERSION}"*.deb
@@ -281,8 +291,13 @@ chmod +x /usr/sbin/policy-rc.d
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
 curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
-echo "deb [signed-by=/usr/share/keyrings/sury-php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" \
-    > /etc/apt/sources.list.d/sury-php.list
+cat > /etc/apt/sources.list.d/sury-php.sources <<EOF
+Types: deb
+URIs: https://packages.sury.org/php/
+Suites: $(lsb_release -sc)
+Components: main
+Signed-By: /usr/share/keyrings/sury-php.gpg
+EOF
 apt-get update
 apt-get install -y --no-install-recommends /debs/*.deb
 

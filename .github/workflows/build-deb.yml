@@ -62,8 +62,13 @@ jobs:
           # deb.sury.org provides php8.3 / php8.4 on Debian trixie
           curl -fsSL https://packages.sury.org/php/apt.gpg \
             -o /usr/share/keyrings/sury-php.gpg
-          echo "deb [signed-by=/usr/share/keyrings/sury-php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" \
-            > /etc/apt/sources.list.d/sury-php.list
+          cat > /etc/apt/sources.list.d/sury-php.sources <<EOF
+          Types: deb
+          URIs: https://packages.sury.org/php/
+          Suites: $(lsb_release -sc)
+          Components: main
+          Signed-By: /usr/share/keyrings/sury-php.gpg
+          EOF
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential debhelper devscripts fakeroot lintian \
@@ -131,8 +136,13 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
           curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg
-          echo "deb [signed-by=/usr/share/keyrings/sury-php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" \
-            > /etc/apt/sources.list.d/sury-php.list
+          cat > /etc/apt/sources.list.d/sury-php.sources <<EOF
+          Types: deb
+          URIs: https://packages.sury.org/php/
+          Suites: $(lsb_release -sc)
+          Components: main
+          Signed-By: /usr/share/keyrings/sury-php.gpg
+          EOF
           apt-get update
           # core + exactly one module (single PHP version per instance).
           # The artifact holds exactly one build's debs, so a version-agnostic
