@@ -239,8 +239,11 @@ if [ "$CLEAN" = "true" ]; then
 fi
 
 apt-get update
-# ca-certificates is needed for the otel Rust crate fetch over https.
-apt-get install -y --no-install-recommends ca-certificates
+# ca-certificates + curl: curl is the pkg/contrib downloader for the njs,
+# wasmtime and wasi-sysroot tarballs (it is tried before wget, then fetch); both
+# are also needed for the otel Rust crate fetch over https. curl must not depend
+# on sury being enabled (sury-off skips its setup), so install it here.
+apt-get install -y --no-install-recommends ca-certificates curl
 # Enable sury only when the requested PHP runtimes are missing from base apt.
 # NEED_PHP is always passed by the host; the fallback matches the PHP_PKGS one.
 setup_sury_if_needed "${NEED_PHP:-8.4}"
