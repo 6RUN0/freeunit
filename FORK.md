@@ -60,8 +60,8 @@ It is triggered by:
 - a push of a version tag — additionally publishes the `.deb` files to the
   matching Release. The release job runs only after the smoke tests pass.
   Two tag shapes are accepted: the plain upstream `X.Y.Z`, and the
-  fork-specific `X.Y.Z-<b|r|p>N` (build / revision / patch of the packaging
-  on top of upstream `X.Y.Z`, e.g. `1.35.5-b1`).
+  fork-specific `X.Y.Z-buildN` (the Nth packaging build on top of upstream
+  `X.Y.Z`, e.g. `1.35.5-build1`).
 
 GitHub Actions are pinned to commit SHAs, and the workflow runs with
 least-privilege permissions (only the release job elevates to `contents: write`).
