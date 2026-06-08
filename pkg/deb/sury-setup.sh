@@ -11,7 +11,10 @@
 # Honors $SURY: auto (default, detect per version), on (always), off (never).
 # Debian trixie main ships a single PHP line, so multi-version PHP normally
 # needs sury; a release that carries the version natively makes auto a no-op
-# without touching this file.
+# without touching this file. When the repo is enabled it is also pinned above
+# the Debian archive (preferences.d) so the build resolves PHP from one source
+# deterministically — see the pin block below for why this stays invisible to
+# end users.
 setup_sury_if_needed() {
     local need="${1:-}" mode="${SURY:-auto}" v cand missing=0
 
@@ -44,5 +47,18 @@ Suites: $(lsb_release -sc)
 Components: main
 Signed-By: /usr/share/keyrings/sury-php.gpg
 SURYSRC
+    # Pin deb.sury.org above the Debian archive for PHP packages so the build
+    # resolves every PHP line from one consistent source. A priority pin wins
+    # regardless of which side carries the higher version, so the build-time
+    # runtime no longer flips between trixie and sury when their version numbers
+    # cross. This only affects php8.4 (the single line trixie ships too); 8.3 and
+    # 8.5 exist only in sury. The runtime Depends is declared by package name
+    # without a version, so this never leaks into what users must install: on
+    # plain trixie unit-php8.4 still resolves libphp8.4-embed natively.
+    cat > /etc/apt/preferences.d/sury-php.pref <<SURYPIN
+Package: *php*
+Pin: origin packages.sury.org
+Pin-Priority: 600
+SURYPIN
     apt-get update
 }
