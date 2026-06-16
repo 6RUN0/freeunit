@@ -97,12 +97,29 @@ run_smoke_asserts() {
     assert_runtime_user
 }
 
+# True once the daemon $1 is no longer a live process: either reaped (kill -0
+# fails) or left as a zombie (<defunct>, /proc state Z). The zombie case matters
+# under a non-reaping container PID 1 -- GitHub Actions' job containers keep the
+# container alive with a `sleep`/`tail` PID 1 that never wait()s, so a daemon
+# that has fully exited lingers as <defunct> and kill -0 keeps succeeding even
+# though it is gone. A plain `docker run` (the local runner) has the shell as a
+# reaping PID 1, so there the process is reaped outright and the first branch
+# fires. /proc/$pid/stat is parsed after the last ')' so a comm with spaces or
+# parens cannot shift the state field.
+shutdown_settled() {
+    kill -0 "$1" 2>/dev/null || return 0
+    _stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 0
+    _state=${_stat##*) }
+    _state=${_state%% *}
+    [ "$_state" = Z ]
+}
+
 # Called at the end of a smoke run, after the daemon has served requests: a
 # SIGTERM to the main process must shut it down cleanly, which the router
-# signals by removing its control socket. Uses the pidfile + kill -0 (a shell
-# builtin) so it needs no procps in the smoke image. Paths follow the .deb
-# configure flags via $RUNDIR (default /var/run, matching pkg/deb/Makefile's
-# RUNDIR ?= /var/run): control.$RUNTIME.sock, $RUNTIME.pid.
+# signals by removing its control socket. Uses the pidfile + kill -0 / /proc
+# state (shell builtins + procfs) so it needs no procps in the smoke image.
+# Paths follow the .deb configure flags via $RUNDIR (default /var/run, matching
+# pkg/deb/Makefile's RUNDIR ?= /var/run): control.$RUNTIME.sock, $RUNTIME.pid.
 assert_clean_shutdown() {
     echo "=== clean shutdown (SIGTERM) assertion ==="
     sock="${RUNDIR:-/var/run}/control.${RUNTIME}.sock"
@@ -114,15 +131,15 @@ assert_clean_shutdown() {
         return 0
     fi
     kill -TERM "$pid" 2>/dev/null || true
-    # Wait on the process itself, not the control socket: the router removes the
-    # socket early in shutdown, so socket-absence races ahead of the main process
-    # actually exiting and would trip the kill -0 check below before the daemon is
-    # gone. kill -0 failing is the authoritative "fully shut down" signal.
+    # Wait on the process state, not the control socket: the router removes the
+    # socket early in shutdown, so socket-absence races ahead of the daemon
+    # actually exiting. shutdown_settled treats both reaped and <defunct> as
+    # done -- see its comment for why a zombie counts as a clean shutdown here.
     for _ in $(seq 1 30); do
-        kill -0 "$pid" 2>/dev/null || break
+        shutdown_settled "$pid" && break
         sleep 0.5
     done
-    if kill -0 "$pid" 2>/dev/null; then
+    if ! shutdown_settled "$pid"; then
         echo "FAIL: ${RUNTIME}d (pid $pid) still running after SIGTERM"; exit 1
     fi
     [ -S "$sock" ] \
