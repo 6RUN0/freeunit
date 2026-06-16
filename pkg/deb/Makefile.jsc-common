@@ -30,7 +30,7 @@ cat <<BANNER
 The $(MODULE_SUMMARY_jsc_common) have been installed.
 
 Please find licenses and related information at:
-  /usr/share/doc/unit-jsc-common/copyright
+  /usr/share/doc/$(BRAND)-jsc-common/copyright
 
 ----------------------------------------------------------------------
 BANNER

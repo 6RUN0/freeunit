@@ -76,7 +76,7 @@ exporter; only HttpBinary was ever selected.
 </changes>
 
 
-<changes apply="unit-php unit-python unit-python3.14
+<changes apply="unit-php unit-php8.3 unit-php8.4 unit-php8.5 unit-python unit-python3.13 unit-python3.14
                 unit-go
                 unit-perl
                 unit-ruby

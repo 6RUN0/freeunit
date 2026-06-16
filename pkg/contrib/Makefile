@@ -65,7 +65,7 @@ endif
 #
 download_git = \
 	rm -Rf -- "$(@:.tar.xz=)" && \
-	$(GIT) init --bare "$(@:.tar.xz=)" && \
+	$(GIT) -c init.defaultBranch=main init --bare "$(@:.tar.xz=)" && \
 	(cd "$(@:.tar.xz=)" && \
 	$(GIT) remote add origin "$(1)" && \
 	$(GIT) fetch origin "$(2)") && \
