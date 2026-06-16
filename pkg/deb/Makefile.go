@@ -39,7 +39,7 @@ To check out the sample app, run these commands:
  GOPATH=/usr/share/gocode GO111MODULE=auto go build -o /tmp/go-app /usr/share/doc/$(BRAND)-$(MODULE_SUFFIX_go)/examples/go-app/let-my-people.go
  sudo service $(RUNTIME) restart
  cd /usr/share/doc/$(BRAND)-$(MODULE_SUFFIX_go)/examples
- sudo curl -X PUT --data-binary @unit.config --unix-socket $(RUNDIR)/control.$(RUNTIME).sock http://localhost/config
+ $(MODULE_CONFIG_PUT)
  curl http://localhost:8500/
 
 Online documentation is available at $(DOCS_URL)

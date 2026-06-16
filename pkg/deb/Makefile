@@ -19,9 +19,12 @@ RELEASE ?= $(DEFAULT_RELEASE)
 # libunit toolchain keeps upstream-stable names by design, so the unitc/setup-
 # unit tools, the unitd.8 man page, the /usr/include/unit headers, libunit*
 # libraries, and the compiled-in "Unit/" strings all stay "unit".
-# Build a drop-in over a stock "unit" install with RUNTIME=unit RUNDIR=/var/run:
-# it reuses that runtime's config dir, socket path and systemd unit name so
-# existing configs and automation keep working.
+# Build a drop-in *replacement* for a stock "unit" install with
+# RUNTIME=unit RUNDIR=/var/run: freeunit then adopts that runtime's config dir,
+# socket path and systemd unit name so existing configs and automation keep
+# working after the swap. This is a replacement, not coexistence: the packages
+# declare Conflicts/Replaces against "unit" (see debian/control.in), so freeunit
+# and upstream "unit" are never installed side by side.
 BRAND   ?= freeunit
 RUNTIME ?= freeunit
 # BRAND_TITLE — human-readable product name for display strings (systemd unit
@@ -47,6 +50,12 @@ BUILD_DEPENDS_unit = build-essential debhelper devscripts fakeroot libxml2-utils
 BUILD_DEPENDS = $(BUILD_DEPENDS_unit)
 
 MODULES=
+
+# Shared install-banner command: PUT the module's example config over the
+# control socket. Defined once here so the per-language Makefile.* banners stay
+# in sync; the example config is installed as $(BRAND).config by the
+# MODULE_PREINSTALL_* recipes, so the filename must track $(BRAND).
+MODULE_CONFIG_PUT = sudo curl -X PUT --data-binary @$(BRAND).config --unix-socket $(RUNDIR)/control.$(RUNTIME).sock http://localhost/config
 
 # Ubuntu 24.04
 ifeq ($(CODENAME),noble)
@@ -229,11 +238,19 @@ debuild/$(SRCDIR)/debian:
 	chmod +x $$D/rules ; \
 	[ -f $$D/dirs ] && sed -i -e "s#%%RUNTIME%%#$(RUNTIME)#g" $$D/dirs || true ; \
 	[ -f $$D/unit.example.config ] && sed -i -e "s#%%PACKAGE%%#$(BRAND)#g" $$D/unit.example.config || true ; \
-	for f in postinst preinst logrotate default init lintian-overrides ; do \
+	: 'package-scoped helper files: debian/<package>.<ext> (keyed on BRAND)' ; \
+	for f in postinst postrm preinst logrotate lintian-overrides ; do \
 		s=$$D/freeunit.$$f ; [ -f $$s ] || continue ; \
 		sed -i -e "s#%%PACKAGE%%#$(BRAND)#g" -e "s#%%RUNTIME%%#$(RUNTIME)#g" -e "s#%%RUNDIR%%#$(RUNDIR)#g" -e "s#%%DOCS_URL%%#$(DOCS_URL)#g" -e "s#%%BRAND_TITLE%%#$(BRAND_TITLE)#g" $$s ; \
 		[ "$(BRAND).$$f" = "freeunit.$$f" ] || mv $$s $$D/$(BRAND).$$f ; \
 	done ; \
+	: 'init/default are resolved by dh_installinit --name=$(RUNTIME); stage as debian/$(BRAND).$(RUNTIME).<ext> so drop-in mode (RUNTIME != BRAND) finds them' ; \
+	for f in init default ; do \
+		s=$$D/freeunit.$$f ; [ -f $$s ] || continue ; \
+		sed -i -e "s#%%PACKAGE%%#$(BRAND)#g" -e "s#%%RUNTIME%%#$(RUNTIME)#g" -e "s#%%RUNDIR%%#$(RUNDIR)#g" -e "s#%%DOCS_URL%%#$(DOCS_URL)#g" -e "s#%%BRAND_TITLE%%#$(BRAND_TITLE)#g" $$s ; \
+		[ "$(BRAND).$(RUNTIME).$$f" = "freeunit.$$f" ] || mv $$s $$D/$(BRAND).$(RUNTIME).$$f ; \
+	done ; \
+	: 'service templates are named freeunit.unit.service as fixed source placeholders (NOT debhelper <pkg>.<name> form); the loop rewrites them to $(BRAND).$(RUNTIME).service' ; \
 	for pair in "freeunit.unit.service $(BRAND).$(RUNTIME).service" \
 	            "freeunit.unit-debug.service $(BRAND).$(RUNTIME)-debug.service" ; do \
 		set -- $$pair ; s=$$D/$$1 ; d=$$D/$$2 ; [ -f $$s ] || continue ; \

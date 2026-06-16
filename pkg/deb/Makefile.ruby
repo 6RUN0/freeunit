@@ -37,7 +37,7 @@ To check out the sample app, run these commands:
 
  sudo service $(RUNTIME) restart
  cd /usr/share/doc/$(BRAND)-$(MODULE_SUFFIX_ruby)/examples
- sudo curl -X PUT --data-binary @unit.config --unix-socket $(RUNDIR)/control.$(RUNTIME).sock http://localhost/config
+ $(MODULE_CONFIG_PUT)
  curl http://localhost:8700/
 
 Online documentation is available at $(DOCS_URL)

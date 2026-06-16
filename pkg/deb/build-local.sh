@@ -73,6 +73,7 @@ SURY_MODE="auto"
 
 # Read the version the Makefile will stamp into the .deb names.
 VERSION="$(grep -m1 '^NXT_VERSION=' "${REPO_ROOT}/version" | cut -d= -f2)"
+: "${VERSION:?could not determine version from the version file}"
 
 # Brand/runtime identity, mirroring pkg/deb/Makefile defaults. BRAND drives the
 # .deb package names (freeunit_*.deb, freeunit-<module>_*.deb); RUNTIME drives
@@ -247,8 +248,9 @@ info "============================================================"
 
 # The deb.sury.org enablement helper (setup_sury_if_needed) lives in
 # pkg/deb/sury-setup.sh and is bind-mounted into every container at
-# /sury-setup.sh, then sourced at the top of each script below. Keeping it in one
-# file is what stops the CI workflow copy and this one from drifting apart.
+# /sury-setup.sh, then sourced at the top of each script below. Keeping it in
+# one file prevents the local smoke paths from drifting apart; the CI workflow
+# sources it directly from the checked-out tree.
 
 # Build script. Consumes env: TARGETS, CLEAN, MODULES_ONLY, SURY, NEED_PHP.
 read -r -d '' BUILD_SCRIPT <<'EOS' || true
@@ -316,6 +318,7 @@ export CARGO_HOME=/root/.cargo
 # Fetch the installer to a file (not a blind curl|sh), optionally verify its
 # checksum, then install the pinned toolchain.
 rustup_init="$(mktemp)"
+trap 'rm -f "$rustup_init"' EXIT
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init"
 if [ -n "${RUSTUP_INIT_SHA256:-}" ]; then
     echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum -c -
@@ -388,18 +391,14 @@ curl -fsS -X PUT --unix-socket /var/run/control.${RUNTIME}.sock \
 
 # Round-trip: the controller must echo back the listener we applied (catches a
 # config that is accepted then silently dropped).
-cfg=$(curl -fsS --unix-socket /var/run/control.${RUNTIME}.sock http://localhost/config)
-printf '%s' "$cfg" | grep -q "\*:$PORT" \
-    || { echo "FAIL $MODULE: GET /config did not echo listener *:$PORT"; printf '%s\n' "$cfg"; exit 1; }
+assert_listener_echoed "\*:$PORT"
 
 out=
 for _ in $(seq 1 20); do
     if out=$(curl -fsS "http://localhost:$PORT/" 2>/dev/null) && printf '%s' "$out" | grep -q "$EXPECT"; then
         # The router itself must answer: a Server: header carrying the upstream
         # NXT_NAME ("Unit") confirms our daemon served the response.
-        hdr=$(curl -fsSI "http://localhost:$PORT/" 2>/dev/null || true)
-        printf '%s' "$hdr" | grep -qiE '^Server:.*Unit' \
-            || { echo "FAIL $MODULE: response missing Server: Unit header"; printf '%s\n' "$hdr"; exit 1; }
+        assert_server_header "http://localhost:$PORT/" "$MODULE"
         echo "PASS $MODULE -> $out (config round-trip + Server header OK)"
         assert_clean_shutdown
         exit 0
@@ -476,10 +475,8 @@ curl -fsS -X PUT --unix-socket /var/run/control.${RUNTIME}.sock \
     }" http://localhost/config
 
 # Round-trip: the controller must echo back both listeners we applied.
-cfg=$(curl -fsS --unix-socket /var/run/control.${RUNTIME}.sock http://localhost/config)
 for want_listener in "\*:${php_port}" "\*:8013"; do
-    printf '%s' "$cfg" | grep -q "$want_listener" \
-        || { echo "FAIL: GET /config did not echo listener $want_listener"; printf '%s\n' "$cfg"; exit 1; }
+    assert_listener_echoed "$want_listener"
 done
 
 check() {
@@ -488,9 +485,7 @@ check() {
         if out=$(curl -fsS "$url" 2>/dev/null) && printf '%s' "$out" | grep -q "$want"; then
             # The router must answer with a Server: header (upstream NXT_NAME
             # "Unit") — confirms our daemon, not something else, served it.
-            hdr=$(curl -fsSI "$url" 2>/dev/null || true)
-            printf '%s' "$hdr" | grep -qiE '^Server:.*Unit' \
-                || { echo "FAIL $url: response missing Server: Unit header"; printf '%s\n' "$hdr"; return 1; }
+            assert_server_header "$url"
             echo "PASS $url -> $out (Server header OK)"
             return 0
         fi

@@ -131,6 +131,11 @@ install: build do.tests
 	# (RUNTIME != unit) install it under the branded name; for the drop-in
 	# default this is a no-op.
 	[ "unitd" = "%%RUNTIME%%d" ] || mv $(INSTALLDIR)/usr/sbin/unitd $(INSTALLDIR)/usr/sbin/%%RUNTIME%%d
+	# The build installs the man page as unitd.8. For a rebrand (RUNTIME != unit)
+	# the daemon is %%RUNTIME%%d, so add a %%RUNTIME%%d.8 alias symlink (dh_compress
+	# repoints it at the compressed page); `man %%RUNTIME%%d` then works and the
+	# original `man unitd` still resolves. The drop-in default is a no-op.
+	[ "unitd" = "%%RUNTIME%%d" ] || ln -s unitd.8 $(INSTALLDIR)/usr/share/man/man8/%%RUNTIME%%d.8
 	cd $(BUILDDIR_unit) && DESTDIR=$(INSTALLDIR_dev) make libunit-install
 	# libunit-install always emits the pkg-config file as "unit.pc". For a
 	# rebrand (RUNTIME != unit) install it under the branded name so

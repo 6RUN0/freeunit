@@ -14,6 +14,12 @@ Build-Depends: debhelper (>= 11),
 Standards-Version: 4.1.4
 Homepage: %%HOMEPAGE%%
 
+# freeunit is a drop-in replacement for upstream NGINX Unit: each package
+# Provides/Conflicts/Replaces its "unit" counterpart so installing freeunit
+# cleanly takes over from a stock "unit" install. The two are deliberately not
+# co-installable. Conflicts/Replaces are unversioned on purpose -- there is no
+# version of upstream "unit" we want present alongside freeunit. The literal
+# "unit" here is the fixed upstream package name, unaffected by the RUNTIME knob.
 Package: %%PACKAGE%%
 Section: admin
 Architecture: any

@@ -2,8 +2,9 @@
 # Shared smoke-time assertions for the FreeUnit .deb packages. Sourced by both
 # the isolated and combined smoke scripts in build-local.sh (bind-mounted at
 # /smoke-asserts.sh, mirroring sury-setup.sh). Keeping the assertions in one
-# place is what stops the two smoke paths — and the CI workflow copy — from
-# drifting apart. Consumes the BRAND / RUNTIME / VERSION env the smoke
+# place prevents the two local smoke paths from drifting apart. The CI workflow
+# (.github/workflows/build-deb.yml) does not currently source this file; wiring
+# it in there is pending. Consumes the BRAND / RUNTIME / VERSION env the smoke
 # containers already export, against an already-installed package set.
 #
 # Convention: a broken rebrand (wrong path, unsubstituted %%placeholder%%,
@@ -17,7 +18,7 @@ assert_rebrand() {
     echo "=== rebrand assertions (BRAND=${BRAND} RUNTIME=${RUNTIME}) ==="
     test -x "/usr/sbin/${RUNTIME}d" \
         || { echo "FAIL: /usr/sbin/${RUNTIME}d not installed"; exit 1; }
-    ls /usr/lib/${RUNTIME}/modules/*.so >/dev/null 2>&1 \
+    ls /usr/lib/"${RUNTIME}"/modules/*.so >/dev/null 2>&1 \
         || { echo "FAIL: no modules under /usr/lib/${RUNTIME}/modules"; exit 1; }
     dpkg -L "${BRAND}" | grep -q "systemd/system/${RUNTIME}\.service" \
         || { echo "FAIL: ${RUNTIME}.service not packaged"; exit 1; }
@@ -66,7 +67,7 @@ assert_no_residual_brand() {
 # "unit version: <NXT_VERSION>" to stderr and exits 0.
 assert_daemon_version() {
     echo "=== daemon version assertion (expect ${VERSION}) ==="
-    ver="$(/usr/sbin/${RUNTIME}d --version 2>&1 || true)"
+    ver="$(/usr/sbin/"${RUNTIME}"d --version 2>&1 || true)"
     printf '%s\n' "$ver"
     printf '%s' "$ver" | grep -q "${VERSION}" \
         || { echo "FAIL: ${RUNTIME}d does not report version ${VERSION}"; exit 1; }
@@ -118,4 +119,27 @@ assert_clean_shutdown() {
         echo "FAIL: ${RUNTIME}d (pid $pid) still running after SIGTERM"; exit 1
     fi
     echo "clean shutdown assertion: PASS"
+}
+
+# Asserts that an HTTP response from <url> carries a "Server: ... Unit" header,
+# confirming the freeunit daemon (NXT_NAME "Unit") served the response rather
+# than some other process. <url> must already be serving (no retry loop here).
+# Usage: assert_server_header <url> [label]
+assert_server_header() {
+    _url="$1"
+    _label="${2:-${_url}}"
+    _hdr=$(curl -fsSI "$_url" 2>/dev/null || true)
+    printf '%s' "$_hdr" | grep -qiE '^Server:.*Unit' \
+        || { echo "FAIL ${_label}: response missing Server: Unit header"; printf '%s\n' "$_hdr"; exit 1; }
+}
+
+# Asserts that GET /config on the control socket echoes back a given listener
+# string (e.g. "*:8084"), confirming the controller accepted and retained the
+# applied config rather than silently dropping it.
+# Usage: assert_listener_echoed <listener_pattern>  (grep -q pattern; shell-escaped as needed)
+assert_listener_echoed() {
+    _want="$1"
+    _cfg=$(curl -fsS --unix-socket /var/run/control."${RUNTIME}".sock http://localhost/config)
+    printf '%s' "$_cfg" | grep -q "$_want" \
+        || { echo "FAIL: GET /config did not echo listener ${_want}"; printf '%s\n' "$_cfg"; exit 1; }
 }
