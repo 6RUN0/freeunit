@@ -93,10 +93,13 @@ VERSION="$(grep -m1 '^NXT_VERSION=' "${REPO_ROOT}/version" | cut -d= -f2)"
 # .deb package names (freeunit_*.deb, freeunit-<module>_*.deb); RUNTIME drives
 # the on-disk artifacts the smoke tests probe (daemon $RUNTIME"d", the
 # control.$RUNTIME.sock socket, /usr/lib/$RUNTIME/modules, /var/log/$RUNTIME.log).
-# Override both to build/smoke a differently-branded set; they are forwarded to
-# make and into the smoke containers.
+# RUNDIR is the volatile runtime dir holding the control socket and pidfile
+# (Makefile's RUNDIR ?= /var/run; set RUNDIR=/run for the pure FHS path). Override
+# any of them to build/smoke a differently-branded or relocated set; all three are
+# forwarded to make and into the smoke containers.
 BRAND="${BRAND:-freeunit}"
 RUNTIME="${RUNTIME:-freeunit}"
+RUNDIR="${RUNDIR:-/var/run}"
 
 # Rust toolchain for the otel/wasi crate compile. Pinned (not "stable") for
 # reproducibility: the merged 1.35.6 otel stack needs rustc >= 1.88 while Debian
@@ -151,6 +154,7 @@ run_oneshot() {
     if $DRY_RUN; then
         info "DRY-RUN: docker run --rm -v ${DEBS_DIR}:/debs:ro \\"
         info "         -v ${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro \\"
+        info "         -v ${REPO_ROOT}/pkg/deb/pkg-qa.sh:/pkg-qa.sh:ro \\"
         info "         -e BRAND=${BRAND} -e RUNTIME=${RUNTIME} -e VERSION=${VERSION} \\"
         info "         -e DEB_MIRROR=${DEB_MIRROR} \\"
         info "         ${IMAGE} bash -s   <<< (${label})"
@@ -159,6 +163,7 @@ run_oneshot() {
     printf '%s' "$script" | docker run --rm -i \
         -v "${DEBS_DIR}:/debs:ro" \
         -v "${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro" \
+        -v "${REPO_ROOT}/pkg/deb/pkg-qa.sh:/pkg-qa.sh:ro" \
         -e BRAND="${BRAND}" \
         -e RUNTIME="${RUNTIME}" \
         -e VERSION="${VERSION}" \
@@ -394,7 +399,7 @@ rm -f "$rustup_init"
 export PATH="$CARGO_HOME/bin:$PATH"
 rustc --version
 
-make -C pkg/deb BRAND="$BRAND" RUNTIME="$RUNTIME" $TARGETS
+make -C pkg/deb BRAND="$BRAND" RUNTIME="$RUNTIME" RUNDIR="$RUNDIR" $TARGETS
 echo "=== produced debs ==="
 ls -la pkg/deb/debs/
 EOS
@@ -432,8 +437,8 @@ apt-get install -y --no-install-recommends /debs/${BRAND}_*.deb "/debs/${MODULE}
 run_smoke_asserts
 
 /usr/sbin/${RUNTIME}d
-for _ in $(seq 1 30); do [ -S /var/run/control.${RUNTIME}.sock ] && break; sleep 0.5; done
-test -S /var/run/control.${RUNTIME}.sock
+for _ in $(seq 1 30); do [ -S "${RUNDIR}/control.${RUNTIME}.sock" ] && break; sleep 0.5; done
+test -S "${RUNDIR}/control.${RUNTIME}.sock"
 
 mkdir -p /tmp/app
 if [ "$APP_KIND" = php ]; then
@@ -453,7 +458,7 @@ PY
 fi
 chmod -R a+rX /tmp/app
 
-curl -fsS -X PUT --unix-socket /var/run/control.${RUNTIME}.sock \
+curl -fsS -X PUT --unix-socket "${RUNDIR}/control.${RUNTIME}.sock" \
     --data-binary "{\"listeners\": {\"*:$PORT\": {\"pass\": \"applications/a\"}}, \"applications\": {\"a\": $app}}" \
     http://localhost/config
 
@@ -514,8 +519,8 @@ ls -la /usr/lib/${RUNTIME}/modules/ || true
 run_smoke_asserts
 
 /usr/sbin/${RUNTIME}d
-for _ in $(seq 1 30); do [ -S /var/run/control.${RUNTIME}.sock ] && break; sleep 0.5; done
-test -S /var/run/control.${RUNTIME}.sock
+for _ in $(seq 1 30); do [ -S "${RUNDIR}/control.${RUNTIME}.sock" ] && break; sleep 0.5; done
+test -S "${RUNDIR}/control.${RUNTIME}.sock"
 
 # php8.3 -> 8083, php8.4 -> 8084, php8.5 -> 8085 (matches the isolated matrix).
 php_port="80${COMBINED_PHP//./}"
@@ -532,7 +537,7 @@ def application(environ, start_response):
 PY
 chmod -R a+rX /tmp/php /tmp/py313
 
-curl -fsS -X PUT --unix-socket /var/run/control.${RUNTIME}.sock \
+curl -fsS -X PUT --unix-socket "${RUNDIR}/control.${RUNTIME}.sock" \
     --data-binary "{
       \"listeners\": {
         \"*:${php_port}\": {\"pass\": \"applications/php\"},
@@ -576,137 +581,39 @@ EOS
 # the drop-in-replacement control contract and runs lintian. Consumes env:
 # BRAND, VERSION. lintian is installed here on demand because the smoke image is
 # a plain debian:trixie (the build image has it, but -s reuses existing debs).
+# Thin wrapper: apply any local mirror, then delegate to the shared gate in
+# pkg-qa.sh (control fields + -dev pkg-config residual scan + lintian). The gate
+# logic is shared verbatim with the build-deb.yml CI workflow.
 read -r -d '' PKG_QA_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
 . /mirror-setup.sh
-
-core="$(ls /debs/${BRAND}_${VERSION}*.deb 2>/dev/null | head -n1)"
-[ -n "$core" ] || { echo "FAIL: no core /debs/${BRAND}_${VERSION}*.deb to QA"; exit 1; }
-
-# Drop-in-replacement contract: renaming unit -> freeunit relies on
-# Provides/Conflicts/Replaces so the new package supersedes the old cleanly.
-echo "=== .deb control fields ($(basename "$core")) ==="
-for field in Depends Provides Conflicts Replaces; do
-    val="$(dpkg-deb -f "$core" "$field" || true)"
-    printf '%s: %s\n' "$field" "${val:-<empty>}"
-    [ -n "$val" ] \
-        || echo "WARN: control field $field is empty (drop-in replacement relies on Provides/Conflicts/Replaces)"
-done
-
-# Residual-brand scan of the -dev pkg-config file: on a rebrand the .pc must be
-# ${RUNTIME}.pc under the multiarch pkgconfig dir, never the upstream unit.pc
-# (caught lintian pkg-config-multi-arch-wrong-dir and a naming leak).
-dev="$(ls /debs/${BRAND}-dev_${VERSION}*.deb 2>/dev/null | head -n1)"
-if [ -n "$dev" ]; then
-    echo "=== -dev pkg-config scan ($(basename "$dev")) ==="
-    pc_list="$(dpkg-deb -c "$dev" | awk '{print $NF}' | grep -E '/pkgconfig/[^/]+\.pc$' || true)"
-    printf '%s\n' "$pc_list"
-    if [ "${RUNTIME}" != unit ]; then
-        printf '%s\n' "$pc_list" | grep -qE '/unit\.pc$' \
-            && { echo "FAIL: -dev still ships unit.pc on a RUNTIME=${RUNTIME} build"; exit 1; }
-        printf '%s\n' "$pc_list" | grep -qE "/${RUNTIME}\.pc\$" \
-            || { echo "FAIL: -dev missing ${RUNTIME}.pc"; exit 1; }
-    fi
-    printf '%s\n' "$pc_list" | grep -qE '/usr/lib/[^/]+/pkgconfig/[^/]+\.pc$' \
-        || echo "WARN: .pc not under /usr/lib/<triplet>/pkgconfig (pkg-config-multi-arch-wrong-dir may recur)"
-    echo "-dev pkg-config scan: PASS"
-fi
-
-# lintian on every produced .deb. Inherited upstream packaging may carry
-# pre-existing tags, so errors are surfaced loudly but kept non-fatal.
-echo "=== lintian (errors only; informational) ==="
 apply_deb_mirror
-apt-get update >/dev/null
-apt-get install -y --no-install-recommends lintian >/dev/null
-lintian --fail-on error --tag-display-limit 0 /debs/${BRAND}*_${VERSION}*.deb \
-    || echo "WARN: lintian reported errors (see above)"
-echo "package QA done"
+. /pkg-qa.sh
+pkg_qa_control_lintian
 EOS
 
-# Package-lifecycle script — install -> remove -> purge -> reinstall over the
-# core .deb, asserting conffile cleanup on purge and an idempotent (re-entrant)
-# postinst on reinstall. Also runs systemd-analyze verify on the packaged unit
-# (the daemon binary it references is installed here). Consumes env: BRAND,
-# RUNTIME, VERSION. There is no postrm, so the system user/group are retained on
-# purge by design (Debian practice for accounts that may still own files).
+# Thin wrapper: apply any local mirror, block service starts (no init system in
+# the container), update apt, then delegate to the shared lifecycle gate in
+# pkg-qa.sh (install/remove/purge/reinstall + ExecStart assertion + systemd
+# verify). Shared verbatim with the build-deb.yml CI workflow.
 read -r -d '' PKG_LIFECYCLE_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
 . /mirror-setup.sh
-# No init system in the container; stop maintainer scripts starting the service.
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 apply_deb_mirror
 apt-get update
-
-core="$(ls /debs/${BRAND}_${VERSION}*.deb 2>/dev/null | head -n1)"
-[ -n "$core" ] || { echo "FAIL: no core /debs/${BRAND}_${VERSION}*.deb for lifecycle"; exit 1; }
-
-echo "=== install ==="
-apt-get install -y --no-install-recommends "$core"
-test -x "/usr/sbin/${RUNTIME}d" || { echo "FAIL: daemon not installed"; exit 1; }
-getent passwd "${RUNTIME}" >/dev/null || { echo "FAIL: ${RUNTIME} user not created"; exit 1; }
-
-echo "=== remove (config retained) ==="
-apt-get remove -y "${BRAND}"
-[ -x "/usr/sbin/${RUNTIME}d" ] && { echo "FAIL: daemon binary survived remove"; exit 1; }
-
-echo "=== purge (config dropped) ==="
-apt-get purge -y "${BRAND}"
-[ -e "/etc/default/${RUNTIME}" ] && { echo "FAIL: conffile /etc/default/${RUNTIME} survived purge"; exit 1; }
-echo "purge dropped conffiles: OK"
-
-echo "=== reinstall (idempotent postinst) ==="
-apt-get install -y --no-install-recommends "$core"
-test -x "/usr/sbin/${RUNTIME}d" || { echo "FAIL: daemon not reinstalled"; exit 1; }
-# The retained user/group must not be duplicated: postinst's getent guards make
-# the second useradd/groupadd a no-op (set -e would already trip on an error).
-[ "$(getent passwd "${RUNTIME}" | wc -l)" -eq 1 ] || { echo "FAIL: duplicate ${RUNTIME} passwd entry after reinstall"; exit 1; }
-[ "$(getent group  "${RUNTIME}" | wc -l)" -eq 1 ] || { echo "FAIL: duplicate ${RUNTIME} group entry after reinstall"; exit 1; }
-echo "lifecycle remove/purge/reinstall: PASS"
-
-echo "=== systemd ExecStart binary assertion ==="
-# Fatal, init-system-independent check: the packaged unit's ExecStart must point
-# at the daemon the package actually installs. The smoke tests launch the daemon
-# by hand, so a typo in ExecStart= would otherwise pass every QA stage. Parse the
-# shipped unit file directly (no boot required).
-svc_file="$(dpkg -L "${BRAND}" | grep -E "systemd/system/${RUNTIME}\.service\$" | head -n1)"
-[ -n "$svc_file" ] || { echo "FAIL: ${RUNTIME}.service not packaged"; exit 1; }
-exec_bin="$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$svc_file" | head -n1)"
-[ -n "$exec_bin" ] || { echo "FAIL: no ExecStart= in $svc_file"; exit 1; }
-# Must be the daemon this package installs, not merely some executable: a typo
-# like ExecStart=/bin/sh would still be -x and would slip past a bare check.
-[ "$exec_bin" = "/usr/sbin/${RUNTIME}d" ] \
-    || { echo "FAIL: ExecStart=$exec_bin (from $svc_file), expected /usr/sbin/${RUNTIME}d"; exit 1; }
-[ -x "$exec_bin" ] \
-    || { echo "FAIL: ExecStart binary $exec_bin (from $svc_file) is not an installed executable"; exit 1; }
-echo "systemd ExecStart assertion: PASS ($exec_bin)"
-
-echo "=== systemd unit verification ==="
-command -v systemd-analyze >/dev/null 2>&1 \
-    || apt-get install -y --no-install-recommends systemd >/dev/null 2>&1 || true
-if command -v systemd-analyze >/dev/null 2>&1; then
-    unit_file="$(dpkg -L "${BRAND}" | grep -E "systemd/system/${RUNTIME}\.service\$" | head -n1)"
-    # Non-fatal: verify is strict and may flag tags inherited from upstream.
-    systemd-analyze verify "$unit_file" \
-        && echo "systemd-analyze verify: PASS ($unit_file)" \
-        || echo "WARN: systemd-analyze verify flagged $unit_file"
-else
-    echo "WARN: systemd-analyze unavailable; skipped unit verification"
-fi
+. /pkg-qa.sh
+pkg_lifecycle
 EOS
 
-# Drop-in-upgrade script — install a stand-in for the upstream "unit" package,
-# then install the freeunit core .deb over it. Its Conflicts/Replaces: unit must
-# make apt remove the upstream package and hand the daemon over cleanly. A clean
-# Debian base ships no "unit" package (upstream NGINX Unit lives in
-# packages.nginx.org, not Debian main), so a real "apt-get install unit" would
-# always skip and leave the headline migration path unverified. We instead
-# synthesize a minimal "unit" .deb that ships the upstream daemon path and
-# systemd unit freeunit must supersede, then assert it is gone afterwards. The
-# test is fail-closed: a failure to build/install the stand-in is fatal.
-# Consumes env: BRAND, RUNTIME, VERSION.
+# Thin wrapper: apply any local mirror, block service starts, update apt, then
+# delegate to the shared drop-in-upgrade gate in pkg-qa.sh (synthesize a stand-in
+# upstream "unit" .deb and prove the Conflicts/Replaces takeover supersedes both
+# its binary and its systemd unit). Shared verbatim with the build-deb.yml CI
+# workflow.
 read -r -d '' PKG_UPGRADE_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
@@ -715,60 +622,8 @@ printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 apply_deb_mirror
 apt-get update
-
-core="$(ls /debs/${BRAND}_${VERSION}*.deb 2>/dev/null | head -n1)"
-[ -n "$core" ] || { echo "FAIL: no core /debs/${BRAND}_${VERSION}*.deb for upgrade test"; exit 1; }
-
-echo "=== build synthetic upstream 'unit' stand-in ==="
-arch="$(dpkg --print-architecture)"
-fake_ver=1.34.0-1
-# Private build dir + an EXIT trap so the stand-in package and its .deb never
-# linger: harmless in the ephemeral --rm container, but keeps the harness clean
-# if the body is ever sourced into a long-lived runner, and tidies up even when
-# an assertion below exits non-zero mid-way.
-work="$(mktemp -d)"
-fake="$work/unit-fake"
-deb="$work/unit_${fake_ver}_${arch}.deb"
-trap 'apt-get purge -y unit >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
-mkdir -p "$fake/DEBIAN" "$fake/usr/sbin" "$fake/lib/systemd/system"
-cat > "$fake/DEBIAN/control" <<CTL
-Package: unit
-Version: ${fake_ver}
-Architecture: ${arch}
-Maintainer: Synthetic Upstream <noreply@example.invalid>
-Description: synthetic stand-in for upstream NGINX Unit
- Built by the freeunit drop-in test to exercise the Conflicts/Replaces takeover;
- not a functional daemon.
-CTL
-printf '#!/bin/sh\necho synthetic-unitd\n' > "$fake/usr/sbin/unitd"
-chmod +x "$fake/usr/sbin/unitd"
-printf '[Unit]\nDescription=synthetic unit\n[Service]\nExecStart=/usr/sbin/unitd\n[Install]\nWantedBy=multi-user.target\n' \
-    > "$fake/lib/systemd/system/unit.service"
-dpkg-deb --build --root-owner-group "$fake" "$deb"
-
-echo "=== install synthetic upstream unit ==="
-apt-get install -y --no-install-recommends "$deb"
-test -e /usr/sbin/unitd || { echo "FAIL: synthetic unitd not installed"; exit 1; }
-test -e /lib/systemd/system/unit.service || { echo "FAIL: synthetic unit.service not installed"; exit 1; }
-dpkg-query -W -f '${Status}' unit 2>/dev/null | grep -q '^install ok installed$' \
-    || { echo "FAIL: synthetic 'unit' not registered as installed"; exit 1; }
-
-echo "=== install ${BRAND} over unit (Conflicts/Replaces) ==="
-apt-get install -y --no-install-recommends "$core"
-test -x "/usr/sbin/${RUNTIME}d" || { echo "FAIL: ${RUNTIME}d missing after drop-in install"; exit 1; }
-# The upstream package must have been superseded, not left half-installed.
-if dpkg-query -W -f '${Status}' unit 2>/dev/null | grep -q '^install ok installed$'; then
-    echo "FAIL: upstream 'unit' still installed after ${BRAND} drop-in"; exit 1
-fi
-# On a rebranded build the upstream daemon path AND its systemd unit must be gone
-# -- the takeover this test exists to prove supersedes both, not just the binary.
-if [ "${RUNTIME}" != unit ]; then
-    [ -e /usr/sbin/unitd ] \
-        && { echo "FAIL: stale /usr/sbin/unitd after drop-in over upstream unit"; exit 1; }
-    [ -e /lib/systemd/system/unit.service ] \
-        && { echo "FAIL: stale upstream unit.service after drop-in over upstream unit"; exit 1; }
-fi
-echo "drop-in upgrade over upstream unit: PASS"
+. /pkg-qa.sh
+pkg_dropin_upgrade
 EOS
 
 # ---------------------------------------------------------------------------
@@ -781,7 +636,7 @@ if $DO_BUILD; then
         info "         -v ${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro \\"
         info "         -v ${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro \\"
         info "         -e TARGETS=\"${BUILD_TARGETS}\" -e CLEAN=${CLEAN} -e MODULES_ONLY=${MODULES_ONLY} \\"
-        info "         -e SURY=${SURY_MODE} -e NEED_PHP=\"${PHP_VERSIONS}\" \\"
+        info "         -e SURY=${SURY_MODE} -e NEED_PHP=\"${PHP_VERSIONS}\" -e RUNDIR=${RUNDIR} \\"
         info "         -e DEB_MIRROR=${DEB_MIRROR} -e SURY_MIRROR=${SURY_MIRROR} \\"
         info "         -e RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} -e RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT} -e RUSTUP_INIT_URL=${RUSTUP_INIT_URL} -e CARGO_MIRROR=${CARGO_MIRROR} \\"
         info "         ${IMAGE} bash -s   <<< (build script)"
@@ -797,6 +652,7 @@ if $DO_BUILD; then
             -e NEED_PHP="${PHP_VERSIONS}" \
             -e BRAND="${BRAND}" \
             -e RUNTIME="${RUNTIME}" \
+            -e RUNDIR="${RUNDIR}" \
             -e RUST_TOOLCHAIN="${RUST_TOOLCHAIN}" \
             -e RUSTUP_INIT_SHA256="${RUSTUP_INIT_SHA256}" \
             -e DEB_MIRROR="${DEB_MIRROR}" \
@@ -845,7 +701,7 @@ if $DO_SMOKE; then
             info "         -v ${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro \\"
             info "         -v ${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro \\"
             info "         -v ${REPO_ROOT}/pkg/deb/smoke-asserts.sh:/smoke-asserts.sh:ro \\"
-            info "         -e SURY=${SURY_MODE} -e COMBINED_PHP=${COMBINED_PHP} -e VERSION=${VERSION} \\"
+            info "         -e SURY=${SURY_MODE} -e COMBINED_PHP=${COMBINED_PHP} -e VERSION=${VERSION} -e RUNDIR=${RUNDIR} \\"
             info "         -e DEB_MIRROR=${DEB_MIRROR} -e SURY_MIRROR=${SURY_MIRROR} \\"
             info "         ${IMAGE} bash -s  <<< (combined smoke)"
         else
@@ -859,6 +715,7 @@ if $DO_SMOKE; then
                 -e VERSION="${VERSION}" \
                 -e BRAND="${BRAND}" \
                 -e RUNTIME="${RUNTIME}" \
+                -e RUNDIR="${RUNDIR}" \
                 -e DEB_MIRROR="${DEB_MIRROR}" \
                 -e SURY_MIRROR="${SURY_MIRROR}" \
                 "${IMAGE}" bash -s
@@ -880,7 +737,7 @@ if $DO_SMOKE; then
                 info "         -v ${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro \\"
                 info "         -v ${REPO_ROOT}/pkg/deb/smoke-asserts.sh:/smoke-asserts.sh:ro \\"
                 info "         -e MODULE=${module} -e APP_KIND=${kind} -e APP_TYPE=\"${type}\" \\"
-                info "         -e PORT=${port} -e EXPECT=${expect} -e VERSION=${VERSION} \\"
+                info "         -e PORT=${port} -e EXPECT=${expect} -e VERSION=${VERSION} -e RUNDIR=${RUNDIR} \\"
                 info "         -e SURY=${SURY_MODE} -e DEB_MIRROR=${DEB_MIRROR} -e SURY_MIRROR=${SURY_MIRROR} \\"
                 info "         ${IMAGE} bash -s   <<< (isolated smoke)"
                 continue
@@ -899,6 +756,7 @@ if $DO_SMOKE; then
                 -e SURY="${SURY_MODE}" \
                 -e BRAND="${BRAND}" \
                 -e RUNTIME="${RUNTIME}" \
+                -e RUNDIR="${RUNDIR}" \
                 -e DEB_MIRROR="${DEB_MIRROR}" \
                 -e SURY_MIRROR="${SURY_MIRROR}" \
                 "${IMAGE}" bash -s; then

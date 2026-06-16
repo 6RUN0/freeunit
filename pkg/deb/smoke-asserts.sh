@@ -2,10 +2,11 @@
 # Shared smoke-time assertions for the FreeUnit .deb packages. Sourced by both
 # the isolated and combined smoke scripts in build-local.sh (bind-mounted at
 # /smoke-asserts.sh, mirroring sury-setup.sh). Keeping the assertions in one
-# place prevents the two local smoke paths from drifting apart. The CI workflow
-# (.github/workflows/build-deb.yml) does not currently source this file; wiring
-# it in there is pending. Consumes the BRAND / RUNTIME / VERSION env the smoke
-# containers already export, against an already-installed package set.
+# place prevents the two local smoke paths from drifting apart. The CI smoke job
+# (.github/workflows/build-deb.yml) sources this file too, so local and CI smoke
+# run the identical assertions. Consumes the BRAND / RUNTIME / RUNDIR / VERSION
+# env the smoke containers / CI job export, against an already-installed package
+# set.
 #
 # Convention: a broken rebrand (wrong path, unsubstituted %%placeholder%%,
 # version mismatch, missing runtime user) is fatal (exit 1); packaging details
@@ -99,13 +100,13 @@ run_smoke_asserts() {
 # Called at the end of a smoke run, after the daemon has served requests: a
 # SIGTERM to the main process must shut it down cleanly, which the router
 # signals by removing its control socket. Uses the pidfile + kill -0 (a shell
-# builtin) so it needs no procps in the smoke image. Paths match the .deb
-# configure flags (RUNDIR defaults to /var/run: control.$RUNTIME.sock,
-# $RUNTIME.pid).
+# builtin) so it needs no procps in the smoke image. Paths follow the .deb
+# configure flags via $RUNDIR (default /var/run, matching pkg/deb/Makefile's
+# RUNDIR ?= /var/run): control.$RUNTIME.sock, $RUNTIME.pid.
 assert_clean_shutdown() {
     echo "=== clean shutdown (SIGTERM) assertion ==="
-    sock="/var/run/control.${RUNTIME}.sock"
-    pidfile="/var/run/${RUNTIME}.pid"
+    sock="${RUNDIR:-/var/run}/control.${RUNTIME}.sock"
+    pidfile="${RUNDIR:-/var/run}/${RUNTIME}.pid"
     pid=""
     [ -f "$pidfile" ] && pid="$(cat "$pidfile" 2>/dev/null)"
     if [ -z "$pid" ]; then
@@ -143,7 +144,7 @@ assert_server_header() {
 # Usage: assert_listener_echoed <listener_pattern>  (grep -q pattern; shell-escaped as needed)
 assert_listener_echoed() {
     _want="$1"
-    _cfg=$(curl -fsS --unix-socket /var/run/control."${RUNTIME}".sock http://localhost/config)
+    _cfg=$(curl -fsS --unix-socket "${RUNDIR:-/var/run}/control.${RUNTIME}.sock" http://localhost/config)
     printf '%s' "$_cfg" | grep -q "$_want" \
         || { echo "FAIL: GET /config did not echo listener ${_want}"; printf '%s\n' "$_cfg"; exit 1; }
 }
