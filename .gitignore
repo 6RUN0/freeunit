@@ -5,9 +5,11 @@
 /.idea/
 .omc/
 /.qwen/
+/AGENTS.md
 /CLAUDE.original.md
 /FIX.md
 /QWEN.md
+/clang-ast/
 /njs/
 /pkg/contrib/.njs
 /pkg/contrib/.sum-*
@@ -19,4 +21,5 @@
 Makefile
 __pycache__/
 build/
+test/fake_otlp/target/
 test/fake_upstream/target/
