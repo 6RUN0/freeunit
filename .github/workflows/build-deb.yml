@@ -99,10 +99,30 @@ jobs:
             python3.13-dev
 
       - name: Build .deb packages
+        env:
+          # The merged 1.35.6 otel stack (tonic 0.14 + icu 2.2) needs rustc >=
+          # 1.88, but Debian trixie's apt rust is 1.85. Pin the same toolchain
+          # pkg/deb/build-local.sh installs; bump deliberately when a dependency
+          # needs newer.
+          RUST_TOOLCHAIN: "1.88.0"
         run: |
           set -eux
           # debuild would otherwise gate the build on lintian findings
           echo 'DEBUILD_LINTIAN=no' > "$HOME/.devscripts"
+
+          # Install a pinned stable Rust toolchain via rustup and prepend it to
+          # PATH so it shadows the apt rustc (1.85) during the build, exactly as
+          # pkg/deb/build-local.sh does. The apt cargo/rustc stay only to satisfy
+          # the dpkg build-deps; debuild preserves PATH + RUSTUP_HOME (see
+          # pkg/deb/Makefile), so the newer toolchain reaches the otel crate.
+          export RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo
+          rustup_init="$(mktemp)"
+          curl --proto '=https' -sSf https://sh.rustup.rs -o "$rustup_init"
+          sh "$rustup_init" -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
+          rm -f "$rustup_init"
+          export PATH="$CARGO_HOME/bin:$PATH"
+          rustc --version
+
           # unit*/python313 are make TARGET names (upstream-derived, unaffected by
           # brand); BRAND/RUNTIME/RUNDIR are forwarded as make vars so the built
           # package names + on-disk paths match what the smoke and package-QA jobs
