@@ -1,12 +1,12 @@
 MODULES+=		jsc20
 MODULE_SUFFIX_jsc20=	jsc20
 
-MODULE_SUMMARY_jsc20=	Java 20 module for FreeUnit
+MODULE_SUMMARY_jsc20=	Java 20 module for $(BRAND_TITLE)
 
 MODULE_VERSION_jsc20=	$(VERSION)
 MODULE_RELEASE_jsc20=	1
 
-MODULE_CONFARGS_jsc20=	java --module=java20 --home=/usr/lib/jvm/java-20-openjdk-$$\(DEB_HOST_ARCH\) --jars=/usr/share/unit-jsc-common/
+MODULE_CONFARGS_jsc20=	java --module=java20 --home=/usr/lib/jvm/java-20-openjdk-$$\(DEB_HOST_ARCH\) --jars=/usr/share/$(BRAND)-jsc-common/
 MODULE_MAKEARGS_jsc20=	java20
 MODULE_INSTARGS_jsc20=	java20-install
 

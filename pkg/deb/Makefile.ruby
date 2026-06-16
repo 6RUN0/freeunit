@@ -1,7 +1,7 @@
 MODULES+=		ruby
 MODULE_SUFFIX_ruby=	ruby
 
-MODULE_SUMMARY_ruby=	Ruby module for FreeUnit
+MODULE_SUMMARY_ruby=	Ruby module for $(BRAND_TITLE)
 
 MODULE_VERSION_ruby=	$(VERSION)
 MODULE_RELEASE_ruby=	1

@@ -113,7 +113,7 @@ git checkout v1.35.5   # or master / latest tag
 make -j$(nproc)
 ```
 
-> **Note:** `--otel` requires Rust ≥ 1.94.1 (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`).
+> **Note:** `--otel` requires Rust ≥ 1.94.1 (`curl --proto '=https' -sSf https://sh.rustup.rs | sh`).
 > Remove `--otel` if you don't need OpenTelemetry support.
 >
 > `--user` / `--group` are omitted because the systemd service runs unitd directly.

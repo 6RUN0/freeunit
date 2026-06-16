@@ -1,7 +1,7 @@
 MODULES+=		perl
 MODULE_SUFFIX_perl=	perl
 
-MODULE_SUMMARY_perl=	Perl module for FreeUnit
+MODULE_SUMMARY_perl=	Perl module for $(BRAND_TITLE)
 
 MODULE_VERSION_perl=	$(VERSION)
 MODULE_RELEASE_perl=	1

@@ -46,8 +46,22 @@
 #   ./build-local.sh -C              # remove all generated artifacts and exit
 #   ./build-local.sh -n              # show what would run
 #
+# Environment (local mirrors — all empty by default => upstream; forwarded into
+# the build/smoke containers for reproducible or offline builds):
+#   DEB_MIRROR          replacement origin for the Debian CDN (deb.debian.org),
+#                       redirecting both the main archive and debian-security.
+#                       Full mirror:  http://mirror.lan
+#                       apt-cacher-ng: http://cache.lan:3142/deb.debian.org
+#   SURY_MIRROR         replacement base for packages.sury.org (php8.3/8.5).
+#   RUSTUP_DIST_SERVER  rustup toolchain dist server (default static.rust-lang.org).
+#   RUSTUP_UPDATE_ROOT  rustup self-update root.
+#   RUSTUP_INIT_URL     rustup installer URL (default https://sh.rustup.rs).
+#   CARGO_MIRROR        crates.io registry replacement (e.g. sparse+https://host/index/).
+#   Plus BRAND / RUNTIME (package identity) and RUST_TOOLCHAIN / RUSTUP_INIT_SHA256.
+#
 # Requirements: docker, network access (apt + Rust crates for otel, plus the
-# sury repo when it is enabled — see -S).
+# sury repo when it is enabled — see -S), unless a local mirror is configured for
+# each source above.
 # The build runs as root inside the container and writes generated artifacts
 # (debuild*/debs/) into the mounted tree; the default pre-build clean keeps
 # repeated runs reproducible.
@@ -93,6 +107,20 @@ RUNTIME="${RUNTIME:-freeunit}"
 RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-1.88.0}"
 RUSTUP_INIT_SHA256="${RUSTUP_INIT_SHA256:-}"
 
+# Optional local mirrors for apt + the Rust toolchain/crates, for reproducible
+# or offline builds. All empty by default => upstream (current behaviour). Each
+# is forwarded into the containers that touch the matching source; see the
+# Environment block in the header for URL forms. DEB_MIRROR rewrites the Debian
+# CDN (mirror-setup.sh), SURY_MIRROR the sury repo (sury-setup.sh), the RUSTUP_*
+# / CARGO_MIRROR knobs the otel Rust build (BUILD_SCRIPT). Normalised here so
+# every `-e VAR="${VAR}"` below is safe under `set -u`.
+DEB_MIRROR="${DEB_MIRROR:-}"
+SURY_MIRROR="${SURY_MIRROR:-}"
+RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER:-}"
+RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-}"
+RUSTUP_INIT_URL="${RUSTUP_INIT_URL:-https://sh.rustup.rs}"
+CARGO_MIRROR="${CARGO_MIRROR:-}"
+
 # PHP versions packaged here. php8.4 ships in the Debian trixie base archive;
 # php8.3 and php8.5 come from deb.sury.org, so with sury disabled (-S off) only
 # the native line is buildable and the active set narrows to it. PHP_VERSIONS is
@@ -122,15 +150,19 @@ run_oneshot() {
     info "${label} ..."
     if $DRY_RUN; then
         info "DRY-RUN: docker run --rm -v ${DEBS_DIR}:/debs:ro \\"
+        info "         -v ${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro \\"
         info "         -e BRAND=${BRAND} -e RUNTIME=${RUNTIME} -e VERSION=${VERSION} \\"
+        info "         -e DEB_MIRROR=${DEB_MIRROR} \\"
         info "         ${IMAGE} bash -s   <<< (${label})"
         return 0
     fi
     printf '%s' "$script" | docker run --rm -i \
         -v "${DEBS_DIR}:/debs:ro" \
+        -v "${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro" \
         -e BRAND="${BRAND}" \
         -e RUNTIME="${RUNTIME}" \
         -e VERSION="${VERSION}" \
+        -e DEB_MIRROR="${DEB_MIRROR}" \
         "${IMAGE}" bash -s
 }
 
@@ -238,6 +270,7 @@ info "  Image    : ${IMAGE}"
 info "  Build    : ${DO_BUILD} (modules-only: ${MODULES_ONLY}, targets: ${BUILD_TARGETS})"
 info "  Smoke    : ${DO_SMOKE} (combined: ${COMBINED_SMOKE})"
 info "  Sury     : ${SURY_MODE} (php: ${PHP_VERSIONS})"
+info "  Mirrors  : deb=${DEB_MIRROR:-<upstream>} sury=${SURY_MIRROR:-<upstream>} cargo=${CARGO_MIRROR:-<upstream>} rustup-dist=${RUSTUP_DIST_SERVER:-<upstream>}"
 info "  Clean    : ${CLEAN}"
 info "  Dry-run  : ${DRY_RUN}"
 info "============================================================"
@@ -256,7 +289,12 @@ info "============================================================"
 read -r -d '' BUILD_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
+. /mirror-setup.sh
 . /sury-setup.sh
+
+# Redirect the Debian archive to DEB_MIRROR (no-op when unset) before any apt
+# call, so the whole build resolves from the local mirror.
+apply_deb_mirror
 
 # git may run against the host-owned tree under a root container.
 git config --global --add safe.directory /unit 2>/dev/null || true
@@ -315,11 +353,39 @@ echo 'DEBUILD_LINTIAN=no' > "$HOME/.devscripts"
 # toolchain reaches the otel crate compile.
 export RUSTUP_HOME=/root/.rustup
 export CARGO_HOME=/root/.cargo
+# Optional local mirrors for the Rust toolchain + crates (offline/reproducible
+# builds). rustup honors RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT natively; export
+# them only when set so an empty value never shadows the upstream default (a bare
+# `[ -n x ] && export` would also trip set -e on the empty case). The crates.io
+# replacement is written to $CARGO_HOME/config.toml; debuild keeps HOME=/root, so
+# the otel crate compile under `make` reads it via the default $HOME/.cargo even
+# though CARGO_HOME itself is not preserved (pkg/deb/Makefile forwards only PATH
+# + RUSTUP_HOME).
+if [ -n "${RUSTUP_DIST_SERVER:-}" ]; then export RUSTUP_DIST_SERVER; fi
+if [ -n "${RUSTUP_UPDATE_ROOT:-}" ]; then export RUSTUP_UPDATE_ROOT; fi
+if [ -n "${CARGO_MIRROR:-}" ]; then
+    mkdir -p "$CARGO_HOME"
+    cat > "$CARGO_HOME/config.toml" <<CARGOCFG
+[source.crates-io]
+replace-with = "mirror"
+
+[source.mirror]
+registry = "${CARGO_MIRROR}"
+CARGOCFG
+    echo "cargo: crates.io -> ${CARGO_MIRROR}"
+fi
 # Fetch the installer to a file (not a blind curl|sh), optionally verify its
-# checksum, then install the pinned toolchain.
+# checksum, then install the pinned toolchain. The default upstream fetch is
+# pinned to =https; a custom RUSTUP_INIT_URL (e.g. an http local mirror)
+# is taken as-is since the operator vouches for it, and RUSTUP_INIT_SHA256 below
+# still guards integrity over any transport.
 rustup_init="$(mktemp)"
 trap 'rm -f "$rustup_init"' EXIT
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init"
+if [ "${RUSTUP_INIT_URL:-https://sh.rustup.rs}" = "https://sh.rustup.rs" ]; then
+    curl --proto '=https' -sSf https://sh.rustup.rs -o "$rustup_init"
+else
+    curl -fsSL "${RUSTUP_INIT_URL}" -o "$rustup_init"
+fi
 if [ -n "${RUSTUP_INIT_SHA256:-}" ]; then
     echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum -c -
 fi
@@ -338,6 +404,7 @@ EOS
 read -r -d '' SMOKE_ONE_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
+. /mirror-setup.sh
 . /sury-setup.sh
 . /smoke-asserts.sh
 
@@ -345,6 +412,7 @@ export DEBIAN_FRONTEND=noninteractive
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 
+apply_deb_mirror
 apt-get update
 # curl drives the control API and health probes; the unit packages do not pull
 # it in, and sury setup (its only other installer) is skipped for native php8.4
@@ -418,12 +486,14 @@ EOS
 read -r -d '' SMOKE_ALL_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
+. /mirror-setup.sh
 . /sury-setup.sh
 . /smoke-asserts.sh
 
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 
+apply_deb_mirror
 apt-get update
 # curl drives the control API and health probes; install it explicitly since the
 # native-php8.4 path skips sury setup (its only other installer).
@@ -509,6 +579,7 @@ EOS
 read -r -d '' PKG_QA_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
+. /mirror-setup.sh
 
 core="$(ls /debs/${BRAND}_${VERSION}*.deb 2>/dev/null | head -n1)"
 [ -n "$core" ] || { echo "FAIL: no core /debs/${BRAND}_${VERSION}*.deb to QA"; exit 1; }
@@ -545,6 +616,7 @@ fi
 # lintian on every produced .deb. Inherited upstream packaging may carry
 # pre-existing tags, so errors are surfaced loudly but kept non-fatal.
 echo "=== lintian (errors only; informational) ==="
+apply_deb_mirror
 apt-get update >/dev/null
 apt-get install -y --no-install-recommends lintian >/dev/null
 lintian --fail-on error --tag-display-limit 0 /debs/${BRAND}*_${VERSION}*.deb \
@@ -561,9 +633,11 @@ EOS
 read -r -d '' PKG_LIFECYCLE_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
+. /mirror-setup.sh
 # No init system in the container; stop maintainer scripts starting the service.
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
+apply_deb_mirror
 apt-get update
 
 core="$(ls /debs/${BRAND}_${VERSION}*.deb 2>/dev/null | head -n1)"
@@ -592,6 +666,23 @@ test -x "/usr/sbin/${RUNTIME}d" || { echo "FAIL: daemon not reinstalled"; exit 1
 [ "$(getent group  "${RUNTIME}" | wc -l)" -eq 1 ] || { echo "FAIL: duplicate ${RUNTIME} group entry after reinstall"; exit 1; }
 echo "lifecycle remove/purge/reinstall: PASS"
 
+echo "=== systemd ExecStart binary assertion ==="
+# Fatal, init-system-independent check: the packaged unit's ExecStart must point
+# at the daemon the package actually installs. The smoke tests launch the daemon
+# by hand, so a typo in ExecStart= would otherwise pass every QA stage. Parse the
+# shipped unit file directly (no boot required).
+svc_file="$(dpkg -L "${BRAND}" | grep -E "systemd/system/${RUNTIME}\.service\$" | head -n1)"
+[ -n "$svc_file" ] || { echo "FAIL: ${RUNTIME}.service not packaged"; exit 1; }
+exec_bin="$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$svc_file" | head -n1)"
+[ -n "$exec_bin" ] || { echo "FAIL: no ExecStart= in $svc_file"; exit 1; }
+# Must be the daemon this package installs, not merely some executable: a typo
+# like ExecStart=/bin/sh would still be -x and would slip past a bare check.
+[ "$exec_bin" = "/usr/sbin/${RUNTIME}d" ] \
+    || { echo "FAIL: ExecStart=$exec_bin (from $svc_file), expected /usr/sbin/${RUNTIME}d"; exit 1; }
+[ -x "$exec_bin" ] \
+    || { echo "FAIL: ExecStart binary $exec_bin (from $svc_file) is not an installed executable"; exit 1; }
+echo "systemd ExecStart assertion: PASS ($exec_bin)"
+
 echo "=== systemd unit verification ==="
 command -v systemd-analyze >/dev/null 2>&1 \
     || apt-get install -y --no-install-recommends systemd >/dev/null 2>&1 || true
@@ -606,26 +697,61 @@ else
 fi
 EOS
 
-# Drop-in-upgrade script — install the upstream "unit" package, then install the
-# freeunit core .deb over it. Its Conflicts/Replaces: unit must make apt remove
-# the upstream package and hand the daemon over cleanly. Best-effort: if the
-# upstream "unit" is not installable in this base, the test is skipped (WARN).
+# Drop-in-upgrade script — install a stand-in for the upstream "unit" package,
+# then install the freeunit core .deb over it. Its Conflicts/Replaces: unit must
+# make apt remove the upstream package and hand the daemon over cleanly. A clean
+# Debian base ships no "unit" package (upstream NGINX Unit lives in
+# packages.nginx.org, not Debian main), so a real "apt-get install unit" would
+# always skip and leave the headline migration path unverified. We instead
+# synthesize a minimal "unit" .deb that ships the upstream daemon path and
+# systemd unit freeunit must supersede, then assert it is gone afterwards. The
+# test is fail-closed: a failure to build/install the stand-in is fatal.
 # Consumes env: BRAND, RUNTIME, VERSION.
 read -r -d '' PKG_UPGRADE_SCRIPT <<'EOS' || true
 set -eux
 export DEBIAN_FRONTEND=noninteractive
+. /mirror-setup.sh
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
+apply_deb_mirror
 apt-get update
 
 core="$(ls /debs/${BRAND}_${VERSION}*.deb 2>/dev/null | head -n1)"
 [ -n "$core" ] || { echo "FAIL: no core /debs/${BRAND}_${VERSION}*.deb for upgrade test"; exit 1; }
 
-echo "=== install upstream unit ==="
-if ! apt-get install -y --no-install-recommends unit; then
-    echo "WARN: upstream 'unit' not installable in this base; skipping drop-in upgrade test"
-    exit 0
-fi
+echo "=== build synthetic upstream 'unit' stand-in ==="
+arch="$(dpkg --print-architecture)"
+fake_ver=1.34.0-1
+# Private build dir + an EXIT trap so the stand-in package and its .deb never
+# linger: harmless in the ephemeral --rm container, but keeps the harness clean
+# if the body is ever sourced into a long-lived runner, and tidies up even when
+# an assertion below exits non-zero mid-way.
+work="$(mktemp -d)"
+fake="$work/unit-fake"
+deb="$work/unit_${fake_ver}_${arch}.deb"
+trap 'apt-get purge -y unit >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
+mkdir -p "$fake/DEBIAN" "$fake/usr/sbin" "$fake/lib/systemd/system"
+cat > "$fake/DEBIAN/control" <<CTL
+Package: unit
+Version: ${fake_ver}
+Architecture: ${arch}
+Maintainer: Synthetic Upstream <noreply@example.invalid>
+Description: synthetic stand-in for upstream NGINX Unit
+ Built by the freeunit drop-in test to exercise the Conflicts/Replaces takeover;
+ not a functional daemon.
+CTL
+printf '#!/bin/sh\necho synthetic-unitd\n' > "$fake/usr/sbin/unitd"
+chmod +x "$fake/usr/sbin/unitd"
+printf '[Unit]\nDescription=synthetic unit\n[Service]\nExecStart=/usr/sbin/unitd\n[Install]\nWantedBy=multi-user.target\n' \
+    > "$fake/lib/systemd/system/unit.service"
+dpkg-deb --build --root-owner-group "$fake" "$deb"
+
+echo "=== install synthetic upstream unit ==="
+apt-get install -y --no-install-recommends "$deb"
+test -e /usr/sbin/unitd || { echo "FAIL: synthetic unitd not installed"; exit 1; }
+test -e /lib/systemd/system/unit.service || { echo "FAIL: synthetic unit.service not installed"; exit 1; }
+dpkg-query -W -f '${Status}' unit 2>/dev/null | grep -q '^install ok installed$' \
+    || { echo "FAIL: synthetic 'unit' not registered as installed"; exit 1; }
 
 echo "=== install ${BRAND} over unit (Conflicts/Replaces) ==="
 apt-get install -y --no-install-recommends "$core"
@@ -634,9 +760,13 @@ test -x "/usr/sbin/${RUNTIME}d" || { echo "FAIL: ${RUNTIME}d missing after drop-
 if dpkg-query -W -f '${Status}' unit 2>/dev/null | grep -q '^install ok installed$'; then
     echo "FAIL: upstream 'unit' still installed after ${BRAND} drop-in"; exit 1
 fi
-# On a rebranded build the upstream daemon path must be gone too.
-if [ "${RUNTIME}" != unit ] && [ -e /usr/sbin/unitd ]; then
-    echo "FAIL: stale /usr/sbin/unitd after drop-in over upstream unit"; exit 1
+# On a rebranded build the upstream daemon path AND its systemd unit must be gone
+# -- the takeover this test exists to prove supersedes both, not just the binary.
+if [ "${RUNTIME}" != unit ]; then
+    [ -e /usr/sbin/unitd ] \
+        && { echo "FAIL: stale /usr/sbin/unitd after drop-in over upstream unit"; exit 1; }
+    [ -e /lib/systemd/system/unit.service ] \
+        && { echo "FAIL: stale upstream unit.service after drop-in over upstream unit"; exit 1; }
 fi
 echo "drop-in upgrade over upstream unit: PASS"
 EOS
@@ -649,13 +779,17 @@ if $DO_BUILD; then
     if $DRY_RUN; then
         info "DRY-RUN: docker run --rm -v ${REPO_ROOT}:/unit -w /unit \\"
         info "         -v ${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro \\"
+        info "         -v ${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro \\"
         info "         -e TARGETS=\"${BUILD_TARGETS}\" -e CLEAN=${CLEAN} -e MODULES_ONLY=${MODULES_ONLY} \\"
         info "         -e SURY=${SURY_MODE} -e NEED_PHP=\"${PHP_VERSIONS}\" \\"
+        info "         -e DEB_MIRROR=${DEB_MIRROR} -e SURY_MIRROR=${SURY_MIRROR} \\"
+        info "         -e RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} -e RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT} -e RUSTUP_INIT_URL=${RUSTUP_INIT_URL} -e CARGO_MIRROR=${CARGO_MIRROR} \\"
         info "         ${IMAGE} bash -s   <<< (build script)"
     else
         printf '%s' "$BUILD_SCRIPT" | docker run --rm -i \
             -v "${REPO_ROOT}:/unit" -w /unit \
             -v "${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro" \
+            -v "${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro" \
             -e TARGETS="${BUILD_TARGETS}" \
             -e CLEAN="${CLEAN}" \
             -e MODULES_ONLY="${MODULES_ONLY}" \
@@ -665,6 +799,12 @@ if $DO_BUILD; then
             -e RUNTIME="${RUNTIME}" \
             -e RUST_TOOLCHAIN="${RUST_TOOLCHAIN}" \
             -e RUSTUP_INIT_SHA256="${RUSTUP_INIT_SHA256}" \
+            -e DEB_MIRROR="${DEB_MIRROR}" \
+            -e SURY_MIRROR="${SURY_MIRROR}" \
+            -e RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER}" \
+            -e RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT}" \
+            -e RUSTUP_INIT_URL="${RUSTUP_INIT_URL}" \
+            -e CARGO_MIRROR="${CARGO_MIRROR}" \
             "${IMAGE}" bash -s
     fi
     info "Build phase done — debs in ${REPO_ROOT}/pkg/deb/debs/"
@@ -703,19 +843,24 @@ if $DO_SMOKE; then
         if $DRY_RUN; then
             info "DRY-RUN: docker run --rm -v ${DEBS_DIR}:/debs:ro \\"
             info "         -v ${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro \\"
+            info "         -v ${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro \\"
             info "         -v ${REPO_ROOT}/pkg/deb/smoke-asserts.sh:/smoke-asserts.sh:ro \\"
             info "         -e SURY=${SURY_MODE} -e COMBINED_PHP=${COMBINED_PHP} -e VERSION=${VERSION} \\"
+            info "         -e DEB_MIRROR=${DEB_MIRROR} -e SURY_MIRROR=${SURY_MIRROR} \\"
             info "         ${IMAGE} bash -s  <<< (combined smoke)"
         else
             printf '%s' "$SMOKE_ALL_SCRIPT" | docker run --rm -i \
                 -v "${DEBS_DIR}:/debs:ro" \
                 -v "${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro" \
+                -v "${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro" \
                 -v "${REPO_ROOT}/pkg/deb/smoke-asserts.sh:/smoke-asserts.sh:ro" \
                 -e SURY="${SURY_MODE}" \
                 -e COMBINED_PHP="${COMBINED_PHP}" \
                 -e VERSION="${VERSION}" \
                 -e BRAND="${BRAND}" \
                 -e RUNTIME="${RUNTIME}" \
+                -e DEB_MIRROR="${DEB_MIRROR}" \
+                -e SURY_MIRROR="${SURY_MIRROR}" \
                 "${IMAGE}" bash -s
         fi
     else
@@ -732,16 +877,18 @@ if $DO_SMOKE; then
             if $DRY_RUN; then
                 info "DRY-RUN: docker run --rm -v ${DEBS_DIR}:/debs:ro \\"
                 info "         -v ${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro \\"
+                info "         -v ${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro \\"
                 info "         -v ${REPO_ROOT}/pkg/deb/smoke-asserts.sh:/smoke-asserts.sh:ro \\"
                 info "         -e MODULE=${module} -e APP_KIND=${kind} -e APP_TYPE=\"${type}\" \\"
                 info "         -e PORT=${port} -e EXPECT=${expect} -e VERSION=${VERSION} \\"
-                info "         -e SURY=${SURY_MODE} \\"
+                info "         -e SURY=${SURY_MODE} -e DEB_MIRROR=${DEB_MIRROR} -e SURY_MIRROR=${SURY_MIRROR} \\"
                 info "         ${IMAGE} bash -s   <<< (isolated smoke)"
                 continue
             fi
             if printf '%s' "$SMOKE_ONE_SCRIPT" | docker run --rm -i \
                 -v "${DEBS_DIR}:/debs:ro" \
                 -v "${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro" \
+                -v "${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro" \
                 -v "${REPO_ROOT}/pkg/deb/smoke-asserts.sh:/smoke-asserts.sh:ro" \
                 -e MODULE="${module}" \
                 -e APP_KIND="${kind}" \
@@ -752,6 +899,8 @@ if $DO_SMOKE; then
                 -e SURY="${SURY_MODE}" \
                 -e BRAND="${BRAND}" \
                 -e RUNTIME="${RUNTIME}" \
+                -e DEB_MIRROR="${DEB_MIRROR}" \
+                -e SURY_MIRROR="${SURY_MIRROR}" \
                 "${IMAGE}" bash -s; then
                 info "${module}: PASS"
             else

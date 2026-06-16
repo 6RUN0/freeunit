@@ -1,12 +1,12 @@
 MODULES+=		jsc21
 MODULE_SUFFIX_jsc21=	jsc21
 
-MODULE_SUMMARY_jsc21=	Java 21 module for FreeUnit
+MODULE_SUMMARY_jsc21=	Java 21 module for $(BRAND_TITLE)
 
 MODULE_VERSION_jsc21=	$(VERSION)
 MODULE_RELEASE_jsc21=	1
 
-MODULE_CONFARGS_jsc21=	java --module=java21 --home=/usr/lib/jvm/java-21-openjdk-$$\(DEB_HOST_ARCH\) --jars=/usr/share/unit-jsc-common/
+MODULE_CONFARGS_jsc21=	java --module=java21 --home=/usr/lib/jvm/java-21-openjdk-$$\(DEB_HOST_ARCH\) --jars=/usr/share/$(BRAND)-jsc-common/
 MODULE_MAKEARGS_jsc21=	java21
 MODULE_INSTARGS_jsc21=	java21-install
 

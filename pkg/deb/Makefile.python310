@@ -1,7 +1,7 @@
 MODULES+=			python310
 MODULE_SUFFIX_python310=		python3.10
 
-MODULE_SUMMARY_python310=	Python 3.10 module for FreeUnit
+MODULE_SUMMARY_python310=	Python 3.10 module for $(BRAND_TITLE)
 
 MODULE_VERSION_python310=	$(VERSION)
 MODULE_RELEASE_python310=	1

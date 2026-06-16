@@ -1,7 +1,7 @@
 MODULES+=			python38
 MODULE_SUFFIX_python38=		python3.8
 
-MODULE_SUMMARY_python38=	Python 3.8 module for FreeUnit
+MODULE_SUMMARY_python38=	Python 3.8 module for $(BRAND_TITLE)
 
 MODULE_VERSION_python38=	$(VERSION)
 MODULE_RELEASE_python38=	1

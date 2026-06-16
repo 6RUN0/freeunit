@@ -1,7 +1,7 @@
 MODULES+=			python39
 MODULE_SUFFIX_python39=		python3.9
 
-MODULE_SUMMARY_python39=	Python 3.9 module for FreeUnit
+MODULE_SUMMARY_python39=	Python 3.9 module for $(BRAND_TITLE)
 
 MODULE_VERSION_python39=	$(VERSION)
 MODULE_RELEASE_python39=	1

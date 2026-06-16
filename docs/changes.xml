@@ -73,6 +73,23 @@ exporter; only HttpBinary was ever selected.
 </para>
 </change>
 
+<change type="change">
+<para>
+the Debian packages are rebranded to "freeunit": the package set
+(freeunit, freeunit-dev, freeunit-php8.x, freeunit-python3.x,
+freeunit-perl, freeunit-ruby, freeunit-go, freeunit-wasm and the
+freeunit-jscNN Java modules), the
+daemon binary (/usr/sbin/freeunitd), the control socket
+(control.freeunit.sock), the state directory (/var/lib/freeunit), the log
+(/var/log/freeunit.log) and the systemd/init service are all renamed. Each
+package Provides/Conflicts/Replaces its upstream "unit" counterpart, so
+installing freeunit cleanly takes over a stock "unit" install; the two are
+deliberately not co-installable. The compiled-in "Unit" identity, the
+unitc/setup-unit tools and the development headers keep their upstream
+names by design.
+</para>
+</change>
+
 </changes>
 
 

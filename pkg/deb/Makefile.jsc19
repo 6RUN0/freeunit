@@ -1,12 +1,12 @@
 MODULES+=		jsc19
 MODULE_SUFFIX_jsc19=	jsc19
 
-MODULE_SUMMARY_jsc19=	Java 19 module for FreeUnit
+MODULE_SUMMARY_jsc19=	Java 19 module for $(BRAND_TITLE)
 
 MODULE_VERSION_jsc19=	$(VERSION)
 MODULE_RELEASE_jsc19=	1
 
-MODULE_CONFARGS_jsc19=	java --module=java19 --home=/usr/lib/jvm/java-19-openjdk-$$\(DEB_HOST_ARCH\) --jars=/usr/share/unit-jsc-common/
+MODULE_CONFARGS_jsc19=	java --module=java19 --home=/usr/lib/jvm/java-19-openjdk-$$\(DEB_HOST_ARCH\) --jars=/usr/share/$(BRAND)-jsc-common/
 MODULE_MAKEARGS_jsc19=	java19
 MODULE_INSTARGS_jsc19=	java19-install
 

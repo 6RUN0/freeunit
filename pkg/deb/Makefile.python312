@@ -1,7 +1,7 @@
 MODULES+=			python312
 MODULE_SUFFIX_python312=		python3.12
 
-MODULE_SUMMARY_python312=	Python 3.12 module for FreeUnit
+MODULE_SUMMARY_python312=	Python 3.12 module for $(BRAND_TITLE)
 
 MODULE_VERSION_python312=	$(VERSION)
 MODULE_RELEASE_python312=	1

@@ -1,7 +1,7 @@
 MODULES+=		php
 MODULE_SUFFIX_php=	php
 
-MODULE_SUMMARY_php=	PHP module for FreeUnit
+MODULE_SUMMARY_php=	PHP module for $(BRAND_TITLE)
 
 MODULE_VERSION_php=	$(VERSION)
 MODULE_RELEASE_php=	1

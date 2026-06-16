@@ -1,7 +1,7 @@
 MODULES+=		go
 MODULE_SUFFIX_go=	go
 
-MODULE_SUMMARY_go=	Go module for FreeUnit
+MODULE_SUMMARY_go=	Go module for $(BRAND_TITLE)
 
 MODULE_VERSION_go=	$(VERSION)
 MODULE_RELEASE_go=	1

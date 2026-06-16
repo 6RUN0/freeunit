@@ -43,8 +43,11 @@ assert_no_residual_brand() {
 /var/lib/dpkg/info/${BRAND}.postinst /var/lib/dpkg/info/${BRAND}.preinst
 /var/lib/dpkg/info/${BRAND}.postrm /var/lib/dpkg/info/${BRAND}.prerm"
     # Unquoted on purpose: word-split the newline/space list (these paths never
-    # contain whitespace). Runs in the main shell, so a fatal exit terminates
-    # the smoke script rather than just a pipeline subshell.
+    # contain whitespace). `set -f` disables pathname expansion so a future path
+    # carrying a glob metachar (*, ?) can't silently skip a file and weaken the
+    # gate. Runs in the main shell, so a fatal exit terminates the smoke script
+    # rather than just a pipeline subshell.
+    set -f
     for f in $files; do
         [ -f "$f" ] || continue
         if grep -qE '%%[A-Z_]+%%' "$f"; then
@@ -53,12 +56,13 @@ assert_no_residual_brand() {
             exit 1
         fi
         if [ "${RUNTIME}" != unit ] \
-           && grep -qE '/usr/sbin/unitd|/usr/lib/unit/|/var/log/unit\.log|control\.unit\.sock' "$f"; then
+           && grep -qE '/usr/sbin/unitd|/usr/lib/unit/|/var/lib/unit\b|/var/log/unit\.log|control\.unit\.sock' "$f"; then
             echo "FAIL: residual upstream 'unit' path in $f"
-            grep -nE '/usr/sbin/unitd|/usr/lib/unit/|/var/log/unit\.log|control\.unit\.sock' "$f"
+            grep -nE '/usr/sbin/unitd|/usr/lib/unit/|/var/lib/unit\b|/var/log/unit\.log|control\.unit\.sock' "$f"
             exit 1
         fi
     done
+    set +f
     echo "residual-brand scan: PASS"
 }
 
@@ -69,7 +73,7 @@ assert_daemon_version() {
     echo "=== daemon version assertion (expect ${VERSION}) ==="
     ver="$(/usr/sbin/"${RUNTIME}"d --version 2>&1 || true)"
     printf '%s\n' "$ver"
-    printf '%s' "$ver" | grep -q "${VERSION}" \
+    printf '%s' "$ver" | grep -qF "${VERSION}" \
         || { echo "FAIL: ${RUNTIME}d does not report version ${VERSION}"; exit 1; }
     echo "daemon version assertion: PASS"
 }
