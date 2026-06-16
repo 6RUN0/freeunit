@@ -150,25 +150,28 @@ pkg_lifecycle() {
 # systemd unit freeunit must supersede, then assert it is gone afterwards. The
 # gate is fail-closed: a failure to build/install the stand-in is fatal.
 pkg_dropin_upgrade() {
-    local core arch fake_ver work fake deb
-    core="$(ls "${DEBS_DIR}"/"${BRAND}"_"${VERSION}"*.deb 2>/dev/null | head -n1)"
-    [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${VERSION}*.deb for upgrade test"; return 1; }
+    # Run the gate body in a subshell so its cleanup trap stays scoped to this
+    # gate and never leaks to the caller's shell. dash (the CI `sh -e`) has no
+    # RETURN pseudo-signal, so an EXIT trap inside a subshell is the portable
+    # equivalent of bash's function-scoped RETURN trap: it fires on every exit
+    # path — a mid-way assertion failure or the normal success — yet stays
+    # local to the subshell rather than the surrounding shell.
+    (
+        core="$(ls "${DEBS_DIR}"/"${BRAND}"_"${VERSION}"*.deb 2>/dev/null | head -n1)"
+        [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${VERSION}*.deb for upgrade test"; exit 1; }
 
-    echo "=== build synthetic upstream 'unit' stand-in ==="
-    arch="$(dpkg --print-architecture)"
-    fake_ver=1.34.0-1
-    # Private build dir + a RETURN trap so the stand-in package and its .deb
-    # never linger: harmless in the ephemeral --rm container, but keeps the
-    # harness clean now that this is a sourced function (RETURN is function-
-    # scoped, unlike an EXIT trap that would leak to the caller's shell). It
-    # fires on every return path — both a mid-way assertion failure below and
-    # the normal successful return — so the synthetic 'unit' is always purged.
-    work="$(mktemp -d)"
-    fake="$work/unit-fake"
-    deb="$work/unit_${fake_ver}_${arch}.deb"
-    trap 'apt-get purge -y unit >/dev/null 2>&1 || true; rm -rf "$work"' RETURN
-    mkdir -p "$fake/DEBIAN" "$fake/usr/sbin" "$fake/lib/systemd/system"
-    cat > "$fake/DEBIAN/control" <<CTL
+        echo "=== build synthetic upstream 'unit' stand-in ==="
+        arch="$(dpkg --print-architecture)"
+        fake_ver=1.34.0-1
+        # Private build dir; the EXIT trap below purges the stand-in package and
+        # removes its .deb so neither lingers — harmless in the ephemeral --rm
+        # container, but keeps the harness clean.
+        work="$(mktemp -d)"
+        fake="$work/unit-fake"
+        deb="$work/unit_${fake_ver}_${arch}.deb"
+        trap 'apt-get purge -y unit >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
+        mkdir -p "$fake/DEBIAN" "$fake/usr/sbin" "$fake/lib/systemd/system"
+        cat > "$fake/DEBIAN/control" <<CTL
 Package: unit
 Version: ${fake_ver}
 Architecture: ${arch}
@@ -177,34 +180,35 @@ Description: synthetic stand-in for upstream NGINX Unit
  Built by the freeunit drop-in test to exercise the Conflicts/Replaces takeover;
  not a functional daemon.
 CTL
-    printf '#!/bin/sh\necho synthetic-unitd\n' > "$fake/usr/sbin/unitd"
-    chmod +x "$fake/usr/sbin/unitd"
-    printf '[Unit]\nDescription=synthetic unit\n[Service]\nExecStart=/usr/sbin/unitd\n[Install]\nWantedBy=multi-user.target\n' \
-        > "$fake/lib/systemd/system/unit.service"
-    dpkg-deb --build --root-owner-group "$fake" "$deb"
+        printf '#!/bin/sh\necho synthetic-unitd\n' > "$fake/usr/sbin/unitd"
+        chmod +x "$fake/usr/sbin/unitd"
+        printf '[Unit]\nDescription=synthetic unit\n[Service]\nExecStart=/usr/sbin/unitd\n[Install]\nWantedBy=multi-user.target\n' \
+            > "$fake/lib/systemd/system/unit.service"
+        dpkg-deb --build --root-owner-group "$fake" "$deb"
 
-    echo "=== install synthetic upstream unit ==="
-    apt-get install -y --no-install-recommends "$deb"
-    test -e /usr/sbin/unitd || { echo "FAIL: synthetic unitd not installed"; return 1; }
-    test -e /lib/systemd/system/unit.service || { echo "FAIL: synthetic unit.service not installed"; return 1; }
-    dpkg-query -W -f '${Status}' unit 2>/dev/null | grep -q '^install ok installed$' \
-        || { echo "FAIL: synthetic 'unit' not registered as installed"; return 1; }
+        echo "=== install synthetic upstream unit ==="
+        apt-get install -y --no-install-recommends "$deb"
+        test -e /usr/sbin/unitd || { echo "FAIL: synthetic unitd not installed"; exit 1; }
+        test -e /lib/systemd/system/unit.service || { echo "FAIL: synthetic unit.service not installed"; exit 1; }
+        dpkg-query -W -f '${Status}' unit 2>/dev/null | grep -q '^install ok installed$' \
+            || { echo "FAIL: synthetic 'unit' not registered as installed"; exit 1; }
 
-    echo "=== install ${BRAND} over unit (Conflicts/Replaces) ==="
-    apt-get install -y --no-install-recommends "$core"
-    test -x "/usr/sbin/${RUNTIME}d" || { echo "FAIL: ${RUNTIME}d missing after drop-in install"; return 1; }
-    # The upstream package must have been superseded, not left half-installed.
-    if dpkg-query -W -f '${Status}' unit 2>/dev/null | grep -q '^install ok installed$'; then
-        echo "FAIL: upstream 'unit' still installed after ${BRAND} drop-in"; return 1
-    fi
-    # On a rebranded build the upstream daemon path AND its systemd unit must be
-    # gone -- the takeover this test exists to prove supersedes both, not just
-    # the binary.
-    if [ "${RUNTIME}" != unit ]; then
-        [ -e /usr/sbin/unitd ] \
-            && { echo "FAIL: stale /usr/sbin/unitd after drop-in over upstream unit"; return 1; }
-        [ -e /lib/systemd/system/unit.service ] \
-            && { echo "FAIL: stale upstream unit.service after drop-in over upstream unit"; return 1; }
-    fi
-    echo "drop-in upgrade over upstream unit: PASS"
+        echo "=== install ${BRAND} over unit (Conflicts/Replaces) ==="
+        apt-get install -y --no-install-recommends "$core"
+        test -x "/usr/sbin/${RUNTIME}d" || { echo "FAIL: ${RUNTIME}d missing after drop-in install"; exit 1; }
+        # The upstream package must have been superseded, not left half-installed.
+        if dpkg-query -W -f '${Status}' unit 2>/dev/null | grep -q '^install ok installed$'; then
+            echo "FAIL: upstream 'unit' still installed after ${BRAND} drop-in"; exit 1
+        fi
+        # On a rebranded build the upstream daemon path AND its systemd unit must
+        # be gone -- the takeover this test exists to prove supersedes both, not
+        # just the binary.
+        if [ "${RUNTIME}" != unit ]; then
+            [ -e /usr/sbin/unitd ] \
+                && { echo "FAIL: stale /usr/sbin/unitd after drop-in over upstream unit"; exit 1; }
+            [ -e /lib/systemd/system/unit.service ] \
+                && { echo "FAIL: stale upstream unit.service after drop-in over upstream unit"; exit 1; }
+        fi
+        echo "drop-in upgrade over upstream unit: PASS"
+    )
 }

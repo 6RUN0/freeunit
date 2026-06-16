@@ -114,15 +114,19 @@ assert_clean_shutdown() {
         return 0
     fi
     kill -TERM "$pid" 2>/dev/null || true
+    # Wait on the process itself, not the control socket: the router removes the
+    # socket early in shutdown, so socket-absence races ahead of the main process
+    # actually exiting and would trip the kill -0 check below before the daemon is
+    # gone. kill -0 failing is the authoritative "fully shut down" signal.
     for _ in $(seq 1 30); do
-        [ -S "$sock" ] || break
+        kill -0 "$pid" 2>/dev/null || break
         sleep 0.5
     done
-    [ -S "$sock" ] \
-        && { echo "FAIL: control socket $sock still present after SIGTERM"; exit 1; }
     if kill -0 "$pid" 2>/dev/null; then
         echo "FAIL: ${RUNTIME}d (pid $pid) still running after SIGTERM"; exit 1
     fi
+    [ -S "$sock" ] \
+        && { echo "FAIL: control socket $sock still present after SIGTERM"; exit 1; }
     echo "clean shutdown assertion: PASS"
 }
 
