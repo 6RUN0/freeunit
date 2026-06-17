@@ -12,6 +12,8 @@ prefix and original NGINX/Igor Sysoev copyrights.
 
 - Default PR branch: `master`. Conventional Commits, English (see `CONTRIBUTING.md`).
 - Issue triage protocol (P0–P4 priority tiers) lives in `UNFREEZE.md`.
+- `FORK.md` and `README.md` are local to THIS downstream repo (6RUN0/freeunit) only —
+  never include their changes in PRs aimed at upstream `freeunitorg/freeunit`.
 
 ## Build & test — Docker only
 
