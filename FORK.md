@@ -18,21 +18,28 @@ curated set of language modules:
 
 | Package | Contents |
 |---------|----------|
-| `unit` | core daemon with njs and OTel |
-| `unit-php8.3` | PHP 8.3 module (runtime from deb.sury.org) |
-| `unit-php8.4` | PHP 8.4 module (runtime native to trixie) |
-| `unit-php8.5` | PHP 8.5 module (runtime from deb.sury.org) |
-| `unit-python3.13` | Python 3.13 module (native trixie) |
+| `freeunit` | core daemon with njs and OTel |
+| `freeunit-php8.3` | PHP 8.3 module (runtime from deb.sury.org) |
+| `freeunit-php8.4` | PHP 8.4 module (runtime native to trixie) |
+| `freeunit-php8.5` | PHP 8.5 module (runtime from deb.sury.org) |
+| `freeunit-python3.13` | Python 3.13 module (native trixie) |
+
+The package set is brand-named `freeunit` (daemon binary `freeunitd`, control
+socket `control.freeunit.sock`, systemd unit `freeunit.service`); the underlying
+server still reports itself as `Unit` in its `Server:` header, preserving the
+upstream lineage. The brand is a packaging knob (`BRAND`/`RUNTIME` in
+`pkg/deb/Makefile`), so a differently-branded set can be produced from the same
+tree.
 
 The packaging lives in `pkg/deb/` — one `Makefile.<lang><version>` per module,
 included from `pkg/deb/Makefile` under the `trixie` codename, following the
-upstream packaging convention. Each `unit-phpX.Y` package bundles its own PHP
+upstream packaging convention. Each `freeunit-phpX.Y` package bundles its own PHP
 embed runtime (`libphpX.Y-embed`), and running several PHP embed runtimes in one
-Unit instance is unsupported, so each module is built and smoke-tested
+server instance is unsupported, so each module is built and smoke-tested
 independently — one PHP version per instance.
 
 **Where PHP comes from.** Debian trixie ships a single PHP line — **8.4** — in
-its main archive, so `unit-php8.4` resolves its `libphp8.4-embed` runtime
+its main archive, so `freeunit-php8.4` resolves its `libphp8.4-embed` runtime
 natively. The 8.3 and 8.5 lines are absent from trixie; those modules depend on
 `libphp8.3-embed` / `libphp8.5-embed` from
 [deb.sury.org](https://deb.sury.org) — Ondřej Surý's long-standing PHP
@@ -42,13 +49,13 @@ the base apt sources**; that logic lives in one place, `pkg/deb/sury-setup.sh`,
 shared by CI and the local build script and tunable with `SURY=auto|on|off`
 (default `auto`). When enabled, deb.sury.org is pinned above the Debian archive
 so the build resolves every PHP line from one consistent source deterministically
-(this only affects 8.4, the line trixie also carries); because each `unit-phpX.Y`
+(this only affects 8.4, the line trixie also carries); because each `freeunit-phpX.Y`
 declares its runtime dependency by package name without a version, the pin stays
 a build-time detail and never changes what users install. On the target host,
 deb.sury.org must therefore be enabled before installing the 8.3 or 8.5 module —
-`php8.4` resolves `libphp8.4-embed` from trixie and needs nothing extra. The
-Python 3.13 module uses trixie's native `python3.13` and needs no extra
-repository either.
+`freeunit-php8.4` resolves `libphp8.4-embed` from trixie and needs nothing
+extra. The Python 3.13 module uses trixie's native `python3.13` and needs no
+extra repository either.
 
 ## Installing the packages
 
@@ -98,13 +105,13 @@ BASE="https://github.com/$REPO/releases/download/$TAG"
 
 curl -fLO "$BASE/SHA256SUMS"
 # The .deb asset names embed the package version; read it from SHA256SUMS:
-DEB=$(sed -nE 's/^[0-9a-f]+  unit_(.+)_amd64\.deb$/\1/p' SHA256SUMS)
-curl -fLO "$BASE/unit_${DEB}_amd64.deb"
-curl -fLO "$BASE/unit-${MOD}_${DEB}_amd64.deb"
+DEB=$(sed -nE 's/^[0-9a-f]+  freeunit_(.+)_amd64\.deb$/\1/p' SHA256SUMS)
+curl -fLO "$BASE/freeunit_${DEB}_amd64.deb"
+curl -fLO "$BASE/freeunit-${MOD}_${DEB}_amd64.deb"
 
 sha256sum -c --ignore-missing SHA256SUMS
 sudo apt-get install -y \
-  "./unit_${DEB}_amd64.deb" "./unit-${MOD}_${DEB}_amd64.deb"
+  "./freeunit_${DEB}_amd64.deb" "./freeunit-${MOD}_${DEB}_amd64.deb"
 ```
 
 `sha256sum -c --ignore-missing` checks only the files you downloaded and
@@ -119,21 +126,21 @@ The package ships a systemd unit (and a sysvinit script). Start and enable
 the daemon, then confirm the control API answers:
 
 ```bash
-sudo systemctl enable --now unit
-systemctl status unit
-sudo curl --unix-socket /var/run/control.unit.sock http://localhost/
+sudo systemctl enable --now freeunit
+systemctl status freeunit
+sudo curl --unix-socket /var/run/control.freeunit.sock http://localhost/
 ```
 
-Operator paths: control socket `/var/run/control.unit.sock`, log
-`/var/log/unit.log`, pid `/var/run/unit.pid`. An example configuration ships
-at `/usr/share/doc/unit/examples/example.config` as a starting point; for
-full configuration see upstream.
+Operator paths: control socket `/var/run/control.freeunit.sock`, log
+`/var/log/freeunit.log`, pid `/var/run/freeunit.pid`. An example configuration
+ships at `/usr/share/doc/freeunit/examples/example.config` as a starting point;
+for full configuration see upstream.
 
 ### Uninstall
 
 ```bash
-sudo apt-get remove unit    # remove binaries, keep config
-sudo apt-get purge unit     # remove everything, including config and logs
+sudo apt-get remove freeunit    # remove binaries, keep config
+sudo apt-get purge freeunit     # remove everything, including config and logs
 ```
 
 ## Building locally
@@ -158,8 +165,15 @@ exactly as CI does. Built `.deb` files land in `pkg/deb/debs/`.
 ## Continuous integration
 
 CI is defined in [`.github/workflows/build-deb.yml`](.github/workflows/build-deb.yml).
-It runs three jobs: build the packages, smoke-test each module in its own clean
-container, then (on a tag only) attach the `.deb` files to a GitHub Release.
+It runs four jobs: `build-trixie` builds the packages; `smoke-test` installs and
+exercises each module in its own clean container (config round-trip, a served
+request, and a clean-shutdown assertion); `package-qa` runs the shared package-QA
+gates (control-field + lintian checks, install/remove/purge lifecycle, and a
+drop-in upgrade over a synthetic upstream `unit` package); then `release` (on a
+tag only) attaches the `.deb` files to a GitHub Release. The smoke-test and
+package-QA gates are shared verbatim with the local runner via
+`pkg/deb/smoke-asserts.sh` and `pkg/deb/pkg-qa.sh`, so CI and `build-local.sh`
+assert exactly the same things.
 
 It is triggered by:
 
