@@ -4,6 +4,7 @@
 /.codegraph/
 /.idea/
 .omc/
+.serena/
 /.qwen/
 /AGENTS.md
 /CLAUDE.original.md
