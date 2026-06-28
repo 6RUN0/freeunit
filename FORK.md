@@ -88,6 +88,11 @@ EOF
 sudo apt-get update
 ```
 
+If `packages.sury.org` is unreachable, replace it in both the `curl` and the
+`URIs:` line with a mirror that also serves the `apt.gpg` key — for example
+`https://mirror.yandex.ru/mirrors/packages.sury.org`. See **Mirrors for
+restricted or offline builds** below for the verified list and the key checksum.
+
 ### Download, verify, and install
 
 The snippet below resolves the latest release automatically, reads the
@@ -161,6 +166,72 @@ These are the common flags; `-h` prints the full list (including `-n`
 dry-run and `-I` image override). The `SURY=auto|on|off` environment variable
 controls deb.sury.org enablement via the shared `pkg/deb/sury-setup.sh` helper,
 exactly as CI does. Built `.deb` files land in `pkg/deb/debs/`.
+
+### Mirrors for restricted or offline builds
+
+`SURY_MIRROR` replaces the deb.sury.org base — the signing **key** and the apt
+source both — for builds behind a proxy or when upstream `packages.sury.org` is
+unreachable. It is read by `pkg/deb/sury-setup.sh`, so it applies both locally
+and in CI. Empty (the default) means upstream, so behaviour is unchanged. The
+value is the base URL **without** the trailing `/php`; the helper appends
+`/php/apt.gpg` (key) and `/php/` (source) and derives the apt pin host from it.
+
+| Form | `SURY_MIRROR` value | Key resolves from |
+|------|---------------------|-------------------|
+| Upstream (default) | *(empty)* | `https://packages.sury.org/php/apt.gpg` |
+| Full reverse-proxy mirror | `https://mirror.example/sury` | `https://mirror.example/sury/php/apt.gpg` |
+| apt-cacher-ng pull-through | `http://cache.example:3142/packages.sury.org` | `http://cache.example:3142/packages.sury.org/php/apt.gpg` |
+
+The mirror must serve `/php/apt.gpg` itself, not only `dists/` and `pool/`: a
+plain package mirror that omits the key still fails on the key fetch (this is the
+common cause of an unreachable `apt.gpg`). A pull-through cache (apt-cacher-ng)
+proxies the key like any other GET, so it covers `apt.gpg` too. The fetched key
+becomes apt's trust anchor (`Signed-By`), so its transport matters: over an
+**http** base the helper **requires** `SURY_KEY_SHA256` and aborts without it
+(the key would otherwise be unauthenticated); over an **https** base the pin is
+optional and empty keeps the TLS-only trust of the upstream default.
+
+The apt source pin (`Pin: origin <host>`, which forces PHP to resolve from one
+source) is keyed on the URL host. Under a pull-through cache the host collapses
+to the cache itself — and if the Debian archive is proxied through the same cache,
+the pin no longer isolates Surý from it, so php8.4 (the one line trixie also ships)
+may resolve from either side; php8.3/8.5 are Surý-only and unaffected. Prefer a
+reverse-proxy mirror on a dedicated host when that determinism matters.
+
+**Known mirrors.** Surý runs no official mirror network — the canonical source is
+`packages.sury.org` (CDN-fronted). A few community rsync mirrors carry the full
+tree *including* the `apt.gpg` key, so they drop straight into `SURY_MIRROR` when
+upstream is down. Verified full mirrors (community-run, not endorsed — re-verify
+the host and key before relying on one):
+
+| Mirror | `SURY_MIRROR` value |
+|--------|---------------------|
+| Yandex (RU) | `https://mirror.yandex.ru/mirrors/packages.sury.org` |
+| MPI-Inf (DE) | `https://ftp.mpi-inf.mpg.de/mirrors/linux/mirror/deb.sury.org/repositories` |
+
+Both mirrors serve the same canonical signing key as upstream (OpenPGP RSA-3072,
+created 2019-03-18), so a single integrity pin covers all three sources:
+
+```text
+SURY_KEY_SHA256=b486fd5488185c4c46467960fa69c53d5085fec492cf76b9eaf3db33561c9d7c
+```
+
+Cross-check this sha256 against upstream once `packages.sury.org` is reachable
+again.
+
+Locally, pass them on the command line:
+
+```bash
+SURY_MIRROR=http://cache.example:3142/packages.sury.org \
+SURY_KEY_SHA256=<sha256> ./pkg/deb/build-local.sh
+```
+
+In CI both are exposed as `workflow_dispatch` inputs (`sury_mirror`,
+`sury_key_sha256`); push triggers leave them empty and build against upstream.
+`build-local.sh` additionally honours `DEB_MIRROR`, `CARGO_MIRROR`, and the
+`RUSTUP_*` knobs (see its `-h` header) — but those apply to the **local runner
+only**: CI does not source `mirror-setup.sh` and installs Rust directly, so it
+ignores them.
 
 ## Continuous integration
 
