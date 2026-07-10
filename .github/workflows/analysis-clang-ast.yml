@@ -70,6 +70,14 @@ jobs:
       - name: Build C tests
         run: make -j4 tests
 
+      # Actually execute the C unit-test suite (nxt_tests.c runner): parser,
+      # port/IPC fault-injection, lvlhsh, mp, rbtree, base64, utf8, clone
+      # creds, etc. It was only ever compiled before, so regressions in these
+      # units went uncaught. This job runs as root in a container, which is the
+      # right environment for the privilege-sensitive cases (e.g. clone creds).
+      - name: Run C tests
+        run: ./build/tests
+
       - name: Build Perl language module
         run: ./configure perl && make -j4 perl
 
@@ -96,7 +104,7 @@ jobs:
       # compile on a hit.
       - name: Cache wasmtime
         id: cache-wasmtime
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: pkg/contrib/wasmtime/artifacts
           key: wasmtime-debian-testing-${{ runner.arch }}-${{ hashFiles('pkg/contrib/src/wasmtime/version') }}

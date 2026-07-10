@@ -275,10 +275,10 @@ nxt_http_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
 
     joint = c->listen->socket.data;
 
-    if (nxt_slow_path(joint == NULL)) {
+    if (nxt_slow_path(joint == NULL || c->listen->draining)) {
         /*
-         * Listening socket had been closed while
-         * connection was in keep-alive state.
+         * Listening socket had been closed or is draining while
+         * connection is still idle.
          */
         c->read_state = &nxt_h1p_idle_close_state;
         return 0;
@@ -368,10 +368,10 @@ nxt_http_conn_test(nxt_task_t *task, void *obj, void *data)
 
     joint = c->listen->socket.data;
 
-    if (nxt_slow_path(joint == NULL)) {
+    if (nxt_slow_path(joint == NULL || c->listen->draining)) {
         /*
-         * Listening socket had been closed while
-         * connection was in keep-alive state.
+         * Listening socket had been closed or is draining while
+         * connection is still idle.
          */
         nxt_h1p_closing(task, c);
         return;
@@ -411,10 +411,10 @@ nxt_h1p_idle_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
 
     joint = c->listen->socket.data;
 
-    if (nxt_slow_path(joint == NULL)) {
+    if (nxt_slow_path(joint == NULL || c->listen->draining)) {
         /*
-         * Listening socket had been closed while
-         * connection was in keep-alive state.
+         * Listening socket had been closed or is draining while
+         * connection is still idle.
          */
         c->read_state = &nxt_h1p_idle_close_state;
         return 0;
@@ -2940,11 +2940,60 @@ nxt_h1p_peer_body_process(nxt_task_t *task, nxt_http_peer_t *peer,
 
     } else if (h1p->remainder > 0) {
         length = nxt_buf_chain_length(out);
-        h1p->remainder -= length;
 
-        if (h1p->remainder == 0) {
+        /*
+         * Cast to nxt_off_t can wrap to negative on 64-bit if length
+         * exceeds NXT_OFF_T_MAX; check that explicitly as well as the
+         * overrun condition.
+         */
+        if (nxt_slow_path((nxt_off_t) length < 0
+                          || (nxt_off_t) length > h1p->remainder))
+        {
+            nxt_buf_t  *b;
+            size_t     trimmed;
+
+            /*
+             * Upstream sent more body bytes than its Content-Length
+             * declared.  Truncate the buf chain to remainder bytes so
+             * we never forward the excess past the Content-Length we
+             * already advertised downstream, then flag inconsistent
+             * and close.
+             */
+            nxt_log(task, NXT_LOG_WARN,
+                    "upstream sent %uz body bytes past Content-Length "
+                    "(remainder %O)", length, h1p->remainder);
+
+            trimmed = 0;
+            for (b = out; b != NULL; b = b->next) {
+                size_t  bsz;
+
+                if (nxt_buf_is_sync(b)) {
+                    continue;
+                }
+                bsz = b->mem.free - b->mem.pos;
+                if (trimmed + bsz <= (size_t) h1p->remainder) {
+                    trimmed += bsz;
+                    continue;
+                }
+                /* Trim this buf to fit, drop everything after it. */
+                b->mem.free = b->mem.pos
+                              + (size_t) h1p->remainder - trimmed;
+                b->next = NULL;
+                break;
+            }
+
+            peer->request->inconsistent = 1;
+            h1p->remainder = 0;
             nxt_buf_chain_add(&out, nxt_http_buf_last(peer->request));
             peer->closed = 1;
+
+        } else {
+            h1p->remainder -= length;
+
+            if (h1p->remainder == 0) {
+                nxt_buf_chain_add(&out, nxt_http_buf_last(peer->request));
+                peer->closed = 1;
+            }
         }
     }
 

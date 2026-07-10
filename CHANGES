@@ -1,5 +1,83 @@
 
-Changes with FreeUnit 1.35.6                                     25 Jun 2026
+Changes with FreeUnit 1.35.6                                     07 Jul 2026
+
+    *) Bugfix: ignore a malformed incoming "traceparent" header and restart
+       the trace per W3C Trace Context instead of rejecting the request
+       with HTTP 500; the malformed header is dropped instead of being
+       forwarded alongside the restarted one, and context accepted from a
+       valid duplicate is preserved. Values are now validated in full
+       (segment lengths, lowercase hex, no all-zero ids, no "ff" version),
+       so content-invalid values restart the trace instead of being
+       re-emitted verbatim. An inbound "tracestate" is dropped together
+       with the rejected context (kept when the traceparent is inherited).
+       The injected "traceparent" fields are now zero-initialized; garbage
+       flag bits could get the header randomly dropped from proxied
+       requests and responses.
+
+    *) Bugfix: reject empty values and embedded NUL bytes in configuration
+       strings that are later used as NUL-terminated C strings ("user",
+       "group", "working_directory", "stdout", "stderr", "executable", and
+       the per-language application targets) and in pathname unix socket
+       addresses, closing a silent-truncation target confusion.
+
+    *) Bugfix: reject empty values and embedded NUL bytes in the remaining
+       configuration strings used as NUL-terminated C strings outside
+       application options: the "access_log" path (string and object
+       forms), the TLS "certificate" and njs "js_module" store names, and
+       the PHP "options.file" php.ini path.
+
+    *) Bugfix: mount rootfs automount destinations onto the openat2
+       validated descriptor via "/proc/self/fd" instead of re-resolving the
+       path, closing a check-to-use window in which a destination component
+       could be swapped for a symlink escaping the rootfs.
+
+    *) Bugfix: treat duplicate upstream "Content-Length" headers in a
+       proxied response as inconsistent — both headers are dropped and the
+       body is read to EOF instead of trusting either length, preventing a
+       response-smuggling desynchronization.
+
+    *) Bugfix: bound the request-header fields region against the shared
+       memory message size in libunit, validate every field name/value
+       serialized pointer and the cached header-field indexes before use,
+       and range-check off/len in the Java InputStream read() binding,
+       preventing out-of-bounds access on a malformed request.
+
+    *) Feature: SIGQUIT now performs a graceful stop — application workers
+       drain in-flight requests before exiting; SIGTERM remains the fast
+       exit that drops them.
+
+    *) Change: upgrade the wasm-wasi-component wasmtime crates from 35.0.0
+       to 36.0.12, clearing the wasmtime sandbox-escape advisories, with the
+       accompanying WasiView/WasiHttpView source migration.
+
+    *) Feature: two-phase listener close — reconfiguration disarms a removed
+       listener first and releases its descriptor only after pending accept
+       references drain, instead of resetting them.
+
+    *) Change: the event engine now tracks in-flight connections on a
+       dedicated active connections queue, symmetric with idle tracking —
+       groundwork for graceful connection draining; connection accounting
+       in the "/status" API is exact on all close paths.
+
+    *) Change: broaden the regression test suite — proxy Content-Length and
+       chunked-response relay framing, OpenTelemetry 5xx tracing and inbound
+       traceparent handling, and Java ServletInputStream bounds — and run
+       the C unit-test suite in CI, which was previously compiled but never
+       executed.
+
+    *) Bugfix: authorize privileged IPC message types by the kernel-validated
+       sender PID (SCM_CREDENTIALS), close any received descriptors on every
+       rejected privileged message, and cap port queue item size at the slot
+       data bound.
+
+    *) Bugfix: reject control characters (CR, LF, NUL, DEL) in "set_headers"
+       names and values at configuration load, including the literal
+       segments of templated values.
+
+    *) Bugfix: handle buffer-allocation failure in the port read handlers
+       with an orderly teardown instead of a NULL-pointer dereference, route
+       a connection write error after a partial send to the error handler
+       immediately, and free the timer batching array on engine teardown.
 
     *) Feature: upgrade the OpenTelemetry Rust crates from 0.24 to 0.32 and
        rewrite the OTLP trace exporter on the stable, dedicated-thread batch
@@ -41,6 +119,60 @@ Changes with FreeUnit 1.35.6                                     25 Jun 2026
        unmounted from the host, so a configuration reload no longer races the
        previous worker generation's teardown against the new prototype's
        procfs mount (freeunitorg/freeunit#83).
+
+    *) Bugfix: validate that a loaded TLS private key matches its certificate
+       at config time, and guard the wildcard-name SAN matcher against a
+       zero-length SAN entry.
+
+    *) Bugfix: correct IPv4 /32 CIDR fallthrough, symmetric URI/pattern
+       decoding, the PCRE2 match-data ovector size, and short port-range
+       parsing in HTTP routing; document the case-insensitive host matcher
+       and the capset stance.
+
+    *) Bugfix: tighten file-descriptor and CLOEXEC lifetime — CLOEXEC-protect
+       accepted sockets and pipe ends, close the pipe end on
+       nxt_fd_nonblocking() failure and the source fd on compression mmap
+       failure, and narrow the accept4() fallback to ENOSYS.
+
+    *) Bugfix: tighten WebSocket frame-bound checks — reject truncated
+       extended-length frames in libunit, validate the 64-bit extended-length
+       MSB (RFC 6455), fix a no-op frame-size decrement that could copy bytes
+       beyond the declared payload, bound the Java sendWsFrame JNI arguments,
+       and guard pending_payload_len overflow in the Python ASGI handler.
+
+    *) Bugfix: bounds-check peer-supplied shared-memory offsets — range-check
+       chunk_id and chunk_id+nchunks in incoming mmap messages, close a
+       lookup/dereference window on the incoming-mmap handler, reject
+       response-buffer size overflow, and validate request sptr offsets
+       before use.
+
+    *) Bugfix: bounds-check app-supplied arguments across the language
+       bindings (PHP header skip / realpath / PATH_INFO; Python WSGI and ASGI
+       checks; Perl ERRSV scrub; Java InputStream.readLine off/len; WASM
+       guest offsets).
+
+    *) Bugfix: tighten isolation boundaries — require a matching peer UID on
+       the unix control socket, resolve mount destinations with
+       openat2(RESOLVE_BENEATH), and resolve relative cgroup paths against the
+       child's /proc/<pid>/cgroup.
+
+    *) Bugfix: reject embedded NUL bytes in the "rootfs" and cgroup "path"
+       isolation options, and validate "rootfs" as an absolute path other
+       than "/" at configuration time.
+
+    *) Bugfix: reject a "rootfs" that lexically resolves to "/" (such as
+       "/.", "/..", or "/foo/.."); chroot("/") is a no-op and would silently
+       defeat rootfs isolation.
+
+    *) Bugfix: cap JSON parser depth and element counts in the controller,
+       scrub PHP TrueAsync exception state before the prototype fork, and bind
+       the Ruby rack.input / rack.errors handles to their originating request.
+
+    *) Bugfix: bound proxy Content-Length and URI/string helpers — truncate a
+       proxied response body that exceeds its Content-Length and close the
+       connection, flag invalid or oversized upstream Content-Length, fix an
+       nxt_is_complex_uri_encoded() off-by-one, and reject over-long lengths
+       in nxt_rmemstrn().
 
 
 Changes with FreeUnit 1.35.5                                     29 May 2026

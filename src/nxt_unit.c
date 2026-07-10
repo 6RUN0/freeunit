@@ -24,10 +24,16 @@
 #define NXT_UNIT_LOCAL_BUF_SIZE  \
     (NXT_UNIT_MAX_PLAIN_SIZE + sizeof(nxt_port_msg_t))
 
-enum {
-    NXT_QUIT_NORMAL   = 0,
-    NXT_QUIT_GRACEFUL = 1,
-};
+/*
+ * Wire-protocol QUIT mode selector.  The canonical enum lives in
+ * src/nxt_port.h alongside NXT_PORT_MSG_QUIT itself; the aliases
+ * below preserve the original local names without risking divergence
+ * from the daemon-side usage (the preprocessor substitutes the same
+ * enum value into every reference, so a compile-time mismatch is
+ * impossible).
+ */
+#define NXT_QUIT_NORMAL    NXT_PORT_QUIT_NORMAL
+#define NXT_QUIT_GRACEFUL  NXT_PORT_QUIT_GRACEFUL
 
 typedef struct nxt_unit_impl_s                  nxt_unit_impl_t;
 typedef struct nxt_unit_mmap_s                  nxt_unit_mmap_t;
@@ -201,6 +207,92 @@ static char * nxt_unit_snprint_prefix(char *p, char *end, pid_t pid,
 static void *nxt_unit_lvlhsh_alloc(void *data, size_t size);
 static void nxt_unit_lvlhsh_free(void *data, void *p);
 static int nxt_unit_memcasecmp(const void *p1, const void *p2, size_t length);
+
+
+/*
+ * Compute the response buffer size for a given (max_fields_count,
+ * max_fields_size) pair, rejecting integer overflow.  Both inputs come
+ * from the application; an overflow here would yield an undersized
+ * allocation that subsequent field memcpy()s overrun.
+ */
+static int
+nxt_unit_response_buf_size(uint32_t max_fields_count,
+    uint32_t max_fields_size, uint32_t *buf_size)
+{
+    /*
+     * Each field name and value is 0-terminated by libunit, hence
+     * the '+ 2' per field (matches the historical formula).
+     */
+    uint32_t  total;
+
+    if (max_fields_count
+        > (UINT32_MAX - (uint32_t) sizeof(nxt_unit_response_t))
+          / (uint32_t) (sizeof(nxt_unit_field_t) + 2))
+    {
+        return NXT_UNIT_ERROR;
+    }
+
+    total = (uint32_t) sizeof(nxt_unit_response_t)
+            + max_fields_count * (uint32_t) (sizeof(nxt_unit_field_t) + 2);
+
+    if (max_fields_size > UINT32_MAX - total) {
+        return NXT_UNIT_ERROR;
+    }
+
+    *buf_size = total + max_fields_size;
+
+    return NXT_UNIT_OK;
+}
+
+
+/*
+ * Validate that an sptr field within a peer-supplied buffer dereferences
+ * to a [length]-byte range that is wholly inside the buffer.  Used at
+ * request-arrival time to vet every sptr in nxt_unit_request_t before
+ * the application sees it.
+ *
+ * sptr->base aliases the address of the sptr itself (the union encodes
+ * an offset relative to that location), so this also implicitly checks
+ * that the sptr is inside the buffer.
+ */
+static int
+nxt_unit_sptr_in_buf(nxt_unit_sptr_t *sptr, uint32_t length,
+    void *buf_start, uint32_t buf_size)
+{
+    size_t  sptr_off, end_off;
+
+    if ((uint8_t *) sptr < (uint8_t *) buf_start) {
+        return 0;
+    }
+
+    sptr_off = (uint8_t *) sptr - (uint8_t *) buf_start;
+
+    /*
+     * The sptr struct itself must fit inside the buffer before we
+     * dereference sptr->offset.  Reject a buffer too small to hold an
+     * sptr first: buf_size is uint32_t and sizeof() is size_t, so
+     * "buf_size - sizeof(nxt_unit_sptr_t)" is evaluated in size_t and
+     * underflows to a huge value -- wrongly passing the bound check --
+     * when buf_size is smaller than the struct.  The short-circuit keeps
+     * the subtraction below from ever underflowing.
+     */
+    if (buf_size < sizeof(nxt_unit_sptr_t)
+        || sptr_off > buf_size - sizeof(nxt_unit_sptr_t))
+    {
+        return 0;
+    }
+
+    if (sptr->offset > buf_size - sptr_off) {
+        return 0;
+    }
+
+    end_off = sptr_off + sptr->offset;
+    if (length > buf_size - end_off) {
+        return 0;
+    }
+
+    return 1;
+}
 
 
 struct nxt_unit_mmap_buf_s {
@@ -1303,6 +1395,103 @@ nxt_unit_process_req_headers(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg,
         return NXT_UNIT_ERROR;
     }
 
+    /*
+     * Validate every sptr in the request struct before any code path
+     * dereferences it.  Offsets originate from the router (a more
+     * privileged peer) but the libunit ABI is also reachable from
+     * attacker-influenced input shapes; keeping the validation
+     * co-located with arrival makes the trust boundary explicit.
+     */
+    {
+        uint32_t            i;
+        nxt_unit_request_t  *vr = recv_msg->start;
+        uint32_t            vsize = recv_msg->size;
+
+        /*
+         * The fields[] array trails the fixed request struct; its region
+         * (fields_count * sizeof(nxt_unit_field_t)) must lie within the
+         * received buffer before the per-field sptr loop below -- and
+         * before nxt_unit_request_group_dup_fields() and the language
+         * modules -- dereference fields[i].  64-bit math keeps the
+         * multiplication from overflowing a 32-bit fields_count.
+         */
+        if (nxt_slow_path(sizeof(nxt_unit_request_t)
+                          + (uint64_t) vr->fields_count
+                            * sizeof(nxt_unit_field_t)
+                          > vsize))
+        {
+            nxt_unit_warn(ctx, "#%"PRIu32": malformed request: fields_count "
+                          "%"PRIu32" exceeds buffer", recv_msg->stream,
+                          vr->fields_count);
+            return NXT_UNIT_ERROR;
+        }
+
+        if (nxt_slow_path(
+               !nxt_unit_sptr_in_buf(&vr->method, vr->method_length,
+                                     recv_msg->start, vsize)
+            || !nxt_unit_sptr_in_buf(&vr->version, vr->version_length,
+                                     recv_msg->start, vsize)
+            || !nxt_unit_sptr_in_buf(&vr->remote, vr->remote_length,
+                                     recv_msg->start, vsize)
+            || !nxt_unit_sptr_in_buf(&vr->local_addr, vr->local_addr_length,
+                                     recv_msg->start, vsize)
+            || !nxt_unit_sptr_in_buf(&vr->local_port, vr->local_port_length,
+                                     recv_msg->start, vsize)
+            || !nxt_unit_sptr_in_buf(&vr->server_name, vr->server_name_length,
+                                     recv_msg->start, vsize)
+            || !nxt_unit_sptr_in_buf(&vr->target, vr->target_length,
+                                     recv_msg->start, vsize)
+            || !nxt_unit_sptr_in_buf(&vr->path, vr->path_length,
+                                     recv_msg->start, vsize)
+            || !nxt_unit_sptr_in_buf(&vr->query, vr->query_length,
+                                     recv_msg->start, vsize)
+            || !nxt_unit_sptr_in_buf(&vr->preread_content, 0,
+                                     recv_msg->start, vsize)))
+        {
+            nxt_unit_warn(ctx, "#%"PRIu32": malformed request: "
+                          "sptr out of buffer", recv_msg->stream);
+            return NXT_UNIT_ERROR;
+        }
+
+        for (i = 0; i < vr->fields_count; i++) {
+            if (nxt_slow_path(
+                   !nxt_unit_sptr_in_buf(&vr->fields[i].name,
+                                         vr->fields[i].name_length,
+                                         recv_msg->start, vsize)
+                || !nxt_unit_sptr_in_buf(&vr->fields[i].value,
+                                         vr->fields[i].value_length,
+                                         recv_msg->start, vsize)))
+            {
+                nxt_unit_warn(ctx, "#%"PRIu32": malformed request: field "
+                              "%"PRIu32" sptr out of buffer",
+                              recv_msg->stream, i);
+                return NXT_UNIT_ERROR;
+            }
+        }
+
+        /*
+         * The cached header indexes also arrive from the peer.  Consumers
+         * (language modules) dereference fields[<index>] after only
+         * checking against NXT_UNIT_NONE_FIELD, so an in-range fields_count
+         * paired with an out-of-range cached index still drives an OOB
+         * read.  Reject any that is neither "unset" nor a valid index.
+         */
+        if (nxt_slow_path(
+               (vr->content_length_field != NXT_UNIT_NONE_FIELD
+                && vr->content_length_field >= vr->fields_count)
+            || (vr->content_type_field != NXT_UNIT_NONE_FIELD
+                && vr->content_type_field >= vr->fields_count)
+            || (vr->cookie_field != NXT_UNIT_NONE_FIELD
+                && vr->cookie_field >= vr->fields_count)
+            || (vr->authorization_field != NXT_UNIT_NONE_FIELD
+                && vr->authorization_field >= vr->fields_count)))
+        {
+            nxt_unit_warn(ctx, "#%"PRIu32": malformed request: cached field "
+                          "index out of range", recv_msg->stream);
+            return NXT_UNIT_ERROR;
+        }
+    }
+
     req_impl = nxt_unit_request_info_get(ctx);
     if (nxt_slow_path(req_impl == NULL)) {
         nxt_unit_warn(ctx, "#%"PRIu32": request info allocation failed",
@@ -1679,10 +1868,36 @@ nxt_unit_process_websocket(nxt_unit_ctx_t *ctx, nxt_unit_recv_msg_t *recv_msg)
         }
 
         ws_impl->ws.header = (void *) b->buf.start;
-        ws_impl->ws.payload_len = nxt_websocket_frame_payload_len(
-            ws_impl->ws.header);
+
+        if (nxt_slow_path((size_t) (b->buf.end - b->buf.start) < 2)) {
+            nxt_unit_warn(ctx, "#%"PRIu32": truncated websocket frame header",
+                          req_impl->stream);
+            nxt_unit_websocket_frame_release(&ws_impl->ws);
+            return NXT_UNIT_ERROR;
+        }
 
         hsize = nxt_websocket_frame_header_size(ws_impl->ws.header);
+
+        /*
+         * Reject truncated frames before reading the extended length /
+         * mask fields or advancing buf.free past buf.end.  A 2-byte
+         * frame whose header advertises a 14-byte extended length would
+         * otherwise OOB-read b->buf.start + hsize - 4 (mask) and the
+         * 8-byte extended length, and break the buffer invariant.
+         */
+        if (nxt_slow_path((size_t) (b->buf.end - b->buf.start) < hsize)) {
+            nxt_unit_warn(ctx, "#%"PRIu32": truncated websocket frame: "
+                          "hsize %zu > buf size %zu",
+                          req_impl->stream, hsize,
+                          (size_t) (b->buf.end - b->buf.start));
+
+            nxt_unit_websocket_frame_release(&ws_impl->ws);
+
+            return NXT_UNIT_ERROR;
+        }
+
+        ws_impl->ws.payload_len = nxt_websocket_frame_payload_len(
+            ws_impl->ws.header);
 
         if (ws_impl->ws.header->mask) {
             ws_impl->ws.mask = (uint8_t *) b->buf.start + hsize - 4;
@@ -2042,13 +2257,15 @@ nxt_unit_response_init(nxt_unit_request_info_t *req,
         nxt_unit_req_debug(req, "duplicate response init");
     }
 
-    /*
-     * Each field name and value 0-terminated by libunit,
-     * this is the reason of '+ 2' below.
-     */
-    buf_size = sizeof(nxt_unit_response_t)
-               + max_fields_count * (sizeof(nxt_unit_field_t) + 2)
-               + max_fields_size;
+    if (nxt_slow_path(nxt_unit_response_buf_size(max_fields_count,
+                                                 max_fields_size,
+                                                 &buf_size) != NXT_UNIT_OK))
+    {
+        nxt_unit_req_alert(req, "init: response buffer size overflow "
+                           "(max_fields_count=%"PRIu32", max_fields_size=%"PRIu32")",
+                           max_fields_count, max_fields_size);
+        return NXT_UNIT_ERROR;
+    }
 
     if (nxt_slow_path(req->response_buf != NULL)) {
         buf = req->response_buf;
@@ -2121,13 +2338,15 @@ nxt_unit_response_realloc(nxt_unit_request_info_t *req,
         return NXT_UNIT_ERROR;
     }
 
-    /*
-     * Each field name and value 0-terminated by libunit,
-     * this is the reason of '+ 2' below.
-     */
-    buf_size = sizeof(nxt_unit_response_t)
-               + max_fields_count * (sizeof(nxt_unit_field_t) + 2)
-               + max_fields_size;
+    if (nxt_slow_path(nxt_unit_response_buf_size(max_fields_count,
+                                                 max_fields_size,
+                                                 &buf_size) != NXT_UNIT_OK))
+    {
+        nxt_unit_req_alert(req, "realloc: response buffer size overflow "
+                           "(max_fields_count=%"PRIu32", max_fields_size=%"PRIu32")",
+                           max_fields_count, max_fields_size);
+        return NXT_UNIT_ERROR;
+    }
 
     nxt_unit_req_debug(req, "realloc %"PRIu32"", buf_size);
 
@@ -3452,7 +3671,18 @@ nxt_unit_websocket_retain(nxt_unit_websocket_frame_t *ws)
 
     memcpy(b, ws_impl->buf->buf.start, size);
 
+    if (nxt_slow_path(size < 2)) {
+        nxt_unit_free(ws->req->ctx, b);
+        return NXT_UNIT_ERROR;
+    }
+
     hsize = nxt_websocket_frame_header_size(b);
+
+    /* Same OOB-read hazard as nxt_unit_process_websocket(). */
+    if (nxt_slow_path(hsize > size)) {
+        nxt_unit_free(ws->req->ctx, b);
+        return NXT_UNIT_ERROR;
+    }
 
     ws_impl->buf->buf.start = b;
     ws_impl->buf->buf.free = b + hsize;
@@ -5993,9 +6223,10 @@ static ssize_t
 nxt_unit_sendmsg(nxt_unit_ctx_t *ctx, int fd,
     const void *buf, size_t buf_size, const nxt_send_oob_t *oob)
 {
-    int            err;
-    ssize_t        n;
-    struct iovec   iov[1];
+    int                  err;
+    ssize_t              n;
+    struct iovec         iov[1];
+    nxt_unit_ctx_impl_t  *ctx_impl;
 
     iov[0].iov_base = (void *) buf;
     iov[0].iov_len = buf_size;
@@ -6012,11 +6243,35 @@ retry:
         }
 
         /*
-         * FIXME: This should be "alert" after router graceful shutdown
-         * implementation.
+         * Severity is conditional on the context's lifecycle state:
+         *
+         *   - online (steady state OR deferred graceful drain): the
+         *     peer should still be reachable, sendmsg failure
+         *     indicates a real problem -> nxt_unit_alert.
+         *   - !online (nxt_unit_quit() has flipped the context out of
+         *     service): the peer is going away by design, so
+         *     EPIPE/ECONNRESET-class errors are expected and would
+         *     otherwise spam the log -> warn.
+         *
+         * Note: ctx_impl->quit_param is NOT a "shutdown in progress"
+         * flag.  It is initialised to NXT_QUIT_GRACEFUL in
+         * nxt_unit_ctx_init() as the default
+         * "intended quit semantics" for the context, and is
+         * re-asserted to GRACEFUL inside nxt_unit_quit's NORMAL branch
+         * for broadcast purposes -- so it is GRACEFUL at steady state
+         * too and cannot be used to distinguish steady state from
+         * shutdown.  The unambiguous flag is ctx_impl->online.
          */
-        nxt_unit_warn(ctx, "sendmsg(%d, %d) failed: %s (%d)",
-                      fd, (int) buf_size, strerror(err), err);
+        ctx_impl = nxt_container_of(ctx, nxt_unit_ctx_impl_t, ctx);
+
+        if (ctx_impl->online) {
+            nxt_unit_alert(ctx, "sendmsg(%d, %d) failed: %s (%d)",
+                           fd, (int) buf_size, strerror(err), err);
+
+        } else {
+            nxt_unit_warn(ctx, "sendmsg(%d, %d) failed: %s (%d)",
+                          fd, (int) buf_size, strerror(err), err);
+        }
 
     } else {
         nxt_unit_debug(ctx, "sendmsg(%d, %d, %d): %d", fd, (int) buf_size,

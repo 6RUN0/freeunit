@@ -34,10 +34,10 @@ on:
         default: ""
         type: string
   push:
-    branches: [ current, stable, develop ]
+    branches: [current, stable, develop]
     tags:
-      - '[0-9]+.[0-9]+.[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+-build[0-9]+'
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-build[0-9]+"
 
 # Default to least privilege; only the release job elevates to contents: write.
 permissions:
@@ -84,7 +84,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates
 
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd   # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
 
@@ -146,7 +146,7 @@ jobs:
           ls -la pkg/deb/debs/
 
       - name: Upload .deb as workflow artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: freeunit-trixie-debs
           path: pkg/deb/debs/*.deb
@@ -169,10 +169,34 @@ jobs:
       # cannot reference the env context.
       matrix:
         include:
-          - { suffix: php8.3,     kind: php, type: "php",          port: "8083", expect: "OK-PHP-8.3" }
-          - { suffix: php8.4,     kind: php, type: "php",          port: "8084", expect: "OK-PHP-8.4" }
-          - { suffix: php8.5,     kind: php, type: "php",          port: "8085", expect: "OK-PHP-8.5" }
-          - { suffix: python3.13, kind: py,  type: "python 3.13",  port: "8013", expect: "OK-PY-3.13" }
+          - {
+              suffix: php8.3,
+              kind: php,
+              type: "php",
+              port: "8083",
+              expect: "OK-PHP-8.3",
+            }
+          - {
+              suffix: php8.4,
+              kind: php,
+              type: "php",
+              port: "8084",
+              expect: "OK-PHP-8.4",
+            }
+          - {
+              suffix: php8.5,
+              kind: php,
+              type: "php",
+              port: "8085",
+              expect: "OK-PHP-8.5",
+            }
+          - {
+              suffix: python3.13,
+              kind: py,
+              type: "python 3.13",
+              port: "8013",
+              expect: "OK-PY-3.13",
+            }
 
     steps:
       # Need the repo for pkg/deb/sury-setup.sh (sourced by the run step below).
@@ -186,12 +210,12 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates
 
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd   # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
 
       - name: Download built .deb packages
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: freeunit-trixie-debs
           path: debs
@@ -316,12 +340,12 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates
 
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd   # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
 
       - name: Download built .deb packages
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: freeunit-trixie-debs
           path: debs
@@ -356,10 +380,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # required to upload assets to the release
+      contents: write # required to upload assets to the release
     steps:
       - name: Download built .deb packages
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: freeunit-trixie-debs
           path: debs
@@ -448,7 +472,7 @@ jobs:
           NOTES
 
       - name: Attach .deb to GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda   # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           body_path: RELEASE_NOTES.md
           files: |
