@@ -1,6 +1,13 @@
 
 Changes with FreeUnit 1.35.6                                     07 Jul 2026
 
+    *) Bugfix: the controller crashed in debug builds when a control-socket
+       connection closed after the active-connection tracking change, and
+       leaked the accepted file descriptor when a control connection failed
+       during initialization or body allocation; connection tracking and
+       teardown now route through the engine's tracking macros and the
+       close path.
+
     *) Bugfix: ignore a malformed incoming "traceparent" header and restart
        the trace per W3C Trace Context instead of rejecting the request
        with HTTP 500; the malformed header is dropped instead of being
@@ -26,6 +33,12 @@ Changes with FreeUnit 1.35.6                                     07 Jul 2026
        forms), the TLS "certificate" and njs "js_module" store names, and
        the PHP "options.file" php.ini path.
 
+    *) Bugfix: reject an embedded NUL byte in a templated static-serving
+       path ("share" and "chroot") after it is resolved from
+       request-controlled variables and before it reaches open()/openat2(),
+       preventing a silent truncation that could serve a different file
+       than the resolved path.
+
     *) Bugfix: mount rootfs automount destinations onto the openat2
        validated descriptor via "/proc/self/fd" instead of re-resolving the
        path, closing a check-to-use window in which a destination component
@@ -49,6 +62,8 @@ Changes with FreeUnit 1.35.6                                     07 Jul 2026
     *) Change: upgrade the wasm-wasi-component wasmtime crates from 35.0.0
        to 36.0.12, clearing the wasmtime sandbox-escape advisories, with the
        accompanying WasiView/WasiHttpView source migration.
+
+    *) Change: upgrade contrib njs to 1.0.0.
 
     *) Feature: two-phase listener close — reconfiguration disarms a removed
        listener first and releases its descriptor only after pending accept
@@ -173,6 +188,12 @@ Changes with FreeUnit 1.35.6                                     07 Jul 2026
        connection, flag invalid or oversized upstream Content-Length, fix an
        nxt_is_complex_uri_encoded() off-by-one, and reject over-long lengths
        in nxt_rmemstrn().
+
+    *) Feature: enforce the runtime/OS end-of-life policy automatically — the
+       unit-eol-check tool now fails when a shipped variant has outlived its
+       support window (supported_until past EOL + grace), and a new
+       eol-check GitHub workflow validates pkg/eol.json against endoflife.date
+       on every relevant pull request and weekly on a schedule.
 
 
 Changes with FreeUnit 1.35.5                                     29 May 2026

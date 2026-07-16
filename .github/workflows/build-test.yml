@@ -9,6 +9,7 @@ on:
       - 'src/**'
       - 'test/**'
       - 'pkg/contrib/**'
+      - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
   push:
     branches: master
@@ -19,6 +20,7 @@ on:
       - 'src/**'
       - 'test/**'
       - 'pkg/contrib/**'
+      - 'pkg/eol.json'
       - '.github/workflows/build-test.yml'
 
 env:
@@ -172,13 +174,13 @@ jobs:
         uses: actions/cache@v6
         with:
           path: njs
-          key: njs-${{ steps.metadata.outputs.njs_version }}-${{ runner.os }}-${{ runner.arch }}
+          key: njs-freeunitorg-${{ steps.metadata.outputs.njs_version }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Clone njs repository
         if: steps.cache-njs.outputs.cache-hit != 'true'
         uses: actions/checkout@v5
         with:
-          repository: nginx/njs
+          repository: freeunitorg/njs
           ref: '${{ steps.metadata.outputs.njs_version }}'
           path: njs
 
@@ -510,3 +512,6 @@ jobs:
 
       - name: Run C tests
         run: sudo ./build/tests
+
+      - name: Run libunit close-provenance test
+        run: ./build/unit_close_test
