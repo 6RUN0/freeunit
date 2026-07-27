@@ -2,9 +2,11 @@
 
 set -e
 
-# No early exit on non-configure arguments: the #DEBHELPER# snippets below
-# expect to run on the abort-* rollback paths too (restarting the service a
-# failed upgrade left stopped), so every argument must fall through to them.
+# No early exit on non-configure arguments: the debhelper-generated snippets
+# below expect to run on the abort-* rollback paths too (restarting the
+# service a failed upgrade left stopped), so every argument must fall through
+# to them. (Never spell the substitution token itself inside a comment —
+# dh_installdeb expands every occurrence, splicing shell code mid-comment.)
 if [ "$1" = "configure" ]; then
     if [ -n "$2" ]; then
         if dpkg --compare-versions "${2%%-*}" le "1.21.0"; then
