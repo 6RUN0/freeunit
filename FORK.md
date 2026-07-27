@@ -260,13 +260,28 @@ It is triggered by:
   from the built commit of this repository — source and packaging alike), so
   any change yields a new apt-orderable version above the last `X.Y.Z`
   release; the former `X.Y.Z-buildN` packaging tags are no longer needed and
-  no longer trigger the workflow;
+  no longer trigger the workflow. When the pushed branch is *also* listed in
+  the `DEB_SNAPSHOT_BRANCHES` variable (space-separated; deliberately no
+  default — unset or empty disables it, public snapshots are opt-in), a green
+  build is additionally published as a GitHub **prerelease** under a new
+  immutable tag equal to the package version, with `SHA256SUMS` and short
+  install notes: one tag per built commit, nothing force-moved, and — unlike
+  workflow artifacts — downloadable without a GitHub login and without the
+  90-day expiry. GitHub renames `~` and `+` to `.` in the published asset
+  names;
 - a push of a plain upstream version tag `X.Y.Z` — additionally publishes the
   `.deb` files (versioned `X.Y.Z-1`) to the matching Release. The release job
-  runs only after the smoke tests pass.
+  runs only after the smoke tests pass;
+- a push of a downstream packaging re-release tag `X.Y.Z-N` — same as the
+  plain tag, but the packages carry Debian revision `N` (`X.Y.Z-N~trixie`):
+  "same upstream version, new packaging". The `X.Y.Z` part must still match
+  `NXT_VERSION`. By convention `N` starts at 2 — `-1` is what the plain
+  upstream tag publishes, and one package version must never exist with two
+  different contents across repos.
 
 GitHub Actions are pinned to commit SHAs, and the workflow runs with
-least-privilege permissions (only the release job elevates to `contents: write`).
+least-privilege permissions (only the release and snapshot-release jobs
+elevate to `contents: write`).
 
 ## Staying in sync with upstream
 

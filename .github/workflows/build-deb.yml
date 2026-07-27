@@ -13,12 +13,17 @@ name: "Build deb packages (Debian trixie)"
 # Trigger manually (workflow_dispatch) or by pushing a branch listed in the
 # repo's DEB_BUILD_BRANCHES Actions variable (each repo — upstream or fork —
 # configures its own set; see the branch gate on build-trixie) to produce
-# build artifacts, or push an upstream "X.Y.Z" version tag to additionally
-# attach the .deb files to the matching GitHub Release. Tag builds stamp the plain X.Y.Z package version; branch/dispatch
+# build artifacts, or push an upstream "X.Y.Z" version tag — or an "X.Y.Z-N"
+# downstream packaging re-release tag — to additionally attach the .deb files
+# to the matching GitHub Release. Tag builds stamp the plain X.Y.Z package
+# version with Debian revision N from the tag (default 1); branch/dispatch
 # builds are snapshots versioned X.Y.Z+git<commit-timestamp>.<short-hash> (see
 # pkg/deb/pkg-version.sh), so any change — packaging-only included — yields a
 # new apt-orderable version and no separate "-buildN" packaging tag is needed.
-# The release job runs only after the smoke tests pass.
+# Green snapshot builds of branches opted in via the DEB_SNAPSHOT_BRANCHES
+# repo variable are additionally published as per-commit prerelease tags
+# (see the snapshot-release job). The release jobs run only after the smoke
+# tests pass.
 
 on:
   workflow_dispatch:
@@ -45,9 +50,16 @@ on:
     # unlisted branches appear as "skipped" and cost nothing).
     branches: ["**"]
     tags:
+      # Plain X.Y.Z is an upstream version release (Debian revision -1).
+      # X.Y.Z-N is a downstream packaging re-release of the same upstream
+      # version: revision N feeds RELEASE in the build step. By convention N
+      # starts at 2 — the plain tag already publishes -1, and one version
+      # with two different contents across repos must never exist.
       - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-[0-9]+"
 
-# Default to least privilege; only the release job elevates to contents: write.
+# Default to least privilege; only the release and snapshot-release jobs
+# elevate to contents: write.
 permissions:
   contents: read
 
@@ -133,7 +145,10 @@ jobs:
           set -eu
           VERSION="$(grep -m1 '^NXT_VERSION=' version | cut -d= -f2)"
           TAG="${GITHUB_REF_NAME#v}"
-          if [ "${TAG}" != "${VERSION}" ]; then
+          # An X.Y.Z-N re-release tag carries the upstream version in its
+          # X.Y.Z part; the -N Debian revision has no counterpart in the
+          # version file (it lives only in the tag and the changelog).
+          if [ "${TAG%%-*}" != "${VERSION}" ]; then
             echo "release tag '${GITHUB_REF_NAME}' does not match NXT_VERSION '${VERSION}' from the version file" >&2
             exit 1
           fi
@@ -213,7 +228,16 @@ jobs:
           VERSION="$(grep -m1 '^NXT_VERSION=' version | cut -d= -f2)"; export VERSION
           . ./pkg/deb/pkg-version.sh
           PKG_VERSION="$(pkg_version .)"
-          echo "package version: ${PKG_VERSION}"
+          # Debian revision: 1 unless an X.Y.Z-N re-release tag says otherwise.
+          # PKG_RELEASE_BUILD guards the parse — on branch/dispatch runs
+          # GITHUB_REF_NAME is a branch name, which may itself contain '-'.
+          RELEASE=1
+          if [ -n "${PKG_RELEASE_BUILD}" ]; then
+            case "${GITHUB_REF_NAME}" in
+              *-*) RELEASE="${GITHUB_REF_NAME##*-}" ;;
+            esac
+          fi
+          echo "package version: ${PKG_VERSION}-${RELEASE}"
 
           # unit*/python313 are make TARGET names (upstream-derived, unaffected by
           # brand); BRAND/RUNTIME/RUNDIR are forwarded as make vars so the built
@@ -225,7 +249,7 @@ jobs:
           make -C pkg/contrib fetch PKGS="njs wasi-sysroot libunit-wasm"
 
           make -C pkg/deb BRAND="$BRAND" RUNTIME="$RUNTIME" RUNDIR="$RUNDIR" \
-            VERSION="$PKG_VERSION" \
+            VERSION="$PKG_VERSION" RELEASE="$RELEASE" \
             unit unit-php83 unit-php84 unit-php85 unit-python313
           ls -la pkg/deb/debs/
 
@@ -565,7 +589,7 @@ jobs:
 
           Optional `-dbg` (debug symbols) and `-dev` packages are attached
           to this release. `SHA256SUMS` provides integrity only, not
-          authenticity. The installed package version is `X.Y.Z-1~trixie`
+          authenticity. The installed package version is `X.Y.Z-N~trixie`
           (the `.` in the asset file name is GitHub's renaming of `~`).
           NOTES
 
@@ -573,6 +597,111 @@ jobs:
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           body_path: RELEASE_NOTES.md
+          files: |
+            debs/*.deb
+            debs/SHA256SUMS
+
+  # Publishes a green snapshot build as a GitHub prerelease, so intermediate
+  # builds are publicly downloadable (workflow artifacts require a logged-in
+  # user with read access and expire). One NEW immutable tag per built commit
+  # — the tag IS the package version (X.Y.Z+git<ts>.<hash>), giving a 1:1
+  # deb <-> tag <-> commit mapping; nothing is ever force-moved, and a re-run
+  # on the same commit lands in the same release instead of duplicating it.
+  # A tag created here with GITHUB_TOKEN cannot retrigger this workflow
+  # (GitHub suppresses recursive runs), and the snapshot tag never matches
+  # the anchored "[0-9]+.[0-9]+.[0-9]+" release pattern anyway.
+  #
+  # Opt-in per repo via the DEB_SNAPSHOT_BRANCHES Actions variable (space-
+  # separated branch list, whole-word matched like DEB_BUILD_BRANCHES) —
+  # deliberately WITHOUT a fallback default: unset or empty means no public
+  # snapshot releases.
+  #
+  # A newer push to the same branch cancels an in-flight run including this
+  # job (see concurrency above; only tag runs are protected). At worst a
+  # cancellation mid-upload leaves a partial prerelease for the OLD commit —
+  # harmless to the next one (different tag); delete it manually if unwanted.
+  snapshot-release:
+    needs: [build-trixie, smoke-test, package-qa]
+    if: >-
+      !startsWith(github.ref, 'refs/tags/') &&
+      contains(format(' {0} ', vars.DEB_SNAPSHOT_BRANCHES), format(' {0} ', github.ref_name))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the snapshot tag + prerelease, upload assets
+    steps:
+      # Unlike the tag-release job this one needs the source checkout:
+      # pkg-version.sh recomputes the snapshot version (= the tag name) from
+      # the same commit + logic as the build job, so it resolves to exactly
+      # the PKG_VERSION stamped into the .deb file names.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Download built .deb packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: freeunit-trixie-debs
+          path: debs
+
+      - name: Generate checksums and snapshot notes
+        id: version
+        run: |
+          set -eux
+          VERSION="$(grep -m1 '^NXT_VERSION=' version | cut -d= -f2)"; export VERSION
+          . ./pkg/deb/pkg-version.sh
+          PKG_VERSION="$(pkg_version .)"
+          echo "snapshot tag/version: ${PKG_VERSION}"
+          echo "tag=${PKG_VERSION}" >> "$GITHUB_OUTPUT"
+          # As in the release job, SHA256SUMS must list the PUBLISHED asset
+          # names: on an API upload GitHub renames both '~' AND '+' to '.',
+          # and snapshot versions carry both (X.Y.Z+git...-1~trixie). The
+          # digests are hex, so the sed can only touch the file names.
+          ( cd debs && sha256sum -- *.deb | sed 's/[~+]/./g' > SHA256SUMS )
+          core=(debs/"${BRAND}"_*_amd64.deb)
+          DEB="$(basename "${core[0]}" \
+            | sed -E "s#^${BRAND}_(.+)_amd64\.deb\$#\1#")"
+          DEB="$(printf '%s' "$DEB" | tr '~+' '..')"
+          # '#' as the sed delimiter: @TAG@ never contains one, and @BRANCH@
+          # (a branch name, which may carry '/') must not terminate the
+          # expression early.
+          sed -e "s#@TAG@#${PKG_VERSION}#g" -e "s#@DEB@#${DEB}#g" \
+              -e "s#@BRAND@#${BRAND}#g" -e "s#@BRANCH@#${GITHUB_REF_NAME}#g" \
+              -e "s#@SHA@#${GITHUB_SHA}#g" \
+            > SNAPSHOT_NOTES.md <<'NOTES'
+          ## Snapshot build — not a stable release
+
+          Automated snapshot of branch `@BRANCH@` at commit @SHA@, published
+          as a prerelease. The package version `@TAG@` sorts above the last
+          stable release and below the next one, so it installs as an upgrade
+          over the matching stable package and is superseded normally later.
+
+          Debian **trixie**, amd64 only. GitHub renames `~` and `+` to `.` in
+          the published asset file names; the package version inside the .deb
+          keeps the original characters. PHP modules need the deb.sury.org
+          repository — see step 1 of any stable release's notes.
+
+          ```bash
+          DEB=@DEB@                 # version inside the asset file names
+          MOD=php8.4                # php8.3 | php8.4 | php8.5 | python3.13
+          BASE="https://github.com/${{ github.repository }}/releases/download/@TAG@"
+
+          curl -fLO "$BASE/SHA256SUMS"
+          curl -fLO "$BASE/@BRAND@_${DEB}_amd64.deb"
+          curl -fLO "$BASE/@BRAND@-${MOD}_${DEB}_amd64.deb"
+
+          sha256sum -c --ignore-missing SHA256SUMS
+          sudo apt-get install -y \
+            "./@BRAND@_${DEB}_amd64.deb" "./@BRAND@-${MOD}_${DEB}_amd64.deb"
+          ```
+          NOTES
+
+      - name: Publish snapshot prerelease
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          body_path: SNAPSHOT_NOTES.md
           files: |
             debs/*.deb
             debs/SHA256SUMS
