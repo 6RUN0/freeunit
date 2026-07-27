@@ -29,19 +29,134 @@ typedef struct {
 } nxt_http_static_conf_t;
 
 
-typedef struct {
-    nxt_http_action_t           *action;
-    nxt_str_t                   share;
-#if (NXT_HAVE_OPENAT2)
-    nxt_str_t                   chroot;
-#endif
-    uint32_t                    share_idx;
-    uint8_t                     need_body;  /* 1 bit */
-} nxt_http_static_ctx_t;
-
-
 #define NXT_HTTP_STATIC_BUF_COUNT  2
 #define NXT_HTTP_STATIC_BUF_SIZE   (128 * 1024)
+
+#if (NXT_HAVE_THREAD_STORAGE_CLASS)
+
+/*
+ * Recycle the fixed-size static-file buffer descriptors (NXT_BUF_FILE_SIZE)
+ * through a thread-local freelist to avoid a per-request malloc/free on the
+ * hot path.  This is only compiled when the compiler provides __thread
+ * storage: with nxt_thread_declare_data() over __thread the freelist head and
+ * count are plain thread-local variables, nxt_thread_get_data() resolves to
+ * their address, and nxt_thread_init_data() is a no-op -- so no runtime
+ * initialisation is required.
+ *
+ * On the pthread-specific-data fallback (see the #else branch) these keys
+ * would be uninitialised (-1) until nxt_thread_init_data() ran on each router
+ * thread; this module has no such per-thread init hook (only the core
+ * nxt_thread_context is initialised that way), so there we fall back to plain
+ * allocation rather than dereference an invalid TSD key.
+ *
+ * A router worker thread drains its own freelist via
+ * nxt_http_static_buf_freelist_drain() just before it exits (see
+ * nxt_router.c): the __thread head lives in the exiting thread's storage and
+ * can only be freed while running on that thread.  Without this drain, every
+ * listen_threads churn that destroys a worker thread would leak up to
+ * NXT_HTTP_STATIC_BUF_FREELIST_MAX descriptors -- an unbounded process leak.
+ */
+
+#define NXT_HTTP_STATIC_BUF_FREELIST_MAX  32
+
+static nxt_thread_declare_data(nxt_buf_t *, nxt_http_static_buf_freelist);
+static nxt_thread_declare_data(nxt_uint_t, nxt_http_static_buf_freelist_count);
+
+
+nxt_inline nxt_buf_t *
+nxt_http_static_buf_alloc(nxt_task_t *task, nxt_mp_t *mp)
+{
+    nxt_buf_t   *fb, **fl;
+    nxt_uint_t  *count;
+
+    fl = nxt_thread_get_data(nxt_http_static_buf_freelist);
+    count = nxt_thread_get_data(nxt_http_static_buf_freelist_count);
+
+    if (*fl != NULL) {
+        fb = *fl;
+        *fl = fb->next;
+        (*count)--;
+        nxt_memzero(fb, sizeof(nxt_buf_t));
+        return fb;
+    }
+
+    fb = nxt_malloc(NXT_BUF_FILE_SIZE);
+    if (nxt_fast_path(fb != NULL)) {
+        nxt_memzero(fb, sizeof(nxt_buf_t));
+    }
+
+    return fb;
+}
+
+
+nxt_inline void
+nxt_http_static_buf_free(nxt_buf_t *fb)
+{
+    nxt_buf_t   **fl;
+    nxt_uint_t  *count;
+
+    fl = nxt_thread_get_data(nxt_http_static_buf_freelist);
+    count = nxt_thread_get_data(nxt_http_static_buf_freelist_count);
+
+    if (*count < NXT_HTTP_STATIC_BUF_FREELIST_MAX) {
+        fb->next = *fl;
+        *fl = fb;
+        (*count)++;
+
+    } else {
+        nxt_free(fb);
+    }
+}
+
+
+void
+nxt_http_static_buf_freelist_drain(void)
+{
+    nxt_buf_t   *fb, *next, **fl;
+    nxt_uint_t  *count;
+
+    fl = nxt_thread_get_data(nxt_http_static_buf_freelist);
+    count = nxt_thread_get_data(nxt_http_static_buf_freelist_count);
+
+    for (fb = *fl; fb != NULL; fb = next) {
+        next = fb->next;
+        nxt_free(fb);
+    }
+
+    *fl = NULL;
+    *count = 0;
+}
+
+#else  /* !NXT_HAVE_THREAD_STORAGE_CLASS */
+
+nxt_inline nxt_buf_t *
+nxt_http_static_buf_alloc(nxt_task_t *task, nxt_mp_t *mp)
+{
+    nxt_buf_t  *fb;
+
+    fb = nxt_malloc(NXT_BUF_FILE_SIZE);
+    if (nxt_fast_path(fb != NULL)) {
+        nxt_memzero(fb, sizeof(nxt_buf_t));
+    }
+
+    return fb;
+}
+
+
+nxt_inline void
+nxt_http_static_buf_free(nxt_buf_t *fb)
+{
+    nxt_free(fb);
+}
+
+
+void
+nxt_http_static_buf_freelist_drain(void)
+{
+}
+
+#endif
+
 
 
 static nxt_http_action_t *nxt_http_static(nxt_task_t *task,
@@ -60,6 +175,8 @@ static void nxt_http_static_extract_extension(nxt_str_t *path,
 static void nxt_http_static_body_handler(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_http_static_buf_completion(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_http_static_buf_cleanup(nxt_task_t *task, void *obj,
     void *data);
 
 static nxt_int_t nxt_http_static_mtypes_hash_test(nxt_lvlhsh_query_t *lhq,
@@ -211,11 +328,8 @@ nxt_http_static(nxt_task_t *task, nxt_http_request_t *r,
         need_body = 1;
     }
 
-    ctx = nxt_mp_zget(r->mem_pool, sizeof(nxt_http_static_ctx_t));
-    if (nxt_slow_path(ctx == NULL)) {
-        nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
-        return NULL;
-    }
+    ctx = &r->static_ctx;
+    nxt_memzero(ctx, sizeof(nxt_http_static_ctx_t));
 
     ctx->action = action;
     ctx->need_body = need_body;
@@ -575,7 +689,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         r->status = NXT_HTTP_OK;
         r->resp.content_length_n = nxt_file_size(&fi);
 
-        field = nxt_list_zero_add(r->resp.fields);
+        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
         if (nxt_slow_path(field == NULL)) {
             goto fail;
         }
@@ -592,7 +706,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         field->value = p;
         field->value_length = nxt_http_date(p, &tm) - p;
 
-        field = nxt_list_zero_add(r->resp.fields);
+        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
         if (nxt_slow_path(field == NULL)) {
             goto fail;
         }
@@ -621,7 +735,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         }
 
         if (mtype->length != 0) {
-            field = nxt_list_zero_add(r->resp.fields);
+            field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
             if (nxt_slow_path(field == NULL)) {
                 goto fail;
             }
@@ -663,7 +777,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
                 r->resp.content_length_n = out_total;
             }
 
-            fb = nxt_mp_zget(r->mem_pool, NXT_BUF_FILE_SIZE);
+            fb = nxt_http_static_buf_alloc(task, r->mem_pool);
             if (nxt_slow_path(fb == NULL)) {
                 goto fail;
             }
@@ -672,6 +786,26 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             fb->file_end = nxt_file_size(&fi);
 
             r->out = fb;
+
+            /*
+             * The descriptor is malloc-backed (freelist), not pool memory, so
+             * it is not reclaimed when the request pool is released.  On the
+             * normal path nxt_http_static_buf_completion() closes the file,
+             * clears r->out and returns fb to the freelist.  But if the header
+             * send below takes the error path the body handler is never
+             * scheduled and fb stays parked in r->out with the file still
+             * open; nothing else drains r->out (discard only drains connection
+             * buffers and r->last).  Register a pool cleanup that reclaims fb
+             * in exactly that case -- it is a no-op once r->out is cleared.
+             */
+            if (nxt_slow_path(nxt_mp_cleanup(r->mem_pool,
+                                             nxt_http_static_buf_cleanup,
+                                             task, fb, r) != NXT_OK))
+            {
+                r->out = NULL;
+                nxt_http_static_buf_free(fb);
+                goto fail;
+            }
 
             body_handler = &nxt_http_static_body_handler;
 
@@ -699,7 +833,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         r->status = NXT_HTTP_MOVED_PERMANENTLY;
         r->resp.content_length_n = 0;
 
-        field = nxt_list_zero_add(r->resp.fields);
+        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
         if (nxt_slow_path(field == NULL)) {
             goto fail;
         }
@@ -968,6 +1102,8 @@ complete_buf:
         nxt_file_close(task, fb->file);
         r->out = NULL;
 
+        nxt_http_static_buf_free(fb);
+
         b->next = nxt_http_buf_last(r);
 
     } else {
@@ -1001,6 +1137,33 @@ clean:
     if (fb != NULL) {
         nxt_file_close(task, fb->file);
         r->out = NULL;
+
+        nxt_http_static_buf_free(fb);
+    }
+}
+
+
+static void
+nxt_http_static_buf_cleanup(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_buf_t           *fb;
+    nxt_http_request_t  *r;
+
+    fb = obj;
+    r = data;
+
+    /*
+     * Runs once when the request pool is destroyed.  If fb is still parked in
+     * r->out the body handler / completion never ran (header send took the
+     * error path), so the file is still open and the descriptor still owned
+     * here: close and reclaim it.  Otherwise completion already cleared r->out
+     * and returned fb to the freelist, so this is a no-op.
+     */
+    if (r->out == fb) {
+        nxt_file_close(task, fb->file);
+        r->out = NULL;
+
+        nxt_http_static_buf_free(fb);
     }
 }
 

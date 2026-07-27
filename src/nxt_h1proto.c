@@ -505,9 +505,28 @@ nxt_h1p_conn_request_init(nxt_task_t *task, void *obj, void *data)
 
         r->task = c->task;
         task = &r->task;
-        c->socket.task = task;
-        c->read_timer.task = task;
-        c->write_timer.task = task;
+
+        nxt_assert(c->socket.task == &c->task);
+        nxt_assert(c->read_timer.task == &c->task);
+        nxt_assert(c->write_timer.task == &c->task);
+
+        /*
+         * The request task is embedded in nxt_http_request_t and thus lives in
+         * the request memory pool, which is released
+         * (nxt_http_request_close_handler -> nxt_mp_release) as soon as the
+         * request completes.  The connection's socket and timer tasks, however,
+         * are captured by value into deferred work items (nxt_conn_write /
+         * nxt_conn_read) and into expiring timer work (nxt_timer_expire), any of
+         * which can still be queued on the engine when the pool is freed -- a
+         * keep-alive / mid-stream-abort straddle (e.g. send_timeout firing while
+         * a write item is pending).  Such a stale item would then dereference the
+         * freed task, notably nxt_conn_io_write()'s leading nxt_debug(task, ...):
+         * a use-after-free.  So the connection's socket and timer tasks are left
+         * pointed at the connection-scoped &c->task (as set by nxt_conn_create);
+         * only the request state machine below uses the request-scoped task.
+         * Both tasks log through &c->log with the same ident, so request log
+         * correlation is unchanged.
+         */
 
         ret = nxt_http_parse_request_init(&h1p->parser, r->mem_pool);
 
@@ -678,9 +697,15 @@ nxt_h1p_header_process(nxt_task_t *task, nxt_h1proto_t *h1p,
     r->path = &h1p->parser.path;
     r->args = &h1p->parser.args;
 
+    r->num_inline_fields = h1p->parser.num_inline_fields;
+    if (r->num_inline_fields > 0) {
+        nxt_memcpy(r->inline_fields, h1p->parser.inline_fields,
+                   sizeof(nxt_http_field_t) * r->num_inline_fields);
+    }
     r->fields = h1p->parser.fields;
 
-    ret = nxt_http_fields_process(r->fields, &nxt_h1p_fields_hash, r);
+    ret = nxt_http_fields_process(r->inline_fields, r->num_inline_fields,
+                                  r->fields, &nxt_h1p_fields_hash, r);
     if (nxt_slow_path(ret != NXT_OK)) {
         return ret;
     }
@@ -900,6 +925,15 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 
         r->chunked = 1;
         h1p->chunked_parse.mem_pool = r->mem_pool;
+
+        /*
+         * Every buffer this parser sees on the request path belongs to someone
+         * else: the header buffer stays linked in h1p->buffers (parsed fields
+         * still point into it) and the body buffer lives in the request memory
+         * pool and remains c->read for the rest of the body.  Neither may be
+         * handed to its completion handler when a read carries only framing.
+         */
+        h1p->chunked_parse.retain_buffers = 1;
         break;
 
     case NXT_HTTP_TE_UNSUPPORTED:
@@ -1443,14 +1477,16 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
         size += connection[conn].length;
     }
 
-    nxt_list_each(field, r->resp.fields) {
+    nxt_http_fields_each(field, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
 
         if (!field->skip) {
             size += field->name_length + field->value_length;
             size += nxt_length(": \r\n");
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     if (nxt_slow_path(n == NXT_HTTP_UPGRADE_REQUIRED)) {
         size += nxt_length(websocket_version);
@@ -1464,7 +1500,9 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
 
     p = nxt_cpymem(header->mem.free, status->start, status->length);
 
-    nxt_list_each(field, r->resp.fields) {
+    nxt_http_fields_each(field, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
 
         if (!field->skip) {
             p = nxt_cpymem(p, field->name, field->name_length);
@@ -1473,7 +1511,7 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
             *p++ = '\r'; *p++ = '\n';
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     if (conn >= 0) {
         p = nxt_cpymem(p, connection[conn].start, connection[conn].length);
@@ -1753,7 +1791,7 @@ nxt_h1p_conn_request_error(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
-    if (r->fields == NULL) {
+    if (r->method == NULL) {
         (void) nxt_h1p_header_process(task, h1p, r);
     }
 
@@ -1789,7 +1827,7 @@ nxt_h1p_conn_request_timeout(nxt_task_t *task, void *obj, void *data)
     h1p->keepalive = 0;
     r = h1p->request;
 
-    if (r->fields == NULL) {
+    if (r->method == NULL) {
         (void) nxt_h1p_header_process(task, h1p, r);
     }
 
@@ -1853,10 +1891,18 @@ nxt_h1p_request_close(nxt_task_t *task, nxt_http_proto_t proto,
     nxt_router_conf_release(task, joint);
 
     c = h1p->conn;
+
+    nxt_assert(c->socket.task == &c->task);
+    nxt_assert(c->read_timer.task == &c->task);
+    nxt_assert(c->write_timer.task == &c->task);
+
     task = &c->task;
-    c->socket.task = task;
-    c->read_timer.task = task;
-    c->write_timer.task = task;
+    /*
+     * The connection's socket and timer tasks were never repointed at the
+     * request task (see nxt_h1p_conn_request_init), so they already reference
+     * &c->task; only the local task is reset for the keep-alive or shutdown
+     * that follows.
+     */
 
     if (h1p->keepalive) {
         nxt_h1p_keepalive(task, h1p, c);
@@ -2454,14 +2500,16 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
         size += nxt_length("Content-Length: ") + NXT_OFF_T_LEN + nxt_length("\r\n");
     }
 
-    nxt_list_each(field, r->fields) {
+    nxt_http_fields_each(field, r->inline_fields, r->num_inline_fields,
+                         r->fields)
+    {
 
         if (!field->hopbyhop && !field->skip) {
             size += field->name_length + field->value_length;
             size += nxt_length(": \r\n");
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     header = nxt_http_buf_mem(task, r, size);
     if (nxt_slow_path(header == NULL)) {
@@ -2476,7 +2524,9 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
     p = nxt_cpymem(p, " HTTP/1.1\r\n", 11);
     p = nxt_cpymem(p, "Connection: close\r\n", 19);
 
-    nxt_list_each(field, r->fields) {
+    nxt_http_fields_each(field, r->inline_fields, r->num_inline_fields,
+                         r->fields)
+    {
 
         if (!field->hopbyhop && !field->skip) {
             p = nxt_cpymem(p, field->name, field->name_length);
@@ -2485,7 +2535,7 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
             *p++ = '\r'; *p++ = '\n';
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     if (content_length >= 0) {
         p = nxt_cpymem(p, "Content-Length: ", nxt_length("Content-Length: "));
@@ -2524,8 +2574,6 @@ nxt_h1p_peer_header_send(nxt_task_t *task, nxt_http_peer_t *peer)
         }
 
         size += nxt_buf_used_size(body);
-
-//        nxt_mp_retain(r->mem_pool);
     }
 
     if (size > 16384) {
@@ -2766,9 +2814,16 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
     switch (ret) {
 
     case NXT_DONE:
+        peer->num_inline_fields = peer->proto.h1->parser.num_inline_fields;
+        if (peer->num_inline_fields > 0) {
+            nxt_memcpy(peer->inline_fields,
+                       peer->proto.h1->parser.inline_fields,
+                       sizeof(nxt_http_field_t) * peer->num_inline_fields);
+        }
         peer->fields = peer->proto.h1->parser.fields;
 
-        ret = nxt_http_fields_process(peer->fields,
+        ret = nxt_http_fields_process(peer->inline_fields,
+                                      peer->num_inline_fields, peer->fields,
                                       &nxt_h1p_peer_fields_hash, r);
         if (nxt_slow_path(ret != NXT_OK)) {
             peer->status = NXT_HTTP_INTERNAL_SERVER_ERROR;
@@ -3176,10 +3231,19 @@ nxt_h1p_peer_close(nxt_task_t *task, nxt_http_peer_t *peer)
     peer->closed = 1;
 
     c = peer->proto.h1->conn;
+
+    nxt_assert(c->socket.task == &c->task);
+    nxt_assert(c->read_timer.task == &c->task);
+    nxt_assert(c->write_timer.task == &c->task);
+
+    /*
+     * The upstream connection's socket and timer tasks are connection-scoped
+     * for its whole lifetime (nxt_conn_create() sets them; nxt_conn_socket()
+     * only rechecks), so there is nothing to reset here -- only the local task
+     * is switched to the connection for the close below, which runs after the
+     * request may already be gone.
+     */
     task = &c->task;
-    c->socket.task = task;
-    c->read_timer.task = task;
-    c->write_timer.task = task;
 
     /*
      * Block further I/O on the upstream connection and cancel its timers.

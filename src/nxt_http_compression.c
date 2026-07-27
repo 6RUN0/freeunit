@@ -475,7 +475,7 @@ nxt_http_comp_set_header(nxt_http_request_t *r, nxt_uint_t comp_idx)
     static const nxt_str_t  content_encoding_str =
                                     nxt_string("Content-Encoding");
 
-    f = nxt_list_add(r->resp.fields);
+    f = nxt_http_resp_field_add(&r->resp, r->mem_pool);
     if (nxt_slow_path(f == NULL)) {
         return NXT_ERROR;
     }
@@ -498,15 +498,26 @@ nxt_http_comp_set_header(nxt_http_request_t *r, nxt_uint_t comp_idx)
         /*
          * As per RFC 2616 section 4.4 item 3, you should not send
          * Content-Length when a Transfer-Encoding header is present.
+         *
+         * Skip every Content-Length, not just the first: leaving a second one
+         * behind would emit an advertised body length alongside the chunked
+         * framing this response now uses, which a downstream parser can use to
+         * re-frame the body.  Match on name_length + nxt_memcasecmp() rather
+         * than nxt_strcasecmp(): nxt_http_field_t carries a length-tracked
+         * name and only happens to be NUL-terminated on the paths that reach
+         * compression today (libunit-built app responses and static-file
+         * literals), which is not part of the type's contract.
          */
-        nxt_list_each(f, r->resp.fields) {
-            if (nxt_strcasecmp(f->name,
-                               (const u_char *)"Content-Length") == 0)
+        nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                             r->resp.fields)
+        {
+            if (f->name_length == nxt_length("Content-Length")
+                && nxt_memcasecmp(f->name, "Content-Length",
+                                  nxt_length("Content-Length")) == 0)
             {
                 f->skip = true;
-                break;
             }
-        } nxt_list_loop;
+        } nxt_http_fields_loop;
     }
 
     return NXT_OK;
@@ -518,11 +529,13 @@ nxt_http_comp_is_resp_content_encoded(const nxt_http_request_t *r)
 {
     nxt_http_field_t  *f;
 
-    nxt_list_each(f, r->resp.fields) {
+    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
         if (nxt_strcasecmp(f->name, (const u_char *)"Content-Encoding") == 0) {
             return true;
         }
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     return false;
 }
