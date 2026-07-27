@@ -264,20 +264,18 @@ debuild/$(SRCDIR)/debian:
 	done ; \
 	}
 
+# The topmost changelog entry must carry exactly $(VERSION)-$(RELEASE): dpkg
+# forces the upstream part of that version into the .orig tarball name. The
+# generated changelog's top entry is whatever changes.xml last recorded for
+# this package, which may lag NXT_VERSION, so rewrite it unconditionally
+# instead of matching one expected version.
 debuild/$(SRCDIR)/debian/changelog: ../../docs/changes.xml | debuild/$(SRCDIR)/debian
 	cd ../../docs && make ../build/unit.deb-changelog
-ifneq ($(DEFAULT_VERSION)$(DEFAULT_RELEASE), $(VERSION)$(RELEASE))
 	cat ../../build/unit.deb-changelog | sed \
-		-e "s/^unit ($(DEFAULT_VERSION)-$(DEFAULT_RELEASE)~/$(BRAND) ($(VERSION)-$(RELEASE)~/" \
+		-e "0,/^unit (/s/^unit ([^~)]*~/unit ($(VERSION)-$(RELEASE)~/" \
 		-e "s/^unit (/$(BRAND) (/" \
 		-e "s#%%CODENAME%%#$(CODENAME)#g" \
 		> debuild/$(SRCDIR)/debian/changelog
-else
-	cat ../../build/unit.deb-changelog | sed \
-		-e "s/^unit (/$(BRAND) (/" \
-		-e "s#%%CODENAME%%#$(CODENAME)#g" \
-		> debuild/$(SRCDIR)/debian/changelog
-endif
 
 debuild/$(BRAND)_$(VERSION).orig.tar.gz: | debuild/$(SRCDIR)/debian
 	cd ../.. && tar -czf pkg/deb/debuild/$(SRCDIR).tar.gz \
@@ -292,9 +290,13 @@ unit: check-build-depends-unit debuild/$(BRAND)_$(VERSION).orig.tar.gz debuild/$
 	cd debuild/$(SRCDIR) && debuild --preserve-envvar PATH --preserve-envvar RUSTUP_HOME -us -uc
 	mkdir -p debs
 	find debuild/ -maxdepth 1 -type f -exec cp {} debs/ \;
-	ln -s debuild/$(SRCDIR)/build $@
+	ln -sfn debuild/$(SRCDIR)/debian/build-unit/build $@
 
 debuild-%: debuild/$(BRAND)_$(VERSION).orig.tar.gz ../../docs/changes.xml
+# The directory name carries no version, so a leftover from a previous
+# (differently-versioned) build must be dropped, not reused: stale source
+# trees, debs and instantiated templates would leak into this build.
+	rm -rf $@
 	mkdir $@
 	cp debuild/$(BRAND)_$(VERSION).orig.tar.gz debuild-$*/$(BRAND)-$(MODULE_SUFFIX_$*)_$(VERSION).orig.tar.gz
 	cd $@ && tar zxf $(BRAND)-$(MODULE_SUFFIX_$*)_$(VERSION).orig.tar.gz
@@ -303,18 +305,14 @@ debuild-%: debuild/$(BRAND)_$(VERSION).orig.tar.gz ../../docs/changes.xml
 	mkdir $@/$(SRCDIR)/debian/source
 	echo '3.0 (quilt)' > $@/$(SRCDIR)/debian/source/format
 	cd ../../docs && make ../build/unit-$(MODULE_SUFFIX_$*).deb-changelog
-ifneq ($(DEFAULT_VERSION)$(DEFAULT_RELEASE), $(VERSION)$(RELEASE))
+# Force the top entry to $(VERSION)-$(RELEASE) whatever changes.xml last
+# recorded for this module (several lag NXT_VERSION), or dpkg-source will
+# look for an .orig tarball named after the stale version and fail.
 	cat ../../build/unit-$(MODULE_SUFFIX_$*).deb-changelog | sed \
-		-e "s/^unit-$(MODULE_SUFFIX_$*) ($(DEFAULT_VERSION)-$(DEFAULT_RELEASE)~/$(BRAND)-$(MODULE_SUFFIX_$*) ($(VERSION)-$(RELEASE)~/" \
+		-e "0,/^unit-$(MODULE_SUFFIX_$*) (/s/^unit-$(MODULE_SUFFIX_$*) ([^~)]*~/unit-$(MODULE_SUFFIX_$*) ($(VERSION)-$(RELEASE)~/" \
 		-e "s/^unit-$(MODULE_SUFFIX_$*) (/$(BRAND)-$(MODULE_SUFFIX_$*) (/" \
 		-e "s#%%CODENAME%%#$(CODENAME)#g" \
 		> $@/$(SRCDIR)/debian/changelog
-else
-	cat ../../build/unit-$(MODULE_SUFFIX_$*).deb-changelog | sed \
-		-e "s/^unit-$(MODULE_SUFFIX_$*) (/$(BRAND)-$(MODULE_SUFFIX_$*) (/" \
-		-e "s#%%CODENAME%%#$(CODENAME)#g" \
-		> $@/$(SRCDIR)/debian/changelog
-endif
 	if [ -f debian.module/copyright.unit-$(MODULE_SUFFIX_$*) ]; then \
 		cp debian.module/copyright.unit-$(MODULE_SUFFIX_$*) debuild-$*/$(SRCDIR)/debian/copyright ; \
 	else \
@@ -370,12 +368,21 @@ endif
         chmod +x $@/$(SRCDIR)/debian/rules ; \
 	}
 
-unit-%: check-build-depends-% | debuild-%
+# debuild-% is a normal (not order-only) prerequisite: its recipe re-runs on a
+# version change (fresh orig tarball), and only a normal dependency propagates
+# that staleness here — order-only would leave $@ "up to date" and silently
+# skip rebuilding the module against the recreated source tree.
+unit-%: check-build-depends-% debuild-%
 	@echo "===> Building $@ package"
 	cd debuild-$*/$(SRCDIR) && debuild --preserve-envvar PATH --preserve-envvar RUSTUP_HOME -us -uc
 	mkdir -p debs
 	find debuild-$*/ -maxdepth 1 -type f -exec cp {} debs/ \;
-	ln -s debuild-$*/$(SRCDIR)/build $@
+	ln -sfn debuild-$*/$(SRCDIR)/debian/build-unit/build $@
+# debuild writes .deb/.changes into debuild-$* AFTER the build tree this
+# symlink resolves to was last touched, leaving the prerequisite forever newer
+# than the target. touch (following the symlink) restores up-to-date-ness so
+# an unchanged rerun is a no-op instead of a full debuild.
+	touch $@
 
 test: unit modules
 	@{ \

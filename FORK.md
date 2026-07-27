@@ -251,7 +251,7 @@ It is triggered by:
 - `workflow_dispatch` — manual run;
 - a push to the fork development branches (`current`, `stable`, `develop`) —
   produces build artifacts. These snapshot builds are versioned
-  `X.Y.Z+git<commit-date>.<short-hash>` (computed by `pkg/deb/pkg-version.sh`
+  `X.Y.Z+git<commit-timestamp>.<short-hash>` (computed by `pkg/deb/pkg-version.sh`
   from the built commit of this repository — source and packaging alike), so
   any change yields a new apt-orderable version above the last `X.Y.Z`
   release; the former `X.Y.Z-buildN` packaging tags are no longer needed and

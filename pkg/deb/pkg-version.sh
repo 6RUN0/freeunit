@@ -13,12 +13,14 @@
 #   VERSION            upstream NXT_VERSION — what the daemon reports (1.36.0);
 #   PKG_RELEASE_BUILD  non-empty => release build: emit VERSION unchanged.
 #
-# Snapshot builds (the default) append +git<commit-date>.<short-hash> of THIS
-# repository's HEAD — the tree actually built, source and packaging alike — so
-# any change, packaging-only included, yields a new apt-orderable version:
-#   1.36.0-1  <  1.36.0+git20260727.abc12345-1  <  1.36.1-1
-# ('+' sorts above the base version, unlike '~'; the commit date keeps
-# successive snapshots monotonic where raw hashes alone would not.)
+# Snapshot builds (the default) append +git<commit-timestamp>.<short-hash> of
+# THIS repository's HEAD — the tree actually built, source and packaging alike
+# — so any change, packaging-only included, yields a new apt-orderable version:
+#   1.36.0-1  <  1.36.0+git20260727070641.abc12345-1  <  1.36.1-1
+# ('+' sorts above the base version, unlike '~'. The full commit timestamp —
+# not just the date — keeps successive snapshots monotonic: with a date alone,
+# same-day builds would be ordered by raw hash, and apt would treat roughly
+# half of them as downgrades.)
 # Uncommitted changes to tracked files add a trailing .dirty marker; outside a
 # git checkout (a release tarball) the plain VERSION is emitted with a warning.
 
@@ -38,8 +40,8 @@ pkg_version() {
     fi
 
     _pv_hash="$(git -C "${_pv_root}" rev-parse --short=8 HEAD)"
-    # Commit date (UTC), not wall clock: reproducible for a given commit.
-    _pv_date="$(TZ=UTC git -C "${_pv_root}" log -1 --format=%cd --date=format-local:%Y%m%d)"
+    # Commit timestamp (UTC), not wall clock: reproducible for a given commit.
+    _pv_stamp="$(TZ=UTC git -C "${_pv_root}" log -1 --format=%cd --date=format-local:%Y%m%d%H%M%S)"
     # Tracked-file changes only (-uno): generated build artifacts and other
     # untracked files must not flip every local rebuild to .dirty.
     _pv_dirty=""
@@ -47,5 +49,5 @@ pkg_version() {
         _pv_dirty=".dirty"
     fi
 
-    echo "${VERSION}+git${_pv_date}.${_pv_hash}${_pv_dirty}"
+    echo "${VERSION}+git${_pv_stamp}.${_pv_hash}${_pv_dirty}"
 }
