@@ -25,6 +25,13 @@
 # to hash order.)
 # Uncommitted changes to tracked files add a trailing .dirty marker; outside a
 # git checkout (a release tarball) the plain VERSION is emitted with a warning.
+# Under GitHub Actions the fallback is FATAL instead: CI always builds from a
+# checkout, so git failing there means broken version stamping, not a tarball
+# build. Container jobs hit exactly that — the workspace stays owned by the
+# runner UID while steps run as root, actions/checkout's safe.directory entry
+# lives only in a step-temporary git config, and every job degraded to the
+# plain VERSION in unison, keeping all version gates green (observed live on
+# 2026-07-27: a snapshot prerelease shipped 1.36.0-1 debs).
 
 pkg_version() {
     # shellcheck disable=SC3043  # local: every caller sources this under bash
@@ -38,6 +45,11 @@ pkg_version() {
     fi
 
     if ! git -C "${_pv_root}" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        if [ -n "${GITHUB_ACTIONS:-}" ]; then
+            echo "pkg-version: git cannot read ${_pv_root} (dubious ownership in a container job?);" >&2
+            echo "pkg-version: refusing the plain-VERSION fallback in CI — fix safe.directory in the workflow" >&2
+            return 1
+        fi
         echo "pkg-version: ${_pv_root} is not a git checkout; using plain ${VERSION}" >&2
         echo "${VERSION}"
         return 0
