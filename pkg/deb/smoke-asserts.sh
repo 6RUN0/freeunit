@@ -35,14 +35,27 @@ assert_rebrand() {
 
 # No installed packaging file may carry an unsubstituted %%placeholder%% or, on
 # a rebranded build, a stray upstream "unit" path — both mean a missed
-# substitution somewhere in pkg/deb. Scans the on-disk init/default/systemd/
-# logrotate files plus the maintainer scripts dpkg stored under /var/lib/dpkg.
+# substitution somewhere in pkg/deb. Scans every installed ${BRAND}* package —
+# the core plus whichever modules this container installed: their on-disk
+# init/default/systemd/logrotate files, the shipped example configs (the bulk
+# of the %%NAME%%/%%PACKAGE%%/%%RUNTIME%% substitutions live in the module
+# examples), plus the maintainer scripts dpkg stored under /var/lib/dpkg.
 assert_no_residual_brand() {
+    # shellcheck disable=SC3043  # local: both smoke callers source this under bash
+    local pkgs p s
     echo "=== residual-brand scan ==="
-    files="$(dpkg -L "${BRAND}" 2>/dev/null \
-        | grep -E '/(init\.d|default|systemd/system|logrotate\.d)/' || true)
-/var/lib/dpkg/info/${BRAND}.postinst /var/lib/dpkg/info/${BRAND}.preinst
-/var/lib/dpkg/info/${BRAND}.postrm /var/lib/dpkg/info/${BRAND}.prerm"
+    # Status filter: the patterns also surface the virtual %%RUNTIME%%-r<ver>
+    # coupling package (Provides of the core) and any half-removed leftovers;
+    # only really-installed packages have files worth scanning.
+    pkgs="$(dpkg-query -W -f '${db:Status-Status} ${Package}\n' "${BRAND}" "${BRAND}-*" 2>/dev/null \
+        | sed -n 's/^installed //p' || true)"
+    files="$(for p in $pkgs; do
+        dpkg -L "$p" 2>/dev/null \
+            | grep -E '/(init\.d|default|systemd/system|logrotate\.d)/|/share/doc/[^/]+/examples/' || true
+        for s in postinst preinst postrm prerm; do
+            echo "/var/lib/dpkg/info/$p.$s"
+        done
+    done)"
     # Unquoted on purpose: word-split the newline/space list (these paths never
     # contain whitespace). `set -f` disables pathname expansion so a future path
     # carrying a glob metachar (*, ?) can't silently skip a file and weaken the
@@ -130,6 +143,8 @@ run_smoke_asserts() {
 # fires. /proc/$pid/stat is parsed after the last ')' so a comm with spaces or
 # parens cannot shift the state field.
 shutdown_settled() {
+    # shellcheck disable=SC3043  # local: both smoke callers source this under bash
+    local _stat _state
     kill -0 "$1" 2>/dev/null || return 0
     _stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 0
     _state=${_stat##*) }
@@ -144,6 +159,8 @@ shutdown_settled() {
 # Paths follow the .deb configure flags via $RUNDIR (default /var/run, matching
 # pkg/deb/Makefile's RUNDIR ?= /var/run): control.$RUNTIME.sock, $RUNTIME.pid.
 assert_clean_shutdown() {
+    # shellcheck disable=SC3043  # local: both smoke callers source this under bash
+    local sock pidfile pid
     echo "=== clean shutdown (SIGTERM) assertion ==="
     sock="${RUNDIR:-/var/run}/control.${RUNTIME}.sock"
     pidfile="${RUNDIR:-/var/run}/${RUNTIME}.pid"

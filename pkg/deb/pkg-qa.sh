@@ -56,9 +56,18 @@ fi
 # Replaces), a residual-brand scan of the -dev pkg-config file, and a non-fatal
 # lintian pass over every produced .deb. Installs lintian on top.
 pkg_qa_control_lintian() {
-    local core dev pc_list field val
+    local core dev pc_list field val suffix
     core="$(ls "${DEBS_DIR}/${BRAND}_${PKG_VERSION}-"*.deb 2>/dev/null | head -n1)"
     [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${PKG_VERSION}-*.deb to QA"; return 1; }
+
+    # debian/control.in declares three binary packages; a packaging regression
+    # that stops emitting -dev or -dbg would otherwise pass every gate (the
+    # artifact upload and the smoke installs only ever need the core deb)
+    # while the release notes keep advertising both.
+    for suffix in dev dbg; do
+        ls "${DEBS_DIR}/${BRAND}-${suffix}_${PKG_VERSION}-"*.deb >/dev/null 2>&1 \
+            || { echo "FAIL: no ${DEBS_DIR}/${BRAND}-${suffix}_${PKG_VERSION}-*.deb (declared in debian/control.in)"; return 1; }
+    done
 
     # Drop-in-replacement contract: renaming unit -> freeunit relies on
     # Provides/Conflicts/Replaces so the new package supersedes the old cleanly.
@@ -116,11 +125,11 @@ pkg_lifecycle() {
     getent passwd "${RUNTIME}" >/dev/null || { echo "FAIL: ${RUNTIME} user not created"; return 1; }
 
     echo "=== remove (config retained) ==="
-    apt-get remove -y "${BRAND}"
+    apt_retry apt-get remove -y "${BRAND}"
     [ -x "/usr/sbin/${RUNTIME}d" ] && { echo "FAIL: daemon binary survived remove"; return 1; }
 
     echo "=== purge (config dropped) ==="
-    apt-get purge -y "${BRAND}"
+    apt_retry apt-get purge -y "${BRAND}"
     [ -e "/etc/default/${RUNTIME}" ] && { echo "FAIL: conffile /etc/default/${RUNTIME} survived purge"; return 1; }
     echo "purge dropped conffiles: OK"
 
@@ -177,11 +186,11 @@ pkg_lifecycle() {
 # gate is fail-closed: a failure to build/install the stand-in is fatal.
 pkg_dropin_upgrade() {
     # Run the gate body in a subshell so its cleanup trap stays scoped to this
-    # gate and never leaks to the caller's shell. dash (the CI `sh -e`) has no
-    # RETURN pseudo-signal, so an EXIT trap inside a subshell is the portable
-    # equivalent of bash's function-scoped RETURN trap: it fires on every exit
-    # path — a mid-way assertion failure or the normal success — yet stays
-    # local to the subshell rather than the surrounding shell.
+    # gate and never leaks to the caller's shell: an EXIT trap inside a
+    # subshell fires on every exit path — a mid-way assertion failure or the
+    # normal success — yet stays local to the subshell rather than the
+    # surrounding shell. (Both callers source this file under bash, but the
+    # idiom needs nothing bash-specific.)
     (
         core="$(ls "${DEBS_DIR}/${BRAND}_${PKG_VERSION}-"*.deb 2>/dev/null | head -n1)"
         [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${PKG_VERSION}-*.deb for upgrade test"; exit 1; }

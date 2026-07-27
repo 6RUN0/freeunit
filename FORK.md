@@ -249,8 +249,13 @@ assert exactly the same things.
 It is triggered by:
 
 - `workflow_dispatch` — manual run;
-- a push to the fork development branches (`current`, `stable`, `develop`) —
-  produces build artifacts. These snapshot builds are versioned
+- a push to a branch listed in the `DEB_BUILD_BRANCHES` repository Actions
+  variable (space-separated; unset defaults to `current stable develop`, and
+  an admin-set empty value also means that default — the falsy `||` fallback
+  cannot express "no branches") — produces build artifacts. The workflow
+  triggers on every branch and gates inside the `build-trixie` job, so runs
+  on unlisted branches appear as "skipped" and cost nothing. Snapshot builds
+  are versioned
   `X.Y.Z+git<commit-timestamp>.<short-hash>` (computed by `pkg/deb/pkg-version.sh`
   from the built commit of this repository — source and packaging alike), so
   any change yields a new apt-orderable version above the last `X.Y.Z`

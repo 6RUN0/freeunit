@@ -2,7 +2,7 @@ Source: %%PACKAGE%%
 Section: admin
 Priority: optional
 Maintainer: %%PACKAGE_VENDOR%%
-Build-Depends: debhelper (>= 11),
+Build-Depends: debhelper (>= 12),
                linux-libc-dev,
                libssl-dev,
                libpcre2-dev,
@@ -23,6 +23,11 @@ Homepage: %%HOMEPAGE%%
 Package: %%PACKAGE%%
 Section: admin
 Architecture: any
+# dh_installinit under compat >= 12 emits init-system-helpers (>= 1.54~)
+# through ${misc:Pre-Depends} (the --skip-systemd-native snippets need it in
+# preinst/prerm); without this field the substvar is silently dropped and
+# lintian flags skip-systemd-native-flag-missing-pre-depends.
+Pre-Depends: ${misc:Pre-Depends}
 Depends: ${misc:Depends}, ${shlibs:Depends}
 Provides: unit (= ${binary:Version}), %%RUNTIME%%-r%%UNIT_VERSION%%
 Conflicts: unit

@@ -2,7 +2,7 @@ Source: %%NAME%%
 Section: admin
 Priority: optional
 Maintainer: %%PACKAGE_VENDOR%%
-Build-Depends: debhelper (>= 11),
+Build-Depends: debhelper (>= 12),
                linux-libc-dev%%MODULE_BUILD_DEPENDS%%
 Standards-Version: 4.1.4
 Homepage: %%HOMEPAGE%%

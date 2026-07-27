@@ -214,13 +214,43 @@ check-build-depends-%:
 	}
 	touch $@
 
-debuild/$(SRCDIR)/debian:
+# Content stamp for every value substituted into the debian/ templates: the
+# recipe rewrites the file only when the value set changes, so a RELEASE/
+# CODENAME/RUNTIME switch re-instantiates the trees below — mtime comparison
+# alone cannot see a variable change.
+PKG_IDENTITY = $(VERSION) $(RELEASE) $(BRAND) $(RUNTIME) $(RUNDIR) $(BRAND_TITLE) $(HOMEPAGE) $(DOCS_URL) $(PACKAGE_VENDOR) $(CODENAME)
+
+debuild/.pkg-identity: FORCE
+	@mkdir -p debuild
+	@echo "$(PKG_IDENTITY)" | cmp -s - $@ || echo "$(PKG_IDENTITY)" > $@
+
+FORCE:
+
+# Siblings from previous differently-versioned builds are never reused: drop
+# them so -k reruns do not accumulate trees and stale artifacts. A separate
+# stamp (not part of .debian-stamp) so the module path — which needs the orig
+# tarball but not the core debian/ tree — can trigger the prune without
+# re-instantiating (and thereby wiping) the core build trees under debian/.
+debuild/.prune-stamp: debuild/.pkg-identity
+	find debuild -mindepth 1 -maxdepth 1 -type d ! -name '$(SRCDIR)' -exec rm -rf {} +
+	find debuild -maxdepth 1 -type f ! -name '.*' ! -name '$(BRAND)*_$(VERSION)[.-]*' -delete
+	touch $@
+
+# The stamp file (not the directory) is the target: an interrupted recipe
+# leaves no fresh stamp, so the next run re-enters and the leading rm -rf
+# heals the partial tree, whereas a directory target would count as made
+# forever. The template files, this Makefile with its includes
+# ($(MAKEFILE_LIST) — the substituted MODULE_*/CONFIGURE_ARGS values live
+# there) and the identity stamp are real prerequisites, so editing any of
+# them or switching RELEASE/CODENAME/RUNTIME re-instantiates the tree.
+debuild/$(SRCDIR)/.debian-stamp: $(wildcard debian/*) $(MAKEFILE_LIST) debuild/.pkg-identity
 	@{ \
 	set -e ; \
+	rm -rf debuild/$(SRCDIR)/debian ; \
 	mkdir -p debuild/$(SRCDIR) ; \
 	cp -pr debian debuild/$(SRCDIR) ; \
 	D=debuild/$(SRCDIR)/debian ; \
-	echo '11' > $$D/compat ; \
+	echo '12' > $$D/compat ; \
 	mkdir -p $$D/source ; \
 	echo '3.0 (quilt)' > $$D/source/format ; \
 	cat debian/control.in | sed \
@@ -263,47 +293,74 @@ debuild/$(SRCDIR)/debian:
 		[ "$$s" = "$$d" ] || mv $$s $$d ; \
 	done ; \
 	}
+	touch $@
 
 # The topmost changelog entry must carry exactly $(VERSION)-$(RELEASE): dpkg
 # forces the upstream part of that version into the .orig tarball name. The
 # generated changelog's top entry is whatever changes.xml last recorded for
 # this package, which may lag NXT_VERSION, so rewrite it unconditionally
 # instead of matching one expected version.
-debuild/$(SRCDIR)/debian/changelog: ../../docs/changes.xml | debuild/$(SRCDIR)/debian
+# The .debian-stamp prerequisite is normal (not order-only): re-instantiating
+# the debian/ tree removes this file, and the fresh stamp must mark it stale.
+debuild/$(SRCDIR)/debian/changelog: ../../docs/changes.xml debuild/$(SRCDIR)/.debian-stamp
 	cd ../../docs && make ../build/unit.deb-changelog
 	cat ../../build/unit.deb-changelog | sed \
 		-e "0,/^unit (/s/^unit ([^~)]*~/unit ($(VERSION)-$(RELEASE)~/" \
 		-e "s/^unit (/$(BRAND) (/" \
 		-e "s#%%CODENAME%%#$(CODENAME)#g" \
-		> debuild/$(SRCDIR)/debian/changelog
+		> $@
 
-debuild/$(BRAND)_$(VERSION).orig.tar.gz: | debuild/$(SRCDIR)/debian
+# Order-only on the prune stamp: pruning deletes stale top-level files in
+# debuild/, so it must not run concurrently with the packing below (-j) —
+# the transient $(SRCDIR).tar.gz does not match the keep pattern — yet a
+# re-run of the prune does not invalidate the tarball itself.
+debuild/$(BRAND)_$(VERSION).orig.tar.gz: | debuild/.prune-stamp
+	mkdir -p debuild
 	cd ../.. && tar -czf pkg/deb/debuild/$(SRCDIR).tar.gz \
 		--transform "s#^#$(SRCDIR)/#" \
 		LICENSE NOTICE CHANGES README.md CONTRIBUTING.md configure auto src \
 		test tools version go pkg/contrib docs/man/man8/unitd.8.in
 	mv debuild/$(SRCDIR).tar.gz debuild/$(BRAND)_$(VERSION).orig.tar.gz
-	cd debuild && tar zxf $(BRAND)_$(VERSION).orig.tar.gz
 
-unit: check-build-depends-unit debuild/$(BRAND)_$(VERSION).orig.tar.gz debuild/$(SRCDIR)/debian/changelog
+# The unpacked source tree gets its own stamp: a deleted tree (or an
+# interrupted extraction) re-extracts even while the tarball itself is up to
+# date. When the extraction lived inside the tarball recipe, a missing tree
+# never re-ran it and debuild met a tree holding only debian/.
+debuild/$(SRCDIR)/.source-stamp: debuild/$(BRAND)_$(VERSION).orig.tar.gz
+	cd debuild && tar zxf $(BRAND)_$(VERSION).orig.tar.gz
+	touch $@
+
+unit: check-build-depends-unit debuild/$(SRCDIR)/.source-stamp debuild/$(SRCDIR)/debian/changelog
 	@echo "===> Building $@ package"
 	cd debuild/$(SRCDIR) && debuild --preserve-envvar PATH --preserve-envvar RUSTUP_HOME -us -uc
 	mkdir -p debs
-	find debuild/ -maxdepth 1 -type f -exec cp {} debs/ \;
+# Pin the copy to this build's version: with -k the debuild/ dir may still
+# hold artifacts of other versions, and an unpinned copy would republish
+# them all into debs/.
+	find debuild/ -maxdepth 1 -type f \
+		\( -name '$(BRAND)*_$(VERSION)-*' -o -name '$(BRAND)_$(VERSION).orig.tar.gz' \) \
+		-exec cp {} debs/ \;
 	ln -sfn debuild/$(SRCDIR)/debian/build-unit/build $@
 
-debuild-%: debuild/$(BRAND)_$(VERSION).orig.tar.gz ../../docs/changes.xml
+# The stamp file (not the debuild-<mod> directory) is the target, for the
+# same reason as .debian-stamp above: an interrupted instantiation must
+# re-enter on the next run so the leading rm -rf can heal it. The templates
+# and the identity stamp are real prerequisites, so editing debian.module/*
+# or switching RELEASE/CODENAME re-instantiates the tree.
+debuild-%/.stamp: debuild/$(BRAND)_$(VERSION).orig.tar.gz ../../docs/changes.xml \
+		$(wildcard debian.module/*) debian/copyright $(MAKEFILE_LIST) \
+		debuild/.pkg-identity
 # The directory name carries no version, so a leftover from a previous
 # (differently-versioned) build must be dropped, not reused: stale source
 # trees, debs and instantiated templates would leak into this build.
-	rm -rf $@
-	mkdir $@
+	rm -rf debuild-$*
+	mkdir debuild-$*
 	cp debuild/$(BRAND)_$(VERSION).orig.tar.gz debuild-$*/$(BRAND)-$(MODULE_SUFFIX_$*)_$(VERSION).orig.tar.gz
-	cd $@ && tar zxf $(BRAND)-$(MODULE_SUFFIX_$*)_$(VERSION).orig.tar.gz
-	mkdir $@/$(SRCDIR)/debian
-	echo '11' > $@/$(SRCDIR)/debian/compat
-	mkdir $@/$(SRCDIR)/debian/source
-	echo '3.0 (quilt)' > $@/$(SRCDIR)/debian/source/format
+	cd debuild-$* && tar zxf $(BRAND)-$(MODULE_SUFFIX_$*)_$(VERSION).orig.tar.gz
+	mkdir debuild-$*/$(SRCDIR)/debian
+	echo '12' > debuild-$*/$(SRCDIR)/debian/compat
+	mkdir debuild-$*/$(SRCDIR)/debian/source
+	echo '3.0 (quilt)' > debuild-$*/$(SRCDIR)/debian/source/format
 	cd ../../docs && make ../build/unit-$(MODULE_SUFFIX_$*).deb-changelog
 # Force the top entry to $(VERSION)-$(RELEASE) whatever changes.xml last
 # recorded for this module (several lag NXT_VERSION), or dpkg-source will
@@ -312,7 +369,7 @@ debuild-%: debuild/$(BRAND)_$(VERSION).orig.tar.gz ../../docs/changes.xml
 		-e "0,/^unit-$(MODULE_SUFFIX_$*) (/s/^unit-$(MODULE_SUFFIX_$*) ([^~)]*~/unit-$(MODULE_SUFFIX_$*) ($(VERSION)-$(RELEASE)~/" \
 		-e "s/^unit-$(MODULE_SUFFIX_$*) (/$(BRAND)-$(MODULE_SUFFIX_$*) (/" \
 		-e "s#%%CODENAME%%#$(CODENAME)#g" \
-		> $@/$(SRCDIR)/debian/changelog
+		> debuild-$*/$(SRCDIR)/debian/changelog
 	if [ -f debian.module/copyright.unit-$(MODULE_SUFFIX_$*) ]; then \
 		cp debian.module/copyright.unit-$(MODULE_SUFFIX_$*) debuild-$*/$(SRCDIR)/debian/copyright ; \
 	else \
@@ -324,7 +381,7 @@ debuild-%: debuild/$(BRAND)_$(VERSION).orig.tar.gz ../../docs/changes.xml
 		sed -e "s#%%NAME%%#$(BRAND)-$(MODULE_SUFFIX_$*)#g" \
 		    -e "s#%%PACKAGE%%#$(BRAND)#g" \
 		    -e "s#%%RUNTIME%%#$(RUNTIME)#g" \
-		    debian.module/$${src} > $@/$(SRCDIR)/debian/$${src} ; \
+		    debian.module/$${src} > debuild-$*/$(SRCDIR)/debian/$${src} ; \
 	done ; \
 	definitions=`echo "$$MODULE_DEFINITIONS_$*" | sed -e ':a' -e 'N' -e '$$!ba' -e "s/\n/\$$CR/g"` ; \
 	prebuild=`echo "$$MODULE_PREBUILD_$*" | sed -e ':a' -e 'N' -e '$$!ba' -e "s/\n/\$$CR/g"` ; \
@@ -346,7 +403,7 @@ debuild-%: debuild/$(BRAND)_$(VERSION).orig.tar.gz ../../docs/changes.xml
                 -e "s#%%PACKAGE_VENDOR%%#$(PACKAGE_VENDOR)#g" \
                 -e "s#%%MODULE_BUILD_DEPENDS%%#$(MODULE_BUILD_DEPENDS_$*)#g" \
                 -e "s#%%MODULE_DEPENDS%%#$(MODULE_DEPENDS_$*)#g" \
-        > $@/$(SRCDIR)/debian/control ; \
+        > debuild-$*/$(SRCDIR)/debian/control ; \
         cat debian.module/$(if $(MODULE_NOARCH_$*),rules-noarch.in,rules.in) | sed \
                 -e "s#%%NAME%%#$(BRAND)-$(MODULE_SUFFIX_$*)#g" \
                 -e "s#%%RUNTIME%%#$(RUNTIME)#g" \
@@ -361,18 +418,20 @@ debuild-%: debuild/$(BRAND)_$(VERSION).orig.tar.gz ../../docs/changes.xml
                 -e "s#%%MODULE_PREBUILD%%#$${prebuild}#g" \
                 -e "s#%%MODULE_PREINSTALL%%#$${preinstall}#g" \
                 -e "s#%%MODULE_POSTINSTALL%%#$${postinstall}#g" \
-        > $@/$(SRCDIR)/debian/rules ; \
+        > debuild-$*/$(SRCDIR)/debian/rules ; \
         cat debian.module/preinst.in | sed \
                 -e "s#%%MODULE_POST%%#$$post#g" \
-        > $@/$(SRCDIR)/debian/preinst ; \
-        chmod +x $@/$(SRCDIR)/debian/rules ; \
+        > debuild-$*/$(SRCDIR)/debian/preinst ; \
+        chmod +x debuild-$*/$(SRCDIR)/debian/rules ; \
 	}
+	touch $@
 
-# debuild-% is a normal (not order-only) prerequisite: its recipe re-runs on a
-# version change (fresh orig tarball), and only a normal dependency propagates
-# that staleness here — order-only would leave $@ "up to date" and silently
-# skip rebuilding the module against the recreated source tree.
-unit-%: check-build-depends-% debuild-%
+# The module stamp is a normal (not order-only) prerequisite: its recipe
+# re-runs on a version change (fresh orig tarball), and only a normal
+# dependency propagates that staleness here — order-only would leave $@ "up
+# to date" and silently skip rebuilding the module against the recreated
+# source tree.
+unit-%: check-build-depends-% debuild-%/.stamp
 	@echo "===> Building $@ package"
 	cd debuild-$*/$(SRCDIR) && debuild --preserve-envvar PATH --preserve-envvar RUSTUP_HOME -us -uc
 	mkdir -p debs
@@ -411,6 +470,12 @@ clean:
 	rm -f check-build-depends-*
 	find . -maxdepth 1 -type l -delete
 
-.PHONY: default all modules test test-debug clean
+.PHONY: default all modules test test-debug clean FORCE
 
-.SECONDARY: $(addprefix check-build-depends-, $(MODULES)) $(addprefix debuild-, $(MODULES))
+# Half-written file targets (changelogs, stamps, tarballs) must never
+# satisfy a later run; make already deletes a changed target on a signal,
+# this extends that to recipes failing with a nonzero status.
+.DELETE_ON_ERROR:
+
+.SECONDARY: $(addprefix check-build-depends-, $(MODULES)) \
+	$(foreach m, $(MODULES), debuild-$(m)/.stamp)

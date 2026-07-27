@@ -13,9 +13,12 @@
 #
 # Options:
 #   -m         Modules-only build — build the language modules and reuse an
-#              already-built core deb (pkg/deb/debs/freeunit_*.deb). Faster.
+#              already-built core deb (pkg/deb/debs/freeunit_*.deb); its
+#              package version is adopted for the whole run, so the rebuilt
+#              modules keep depending on the reused core. Faster.
 #   -B         Build only — skip the smoke test.
-#   -s         Smoke only — skip the build, test the existing pkg/deb/debs/*.deb.
+#   -s         Smoke only — skip the build, test the existing pkg/deb/debs/*.deb
+#              (the core deb's package version is adopted; PKG_VERSION= overrides).
 #   -c         Combined smoke — serve the modules from a single container
 #              instead of one isolated container per module. Each freeunit-php8.x
 #              package bundles its own PHP embed runtime, and running several of
@@ -26,9 +29,10 @@
 #   -k         Keep build state — skip the pre-build clean of generated
 #              artifacts (debuild*/debs/symlinks). Useful for incremental runs.
 #   -C         Clean only — remove all generated artifacts (debuild*/debs/
-#              symlinks/check-build-depends-*) and exit, without building or
-#              smoke-testing. Runs the removal inside a container as root, since
-#              the build writes those files as root into the mounted tree.
+#              symlinks/check-build-depends-*, plus the pkg/contrib downloads)
+#              and exit, without building or smoke-testing. Runs the removal
+#              inside a container as root, since the build writes those files
+#              as root into the mounted tree.
 #   -I IMAGE   Base image (default: debian:trixie).
 #   -S MODE    deb.sury.org PHP repo: auto (default) | on | off. In auto mode
 #              sury is enabled only when a requested libphpX.Y-embed runtime is
@@ -222,7 +226,33 @@ esac
 # Package version the Makefile stamps into the .deb names: the plain NXT_VERSION
 # on release builds (-r / PKG_RELEASE_BUILD), a +git snapshot of this checkout
 # otherwise; a pre-set PKG_VERSION wins outright (see pkg-version.sh).
+# -s and -m reuse debs stamped with the snapshot version of the HEAD that built
+# them; recomputing from the current HEAD would miss those files after any new
+# commit, so reuse modes adopt the version of the newest core deb present.
+# Release builds (-r) are exempt: their version is the stable NXT_VERSION and
+# must not be silently overridden by a snapshot deb lying around.
 . "${SCRIPT_DIR}/pkg-version.sh"
+if [ -z "${PKG_VERSION:-}" ] && [ -z "${PKG_RELEASE_BUILD:-}" ] && ! $CLEAN_ONLY \
+   && { ! $DO_BUILD || $MODULES_ONLY; }; then
+    core_deb="$(ls -t "${REPO_ROOT}/pkg/deb/debs/${BRAND}_"*"-"*.deb 2>/dev/null | head -n1 || true)"
+    if [ -n "$core_deb" ]; then
+        PKG_VERSION="$(basename "$core_deb" | sed -E 's/^[^_]+_([^-]+)-.*$/\1/')"
+        info "Reusing the core deb version ${PKG_VERSION} (from $(basename "$core_deb"))"
+        # An adopted version older than this checkout means the reused orig
+        # tarball (and with it the module sources -m rebuilds) predates the
+        # working tree — a silent way to smoke stale code.
+        checkout_version="$(pkg_version "${REPO_ROOT}")"
+        if [ "$PKG_VERSION" != "$checkout_version" ]; then
+            warn "checkout is at ${checkout_version}, reused debs are ${PKG_VERSION}:"
+            warn "artifacts built or tested now may not match this tree (a -m module build packs sources from the ORIGINAL build's tarball); run a full build to pick up current changes"
+        fi
+    elif $DRY_RUN; then
+        warn "no ${BRAND}_*.deb in pkg/deb/debs to adopt a version from; dry-run continues with the computed snapshot"
+    else
+        err "-s/-m reuse existing debs, but pkg/deb/debs holds no ${BRAND}_*.deb — build first, or set PKG_VERSION="
+        exit 1
+    fi
+fi
 PKG_VERSION="${PKG_VERSION:-$(pkg_version "${REPO_ROOT}")}"
 
 # A release build stamps the plain version, hiding the git state — make an
@@ -266,7 +296,12 @@ set -eu
 git config --global --add safe.directory /unit 2>/dev/null || true
 rm -rf pkg/deb/debuild pkg/deb/debuild-* pkg/deb/debs \
        pkg/deb/unit pkg/deb/unit-* pkg/deb/check-build-depends-*
-echo "cleaned: pkg/deb/{debuild*,debs,unit,unit-*,check-build-depends-*}"
+# The contrib downloads are root-owned too (`make fetch` runs as root in the
+# build container) and cannot be removed from the host without sudo. Keep the
+# tracked tarballs/.gitignore; the next build refetches (~71M).
+find pkg/contrib/tarballs -maxdepth 1 -type f ! -name '.gitignore' -delete 2>/dev/null || true
+rm -f pkg/contrib/.sum-*
+echo "cleaned: pkg/deb/{debuild*,debs,unit,unit-*,check-build-depends-*}, pkg/contrib downloads"
 EOS
     info "Cleaning generated artifacts in ${REPO_ROOT}/pkg/deb ..."
     if $DRY_RUN; then
@@ -783,8 +818,8 @@ if $DO_SMOKE; then
             IFS='|' read -r module kind type port expect <<< "$row"
             # Second guard (the matrix already tracks the active PHP set): skip a
             # module whose .deb is absent, e.g. a partial -m/-s run.
-            if ! $DRY_RUN && ! ls "${DEBS_DIR}/${module}_${PKG_VERSION}"*.deb >/dev/null 2>&1; then
-                warn "Skipping ${module}: no ${module}_${PKG_VERSION}*.deb in ${DEBS_DIR}"
+            if ! $DRY_RUN && ! ls "${DEBS_DIR}/${module}_${PKG_VERSION}-"*.deb >/dev/null 2>&1; then
+                warn "Skipping ${module}: no ${module}_${PKG_VERSION}-*.deb in ${DEBS_DIR}"
                 continue
             fi
             info "Smoke-testing ${module} (isolated) ..."

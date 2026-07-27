@@ -18,13 +18,17 @@
 # — so any change, packaging-only included, yields a new apt-orderable version:
 #   1.36.0-1  <  1.36.0+git20260727070641.abc12345-1  <  1.36.1-1
 # ('+' sorts above the base version, unlike '~'. The full commit timestamp —
-# not just the date — keeps successive snapshots monotonic: with a date alone,
-# same-day builds would be ordered by raw hash, and apt would treat roughly
-# half of them as downgrades.)
+# not just the date — orders successive snapshots by commit time down to
+# one-second granularity: with a date alone, all same-day builds would sort
+# by raw hash and apt would treat roughly half of them as downgrades. Commits
+# created within the same second — e.g. a scripted rebase — still fall back
+# to hash order.)
 # Uncommitted changes to tracked files add a trailing .dirty marker; outside a
 # git checkout (a release tarball) the plain VERSION is emitted with a warning.
 
 pkg_version() {
+    # shellcheck disable=SC3043  # local: every caller sources this under bash
+    local _pv_root _pv_hash _pv_stamp _pv_dirty
     _pv_root="${1:-.}"
     : "${VERSION:?pkg_version: VERSION must be set (NXT_VERSION)}"
 

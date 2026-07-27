@@ -55,8 +55,11 @@ permissions:
 # is its own snapshot version, so an older in-flight build+smoke+QA matrix
 # (~40 runner-minutes) produces artifacts nobody will consume. Cancel it —
 # except for tag (release) builds, which must never be interrupted.
+# github.event_name keeps a manual workflow_dispatch run and a push run on
+# the same ref in separate groups, so a teammate's push cannot cancel an
+# in-flight manual build.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 # sury mode for the build/smoke jobs. workflow_dispatch can override it; pushes
@@ -135,15 +138,23 @@ jobs:
             exit 1
           fi
 
-      # Heavy third-party downloads (njs, wasi-sysroot, libunit-wasm) are
-      # cached across runs, keyed on the pinned versions/checksums — a key
-      # change means a bumped dependency, which naturally refetches. The build
-      # step warms pkg/contrib/tarballs before packing the orig tarball, so
-      # the downloads ride into every debuild source tree.
+      # Heavy third-party downloads (njs, wasi-sysroot) are cached across
+      # runs, keyed on the pinned versions/checksums — a key change means a
+      # bumped dependency, which naturally refetches. The build step warms
+      # pkg/contrib/tarballs before packing the orig tarball, so the
+      # downloads ride into every debuild source tree. Only the two
+      # sha512-pinned tarballs are cached: libunit-wasm's check_githash never
+      # hashes the tarball bytes, so a cached copy would enter the build
+      # unverified — its ~33K git fetch stays per-run. Restoring named files
+      # (never the whole tarballs/ dir) also keeps a stale cache from
+      # overwriting the tracked tarballs/.gitignore, which would dirty the
+      # snapshot PKG_VERSION in this job only and split it across jobs.
       - name: Cache contrib tarballs
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: pkg/contrib/tarballs
+          path: |
+            pkg/contrib/tarballs/njs-*.tar.gz
+            pkg/contrib/tarballs/wasi-sysroot-*.tar.gz
           key: contrib-tarballs-${{ hashFiles('pkg/contrib/src/*/version', 'pkg/contrib/src/*/SHA512SUMS') }}
 
       - name: Install build dependencies (PHP via deb.sury.org when needed)
@@ -474,14 +485,20 @@ jobs:
           set -eux
           # SHA256SUMS lists every published .deb; users verify with
           # `sha256sum -c`. Paths are stored relative to debs/ so the
-          # checksum file works next to the downloaded packages.
-          ( cd debs && sha256sum -- *.deb > SHA256SUMS )
+          # checksum file works next to the downloaded packages. The listed
+          # names must be the PUBLISHED asset names — GitHub renames '~' to
+          # '.' on upload — or `sha256sum -c` finds nothing to verify; the
+          # digests are hex, so the sed can only touch the file names.
+          ( cd debs && sha256sum -- *.deb | sed 's/~/./g' > SHA256SUMS )
           # The asset version (e.g. 1.35.5-1.trixie) is the .deb file
           # name, which GitHub derives from the package version by
           # replacing the '~' of "1.35.5-1~trixie" with a '.'.
           core=(debs/"${BRAND}"_*_amd64.deb)
           DEB="$(basename "${core[0]}" \
             | sed -E "s#^${BRAND}_(.+)_amd64\.deb\$#\1#")"
+          # GitHub renames '~' to '.' when publishing an asset, so the curl
+          # URLs below must carry the renamed form or they 404.
+          DEB="${DEB//\~/.}"
           # @BRAND@/@RUNTIME@ keep the user-facing instructions in sync with the
           # package identity (mirrors $BRAND/$RUNTIME used everywhere else).
           sed -e "s/@TAG@/${GITHUB_REF_NAME}/g" -e "s/@DEB@/${DEB}/g" \
