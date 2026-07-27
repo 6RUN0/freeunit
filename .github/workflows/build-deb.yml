@@ -674,14 +674,16 @@ jobs:
           echo "snapshot tag/version: ${PKG_VERSION}"
           echo "tag=${PKG_VERSION}" >> "$GITHUB_OUTPUT"
           # As in the release job, SHA256SUMS must list the PUBLISHED asset
-          # names: on an API upload GitHub renames both '~' AND '+' to '.',
-          # and snapshot versions carry both (X.Y.Z+git...-1~trixie). The
-          # digests are hex, so the sed can only touch the file names.
-          ( cd debs && sha256sum -- *.deb | sed 's/[~+]/./g' > SHA256SUMS )
+          # names: on upload GitHub renames '~' to '.' but keeps '+' as is
+          # (verified empirically on the first snapshot prerelease,
+          # 2026-07-27), so of the X.Y.Z+git...-1~trixie version only the
+          # suite separator changes. The digests are hex, so the sed can
+          # only touch the file names.
+          ( cd debs && sha256sum -- *.deb | sed 's/~/./g' > SHA256SUMS )
           core=(debs/"${BRAND}"_*_amd64.deb)
           DEB="$(basename "${core[0]}" \
             | sed -E "s#^${BRAND}_(.+)_amd64\.deb\$#\1#")"
-          DEB="$(printf '%s' "$DEB" | tr '~+' '..')"
+          DEB="${DEB//\~/.}"
           # '#' as the sed delimiter: @TAG@ never contains one, and @BRANCH@
           # (a branch name, which may carry '/') must not terminate the
           # expression early.
@@ -696,10 +698,10 @@ jobs:
           stable release and below the next one, so it installs as an upgrade
           over the matching stable package and is superseded normally later.
 
-          Debian **trixie**, amd64 only. GitHub renames `~` and `+` to `.` in
-          the published asset file names; the package version inside the .deb
-          keeps the original characters. PHP modules need the deb.sury.org
-          repository — see step 1 of any stable release's notes.
+          Debian **trixie**, amd64 only. GitHub renames the version's `~` to
+          `.` in the published asset file names; the package version inside
+          the .deb keeps it. PHP modules need the deb.sury.org repository —
+          see step 1 of any stable release's notes.
 
           ```bash
           DEB=@DEB@                 # version inside the asset file names

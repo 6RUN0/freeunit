@@ -267,8 +267,8 @@ It is triggered by:
   immutable tag equal to the package version, with `SHA256SUMS` and short
   install notes: one tag per built commit, nothing force-moved, and — unlike
   workflow artifacts — downloadable without a GitHub login and without the
-  90-day expiry. GitHub renames `~` and `+` to `.` in the published asset
-  names;
+  90-day expiry. GitHub renames the version's `~` to `.` in the published
+  asset names (the `+` survives as is);
 - a push of a plain upstream version tag `X.Y.Z` — additionally publishes the
   `.deb` files (versioned `X.Y.Z-1`) to the matching Release. The release job
   runs only after the smoke tests pass;
