@@ -117,6 +117,17 @@ jobs:
             exit 1
           fi
 
+      # Heavy third-party downloads (njs, wasi-sysroot, libunit-wasm) are
+      # cached across runs, keyed on the pinned versions/checksums — a key
+      # change means a bumped dependency, which naturally refetches. The build
+      # step warms pkg/contrib/tarballs before packing the orig tarball, so
+      # the downloads ride into every debuild source tree.
+      - name: Cache contrib tarballs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: pkg/contrib/tarballs
+          key: contrib-tarballs-${{ hashFiles('pkg/contrib/src/*/version', 'pkg/contrib/src/*/SHA512SUMS') }}
+
       - name: Install build dependencies (PHP via deb.sury.org when needed)
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -179,6 +190,11 @@ jobs:
           # brand); BRAND/RUNTIME/RUNDIR are forwarded as make vars so the built
           # package names + on-disk paths match what the smoke and package-QA jobs
           # probe — exactly as pkg/deb/build-local.sh forwards them.
+          # Populate pkg/contrib/tarballs (no-op on a cache hit) before the
+          # orig tarball is packed, so the debuild trees skip the downloads.
+          # wasmtime is excluded: only the unbuilt wasm module needs it.
+          make -C pkg/contrib fetch PKGS="njs wasi-sysroot libunit-wasm"
+
           make -C pkg/deb BRAND="$BRAND" RUNTIME="$RUNTIME" RUNDIR="$RUNDIR" \
             VERSION="$PKG_VERSION" \
             unit unit-php83 unit-php84 unit-php85 unit-python313

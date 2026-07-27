@@ -440,6 +440,14 @@ rm -f "$rustup_init"
 export PATH="$CARGO_HOME/bin:$PATH"
 rustc --version
 
+# Warm the shared contrib download cache at the repo top level before any
+# debuild tree is packed: the mounted tree keeps pkg/contrib/tarballs/ across
+# runs, and the orig tarball embeds it, so every extracted source tree finds
+# njs/wasi-sysroot/libunit-wasm pre-seeded (checksum-verified) instead of
+# re-downloading them on each build. wasmtime is deliberately left out: only
+# the wasm module needs it and no default target builds that module.
+make -C pkg/contrib fetch PKGS="njs wasi-sysroot libunit-wasm"
+
 make -C pkg/deb BRAND="$BRAND" RUNTIME="$RUNTIME" RUNDIR="$RUNDIR" \
      VERSION="$PKG_VERSION" $TARGETS
 echo "=== produced debs ==="
