@@ -32,13 +32,33 @@
 # from the daemon-reported $VERSION (see pkg-version.sh).
 : "${PKG_VERSION:=${VERSION:-}}"
 
+# The build/smoke paths get apt_retry from sury-setup.sh, but the QA containers
+# source only this file (plus mirror-setup.sh) — without a retry a single
+# transient mirror hiccup fails a gate under `set -e`, the exact spurious
+# failure class apt_retry exists to remove. Same body as sury-setup.sh; the
+# guard keeps whichever definition loaded first.
+if ! command -v apt_retry >/dev/null 2>&1; then
+apt_retry() {
+    local i=1
+    while [ "$i" -lt 5 ]; do
+        if "$@"; then
+            return 0
+        fi
+        echo "apt_retry: '$*' failed (attempt ${i}/5); retrying in $((i * 3))s" >&2
+        sleep "$((i * 3))"
+        i=$((i + 1))
+    done
+    "$@"
+}
+fi
+
 # Control-field sanity (drop-in replacement relies on Provides/Conflicts/
 # Replaces), a residual-brand scan of the -dev pkg-config file, and a non-fatal
 # lintian pass over every produced .deb. Installs lintian on top.
 pkg_qa_control_lintian() {
     local core dev pc_list field val
-    core="$(ls "${DEBS_DIR}"/"${BRAND}"_"${PKG_VERSION}"*.deb 2>/dev/null | head -n1)"
-    [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${PKG_VERSION}*.deb to QA"; return 1; }
+    core="$(ls "${DEBS_DIR}/${BRAND}_${PKG_VERSION}-"*.deb 2>/dev/null | head -n1)"
+    [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${PKG_VERSION}-*.deb to QA"; return 1; }
 
     # Drop-in-replacement contract: renaming unit -> freeunit relies on
     # Provides/Conflicts/Replaces so the new package supersedes the old cleanly.
@@ -53,7 +73,7 @@ pkg_qa_control_lintian() {
     # Residual-brand scan of the -dev pkg-config file: on a rebrand the .pc must
     # be ${RUNTIME}.pc under the multiarch pkgconfig dir, never the upstream
     # unit.pc (caught lintian pkg-config-multi-arch-wrong-dir and a naming leak).
-    dev="$(ls "${DEBS_DIR}"/"${BRAND}"-dev_"${PKG_VERSION}"*.deb 2>/dev/null | head -n1)"
+    dev="$(ls "${DEBS_DIR}/${BRAND}-dev_${PKG_VERSION}-"*.deb 2>/dev/null | head -n1)"
     if [ -n "$dev" ]; then
         echo "=== -dev pkg-config scan ($(basename "$dev")) ==="
         pc_list="$(dpkg-deb -c "$dev" | awk '{print $NF}' | grep -E '/pkgconfig/[^/]+\.pc$' || true)"
@@ -72,9 +92,9 @@ pkg_qa_control_lintian() {
     # lintian on every produced .deb. Inherited upstream packaging may carry
     # pre-existing tags, so errors are surfaced loudly but kept non-fatal.
     echo "=== lintian (errors only; informational) ==="
-    apt-get update >/dev/null
-    apt-get install -y --no-install-recommends lintian >/dev/null
-    lintian --fail-on error --tag-display-limit 0 "${DEBS_DIR}"/"${BRAND}"*_"${PKG_VERSION}"*.deb \
+    apt_retry apt-get update >/dev/null
+    apt_retry apt-get install -y --no-install-recommends lintian >/dev/null
+    lintian --fail-on error --tag-display-limit 0 "${DEBS_DIR}/${BRAND}"*"_${PKG_VERSION}-"*.deb \
         || echo "WARN: lintian reported errors (see above)"
     echo "package QA done"
 }
@@ -87,11 +107,11 @@ pkg_qa_control_lintian() {
 # may still own files).
 pkg_lifecycle() {
     local core svc_file exec_bin unit_file
-    core="$(ls "${DEBS_DIR}"/"${BRAND}"_"${PKG_VERSION}"*.deb 2>/dev/null | head -n1)"
-    [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${PKG_VERSION}*.deb for lifecycle"; return 1; }
+    core="$(ls "${DEBS_DIR}/${BRAND}_${PKG_VERSION}-"*.deb 2>/dev/null | head -n1)"
+    [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${PKG_VERSION}-*.deb for lifecycle"; return 1; }
 
     echo "=== install ==="
-    apt-get install -y --no-install-recommends "$core"
+    apt_retry apt-get install -y --no-install-recommends "$core"
     test -x "/usr/sbin/${RUNTIME}d" || { echo "FAIL: daemon not installed"; return 1; }
     getent passwd "${RUNTIME}" >/dev/null || { echo "FAIL: ${RUNTIME} user not created"; return 1; }
 
@@ -105,7 +125,7 @@ pkg_lifecycle() {
     echo "purge dropped conffiles: OK"
 
     echo "=== reinstall (idempotent postinst) ==="
-    apt-get install -y --no-install-recommends "$core"
+    apt_retry apt-get install -y --no-install-recommends "$core"
     test -x "/usr/sbin/${RUNTIME}d" || { echo "FAIL: daemon not reinstalled"; return 1; }
     # The retained user/group must not be duplicated: postinst's getent guards
     # make the second useradd/groupadd a no-op (set -e would already trip on an
@@ -134,7 +154,7 @@ pkg_lifecycle() {
 
     echo "=== systemd unit verification ==="
     command -v systemd-analyze >/dev/null 2>&1 \
-        || apt-get install -y --no-install-recommends systemd >/dev/null 2>&1 || true
+        || apt_retry apt-get install -y --no-install-recommends systemd >/dev/null 2>&1 || true
     if command -v systemd-analyze >/dev/null 2>&1; then
         unit_file="$(dpkg -L "${BRAND}" | grep -E "systemd/system/${RUNTIME}\.service\$" | head -n1)"
         # Non-fatal: verify is strict and may flag tags inherited from upstream.
@@ -163,8 +183,8 @@ pkg_dropin_upgrade() {
     # path — a mid-way assertion failure or the normal success — yet stays
     # local to the subshell rather than the surrounding shell.
     (
-        core="$(ls "${DEBS_DIR}"/"${BRAND}"_"${PKG_VERSION}"*.deb 2>/dev/null | head -n1)"
-        [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${PKG_VERSION}*.deb for upgrade test"; exit 1; }
+        core="$(ls "${DEBS_DIR}/${BRAND}_${PKG_VERSION}-"*.deb 2>/dev/null | head -n1)"
+        [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${PKG_VERSION}-*.deb for upgrade test"; exit 1; }
 
         echo "=== build synthetic upstream 'unit' stand-in ==="
         arch="$(dpkg --print-architecture)"
@@ -193,14 +213,14 @@ CTL
         dpkg-deb --build --root-owner-group "$fake" "$deb"
 
         echo "=== install synthetic upstream unit ==="
-        apt-get install -y --no-install-recommends "$deb"
+        apt_retry apt-get install -y --no-install-recommends "$deb"
         test -e /usr/sbin/unitd || { echo "FAIL: synthetic unitd not installed"; exit 1; }
         test -e /lib/systemd/system/unit.service || { echo "FAIL: synthetic unit.service not installed"; exit 1; }
         dpkg-query -W -f '${Status}' unit 2>/dev/null | grep -q '^install ok installed$' \
             || { echo "FAIL: synthetic 'unit' not registered as installed"; exit 1; }
 
         echo "=== install ${BRAND} over unit (Conflicts/Replaces) ==="
-        apt-get install -y --no-install-recommends "$core"
+        apt_retry apt-get install -y --no-install-recommends "$core"
         test -x "/usr/sbin/${RUNTIME}d" || { echo "FAIL: ${RUNTIME}d missing after drop-in install"; exit 1; }
         # The upstream package must have been superseded, not left half-installed.
         if dpkg-query -W -f '${Status}' unit 2>/dev/null | grep -q '^install ok installed$'; then

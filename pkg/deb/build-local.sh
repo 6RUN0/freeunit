@@ -36,7 +36,7 @@
 #              PHP line, so multi-version PHP normally needs it). Use off to
 #              build against base sources only, on to force-enable.
 #   -r         Release build — stamp the plain NXT_VERSION into the .deb
-#              version instead of the default +git<commit-date>.<short-hash>
+#              version instead of the default +git<commit-timestamp>.<short-hash>
 #              snapshot (equivalent to PKG_RELEASE_BUILD=1; see
 #              pkg/deb/pkg-version.sh).
 #   -n         Dry-run — print the docker commands, do not execute.
@@ -64,7 +64,7 @@
 #   CARGO_MIRROR        crates.io registry replacement (e.g. sparse+https://host/index/).
 #   Plus BRAND / RUNTIME (package identity) and RUST_TOOLCHAIN / RUSTUP_INIT_SHA256.
 #   PKG_VERSION        override the .deb package version outright; by default a
-#                      snapshot version NXT_VERSION+git<commit-date>.<short-hash>
+#                      snapshot version NXT_VERSION+git<commit-timestamp>.<short-hash>
 #                      (+ .dirty on uncommitted tracked changes) is computed from
 #                      this checkout via pkg/deb/pkg-version.sh.
 #   PKG_RELEASE_BUILD  non-empty => release build: stamp the plain NXT_VERSION.
@@ -82,7 +82,9 @@ set -euo pipefail
 # Defaults
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null)"
+# `|| true`: under `set -e` a failing $(git ...) inside a plain assignment
+# kills the whole script, which would make the tarball fallback unreachable.
+REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || true)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 
 IMAGE="debian:trixie"
@@ -408,18 +410,28 @@ registry = "${CARGO_MIRROR}"
 CARGOCFG
     echo "cargo: crates.io -> ${CARGO_MIRROR}"
 fi
-# Fetch the installer to a file (not a blind curl|sh), optionally verify its
-# checksum, then install the pinned toolchain. The default upstream fetch is
-# pinned to =https; a custom RUSTUP_INIT_URL (e.g. an http local mirror)
-# is taken as-is since the operator vouches for it, and RUSTUP_INIT_SHA256 below
-# still guards integrity over any transport.
+# Fetch the installer to a file (not a blind curl|sh), verify its checksum,
+# then install the pinned toolchain. It runs as root in this container, so a
+# non-https RUSTUP_INIT_URL (e.g. an http local mirror) has no transport
+# integrity at all and RUSTUP_INIT_SHA256 becomes mandatory — symmetric with
+# the SURY_KEY_SHA256 guard in sury-setup.sh. Over https the checksum stays
+# optional defence-in-depth; --proto-redir keeps a redirecting https source
+# from silently downgrading the transport.
 rustup_init="$(mktemp)"
 trap 'rm -f "$rustup_init"' EXIT
-if [ "${RUSTUP_INIT_URL:-https://sh.rustup.rs}" = "https://sh.rustup.rs" ]; then
-    curl --proto '=https' -sSf https://sh.rustup.rs -o "$rustup_init"
-else
-    curl -fsSL "${RUSTUP_INIT_URL}" -o "$rustup_init"
-fi
+rustup_url="${RUSTUP_INIT_URL:-https://sh.rustup.rs}"
+case "$rustup_url" in
+    https://*)
+        curl --proto '=https' --proto-redir '=https' -fsSL "$rustup_url" -o "$rustup_init"
+        ;;
+    *)
+        if [ -z "${RUSTUP_INIT_SHA256:-}" ]; then
+            echo "rustup: refusing to run an installer fetched over non-https '${rustup_url}' without RUSTUP_INIT_SHA256" >&2
+            exit 1
+        fi
+        curl -fsSL "$rustup_url" -o "$rustup_init"
+        ;;
+esac
 if [ -n "${RUSTUP_INIT_SHA256:-}" ]; then
     echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum -c -
 fi
@@ -459,8 +471,10 @@ case "$MODULE" in
     *)             NEED_PHP="" ;;
 esac
 setup_sury_if_needed "$NEED_PHP"
-# core + exactly one module (single PHP version per instance)
-apt_retry apt-get install -y --no-install-recommends /debs/${BRAND}_*.deb "/debs/${MODULE}_${PKG_VERSION}"*.deb
+# core + exactly one module (single PHP version per instance). Both globs are
+# pinned to PKG_VERSION: with -k the debs/ dir accumulates builds, and an
+# unpinned core glob would hand apt several ${BRAND}_*.deb files at once.
+apt_retry apt-get install -y --no-install-recommends "/debs/${BRAND}_${PKG_VERSION}-"*.deb "/debs/${MODULE}_${PKG_VERSION}-"*.deb
 
 # Packaging/rebrand assertions on the freshly installed set (shared with the
 # combined path); fatal on a broken rebrand, before any request is served.
@@ -534,10 +548,11 @@ apt_retry apt-get update
 # native-php8.4 path skips sury setup (its only other installer).
 apt_retry apt-get install -y --no-install-recommends curl
 setup_sury_if_needed "$COMBINED_PHP"
+# All three globs pinned to PKG_VERSION — see the isolated script's rationale.
 apt_retry apt-get install -y --no-install-recommends \
-    /debs/${BRAND}_*.deb \
-    "/debs/${BRAND}-php${COMBINED_PHP}_"*.deb \
-    /debs/${BRAND}-python3.13_*.deb
+    "/debs/${BRAND}_${PKG_VERSION}-"*.deb \
+    "/debs/${BRAND}-php${COMBINED_PHP}_${PKG_VERSION}-"*.deb \
+    "/debs/${BRAND}-python3.13_${PKG_VERSION}-"*.deb
 
 echo "=== installed ${BRAND} packages ==="
 dpkg -l "${BRAND}*" | grep '^ii' || true
@@ -634,8 +649,9 @@ export DEBIAN_FRONTEND=noninteractive
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 apply_deb_mirror
-apt-get update
+# pkg-qa.sh first: it provides apt_retry for the update below.
 . /pkg-qa.sh
+apt_retry apt-get update
 pkg_lifecycle
 EOS
 
@@ -651,8 +667,9 @@ export DEBIAN_FRONTEND=noninteractive
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod +x /usr/sbin/policy-rc.d
 apply_deb_mirror
-apt-get update
+# pkg-qa.sh first: it provides apt_retry for the update below.
 . /pkg-qa.sh
+apt_retry apt-get update
 pkg_dropin_upgrade
 EOS
 
@@ -732,7 +749,7 @@ if $DO_SMOKE; then
             info "         -v ${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro \\"
             info "         -v ${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro \\"
             info "         -v ${REPO_ROOT}/pkg/deb/smoke-asserts.sh:/smoke-asserts.sh:ro \\"
-            info "         -e SURY=${SURY_MODE} -e COMBINED_PHP=${COMBINED_PHP} -e VERSION=${VERSION} -e RUNDIR=${RUNDIR} \\"
+            info "         -e SURY=${SURY_MODE} -e COMBINED_PHP=${COMBINED_PHP} -e VERSION=${VERSION} -e PKG_VERSION=${PKG_VERSION} -e RUNDIR=${RUNDIR} \\"
             info "         -e DEB_MIRROR=${DEB_MIRROR} -e SURY_MIRROR=${SURY_MIRROR} \\"
             info "         ${IMAGE} bash -s  <<< (combined smoke)"
         else
@@ -744,6 +761,7 @@ if $DO_SMOKE; then
                 -e SURY="${SURY_MODE}" \
                 -e COMBINED_PHP="${COMBINED_PHP}" \
                 -e VERSION="${VERSION}" \
+                -e PKG_VERSION="${PKG_VERSION}" \
                 -e BRAND="${BRAND}" \
                 -e RUNTIME="${RUNTIME}" \
                 -e RUNDIR="${RUNDIR}" \

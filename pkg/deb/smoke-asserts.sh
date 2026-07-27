@@ -79,6 +79,28 @@ assert_daemon_version() {
     echo "daemon version assertion: PASS"
 }
 
+# The installed core package must carry exactly the version this build stamped
+# (PKG_VERSION from pkg-version.sh) — catches a stale .deb picked up by a glob
+# and a job pair silently falling back to the plain NXT_VERSION. The daemon
+# assertion above cannot see either: it checks NXT_VERSION, which all of those
+# share. PKG_VERSION is optional (a caller testing pre-built debs may not know
+# it), so absence is a WARN, not a FAIL.
+assert_package_version() {
+    echo "=== package version assertion (expect ${PKG_VERSION:-<unset>}) ==="
+    if [ -z "${PKG_VERSION:-}" ]; then
+        echo "WARN: PKG_VERSION not set; skipping package version assertion"
+        return 0
+    fi
+    _pkg_ver="$(dpkg-query -W -f '${Version}' "${BRAND}")"
+    case "$_pkg_ver" in
+        "${PKG_VERSION}-"*)
+            echo "package version assertion: PASS (${_pkg_ver})" ;;
+        *)
+            echo "FAIL: installed ${BRAND} is ${_pkg_ver}, expected ${PKG_VERSION}-*"
+            exit 1 ;;
+    esac
+}
+
 # postinst must have created the unprivileged RUNTIME user and group (the 1.22
 # non-root worker model the migration banner warns about).
 assert_runtime_user() {
@@ -94,6 +116,7 @@ run_smoke_asserts() {
     assert_rebrand
     assert_no_residual_brand
     assert_daemon_version
+    assert_package_version
     assert_runtime_user
 }
 

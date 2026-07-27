@@ -14,7 +14,7 @@ name: "Build deb packages (Debian trixie)"
 # development branches to produce build artifacts, or push an upstream "X.Y.Z"
 # version tag to additionally attach the .deb files to the matching GitHub
 # Release. Tag builds stamp the plain X.Y.Z package version; branch/dispatch
-# builds are snapshots versioned X.Y.Z+git<commit-date>.<short-hash> (see
+# builds are snapshots versioned X.Y.Z+git<commit-timestamp>.<short-hash> (see
 # pkg/deb/pkg-version.sh), so any change — packaging-only included — yields a
 # new apt-orderable version and no separate "-buildN" packaging tag is needed.
 # The release job runs only after the smoke tests pass.
@@ -44,6 +44,14 @@ on:
 permissions:
   contents: read
 
+# Successive pushes to the same ref supersede each other's runs: every commit
+# is its own snapshot version, so an older in-flight build+smoke+QA matrix
+# (~40 runner-minutes) produces artifacts nobody will consume. Cancel it —
+# except for tag (release) builds, which must never be interrupted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 # sury mode for the build/smoke jobs. workflow_dispatch can override it; pushes
 # default to auto, which enables deb.sury.org only when a requested
 # libphpX.Y-embed is missing from base apt (see pkg/deb/sury-setup.sh).
@@ -68,7 +76,7 @@ env:
   RUNDIR: /var/run
   # Tag pushes are release builds: the .deb version is the plain NXT_VERSION.
   # Branch/dispatch builds are snapshots: pkg/deb/pkg-version.sh appends
-  # +git<commit-date>.<short-hash> of the built commit, so every job below
+  # +git<commit-timestamp>.<short-hash> of the built commit, so every job below
   # derives the same PKG_VERSION from the same checkout.
   PKG_RELEASE_BUILD: ${{ startsWith(github.ref, 'refs/tags/') && '1' || '' }}
 
@@ -93,6 +101,21 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      # Release builds stamp the plain NXT_VERSION from the version file while
+      # the release job publishes under the pushed tag name; nothing else ties
+      # the two together, so a tag pushed against a tree whose version file
+      # lags would silently attach wrongly-versioned .debs to the release.
+      - name: Verify release tag matches NXT_VERSION
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -eu
+          VERSION="$(grep -m1 '^NXT_VERSION=' version | cut -d= -f2)"
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "${TAG}" != "${VERSION}" ]; then
+            echo "release tag '${GITHUB_REF_NAME}' does not match NXT_VERSION '${VERSION}' from the version file" >&2
+            exit 1
+          fi
 
       - name: Install build dependencies (PHP via deb.sury.org when needed)
         env:
@@ -137,14 +160,14 @@ jobs:
           # pkg/deb/Makefile), so the newer toolchain reaches the otel crate.
           export RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo
           rustup_init="$(mktemp)"
-          curl --proto '=https' -sSf https://sh.rustup.rs -o "$rustup_init"
+          curl --proto '=https' --proto-redir '=https' -sSf https://sh.rustup.rs -o "$rustup_init"
           sh "$rustup_init" -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal
           rm -f "$rustup_init"
           export PATH="$CARGO_HOME/bin:$PATH"
           rustc --version
 
           # Package version: the plain NXT_VERSION on tag (release) builds, a
-          # +git<commit-date>.<short-hash> snapshot otherwise — the same
+          # +git<commit-timestamp>.<short-hash> snapshot otherwise — the same
           # pkg-version.sh logic build-local.sh uses, keyed on PKG_RELEASE_BUILD
           # from the workflow env.
           VERSION="$(grep -m1 '^NXT_VERSION=' version | cut -d= -f2)"; export VERSION
@@ -275,13 +298,13 @@ jobs:
           # Enable deb.sury.org only when libphp${NEED_PHP}-embed is missing from
           # base apt (honors $SURY: auto|on|off). See sury-setup.sh.
           setup_sury_if_needed "$NEED_PHP"
-          # core + exactly one module (single PHP version per instance). The
-          # artifact holds exactly one build's debs; the core uses a version-
-          # agnostic glob (underscore separator disambiguates it from the
-          # ${BRAND}-<module> packages), while the module glob is pinned to
-          # ${PKG_VERSION} to match the local runner (build-local.sh).
+          # core + exactly one module (single PHP version per instance). Both
+          # globs are pinned to ${PKG_VERSION}, matching the local runner
+          # (build-local.sh): the artifact holds one build's debs today, and the
+          # pin keeps a future multi-build artifact from handing apt several
+          # ${BRAND}_*.deb files at once.
           apt_retry apt-get install -y --no-install-recommends \
-            ./debs/"${BRAND}"_*.deb "./debs/${MODULE}_${PKG_VERSION}"*.deb
+            "./debs/${BRAND}_${PKG_VERSION}-"*.deb "./debs/${MODULE}_${PKG_VERSION}-"*.deb
 
           # Packaging/rebrand assertions on the freshly installed set, before any
           # request is served — fatal on a broken rebrand (mirrors SMOKE_ONE).
@@ -383,7 +406,6 @@ jobs:
           # the service (the lifecycle/drop-in gates install the package).
           printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
           chmod +x /usr/sbin/policy-rc.d
-          apt-get update
           # pkg-qa.sh reads the .deb set from $DEBS_DIR (default /debs) and the
           # package identity + expected version from $BRAND/$RUNTIME/$VERSION.
           DEBS_DIR="$PWD/debs"; export DEBS_DIR
@@ -396,6 +418,8 @@ jobs:
           PKG_VERSION="$(pkg_version .)"; export PKG_VERSION
           echo "gate=$GATE brand=$BRAND runtime=$RUNTIME version=$VERSION pkg_version=$PKG_VERSION"
           . ./pkg/deb/pkg-qa.sh
+          # After sourcing pkg-qa.sh so the update gets its apt_retry.
+          apt_retry apt-get update
           "$GATE"
 
   release:
