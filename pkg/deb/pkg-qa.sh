@@ -7,7 +7,10 @@
 # exercise identical gates.
 #
 # Contract for every gate below:
-#   - env BRAND, RUNTIME, VERSION are set (package identity + expected version);
+#   - env BRAND, RUNTIME, VERSION are set (package identity + the upstream
+#     version the daemon reports); PKG_VERSION optionally carries the version
+#     stamped into the .deb file names (snapshot builds append +git<date>.<hash>,
+#     see pkg-version.sh) and falls back to VERSION when the two coincide;
 #   - $DEBS_DIR (default /debs) holds the built *.deb set;
 #   - apt sources are configured and the caller applied any local mirror first.
 #     Mirror application is the caller's responsibility: build-local.sh sources
@@ -25,14 +28,17 @@
 # here are controlled (BRAND_VERSION...arch.deb, never whitespace) and we want a
 # glob match's first hit; `find` would be heavier for no gain.
 : "${DEBS_DIR:=/debs}"
+# .deb file names carry the package version, which on snapshot builds differs
+# from the daemon-reported $VERSION (see pkg-version.sh).
+: "${PKG_VERSION:=${VERSION:-}}"
 
 # Control-field sanity (drop-in replacement relies on Provides/Conflicts/
 # Replaces), a residual-brand scan of the -dev pkg-config file, and a non-fatal
 # lintian pass over every produced .deb. Installs lintian on top.
 pkg_qa_control_lintian() {
     local core dev pc_list field val
-    core="$(ls "${DEBS_DIR}"/"${BRAND}"_"${VERSION}"*.deb 2>/dev/null | head -n1)"
-    [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${VERSION}*.deb to QA"; return 1; }
+    core="$(ls "${DEBS_DIR}"/"${BRAND}"_"${PKG_VERSION}"*.deb 2>/dev/null | head -n1)"
+    [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${PKG_VERSION}*.deb to QA"; return 1; }
 
     # Drop-in-replacement contract: renaming unit -> freeunit relies on
     # Provides/Conflicts/Replaces so the new package supersedes the old cleanly.
@@ -47,7 +53,7 @@ pkg_qa_control_lintian() {
     # Residual-brand scan of the -dev pkg-config file: on a rebrand the .pc must
     # be ${RUNTIME}.pc under the multiarch pkgconfig dir, never the upstream
     # unit.pc (caught lintian pkg-config-multi-arch-wrong-dir and a naming leak).
-    dev="$(ls "${DEBS_DIR}"/"${BRAND}"-dev_"${VERSION}"*.deb 2>/dev/null | head -n1)"
+    dev="$(ls "${DEBS_DIR}"/"${BRAND}"-dev_"${PKG_VERSION}"*.deb 2>/dev/null | head -n1)"
     if [ -n "$dev" ]; then
         echo "=== -dev pkg-config scan ($(basename "$dev")) ==="
         pc_list="$(dpkg-deb -c "$dev" | awk '{print $NF}' | grep -E '/pkgconfig/[^/]+\.pc$' || true)"
@@ -68,7 +74,7 @@ pkg_qa_control_lintian() {
     echo "=== lintian (errors only; informational) ==="
     apt-get update >/dev/null
     apt-get install -y --no-install-recommends lintian >/dev/null
-    lintian --fail-on error --tag-display-limit 0 "${DEBS_DIR}"/"${BRAND}"*_"${VERSION}"*.deb \
+    lintian --fail-on error --tag-display-limit 0 "${DEBS_DIR}"/"${BRAND}"*_"${PKG_VERSION}"*.deb \
         || echo "WARN: lintian reported errors (see above)"
     echo "package QA done"
 }
@@ -81,8 +87,8 @@ pkg_qa_control_lintian() {
 # may still own files).
 pkg_lifecycle() {
     local core svc_file exec_bin unit_file
-    core="$(ls "${DEBS_DIR}"/"${BRAND}"_"${VERSION}"*.deb 2>/dev/null | head -n1)"
-    [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${VERSION}*.deb for lifecycle"; return 1; }
+    core="$(ls "${DEBS_DIR}"/"${BRAND}"_"${PKG_VERSION}"*.deb 2>/dev/null | head -n1)"
+    [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${PKG_VERSION}*.deb for lifecycle"; return 1; }
 
     echo "=== install ==="
     apt-get install -y --no-install-recommends "$core"
@@ -157,8 +163,8 @@ pkg_dropin_upgrade() {
     # path — a mid-way assertion failure or the normal success — yet stays
     # local to the subshell rather than the surrounding shell.
     (
-        core="$(ls "${DEBS_DIR}"/"${BRAND}"_"${VERSION}"*.deb 2>/dev/null | head -n1)"
-        [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${VERSION}*.deb for upgrade test"; exit 1; }
+        core="$(ls "${DEBS_DIR}"/"${BRAND}"_"${PKG_VERSION}"*.deb 2>/dev/null | head -n1)"
+        [ -n "$core" ] || { echo "FAIL: no core ${DEBS_DIR}/${BRAND}_${PKG_VERSION}*.deb for upgrade test"; exit 1; }
 
         echo "=== build synthetic upstream 'unit' stand-in ==="
         arch="$(dpkg --print-architecture)"

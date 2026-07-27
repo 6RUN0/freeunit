@@ -250,12 +250,15 @@ It is triggered by:
 
 - `workflow_dispatch` — manual run;
 - a push to the fork development branches (`current`, `stable`, `develop`) —
-  produces build artifacts;
-- a push of a version tag — additionally publishes the `.deb` files to the
-  matching Release. The release job runs only after the smoke tests pass.
-  Two tag shapes are accepted: the plain upstream `X.Y.Z`, and the
-  fork-specific `X.Y.Z-buildN` (the Nth packaging build on top of upstream
-  `X.Y.Z`, e.g. `1.35.5-build1`).
+  produces build artifacts. These snapshot builds are versioned
+  `X.Y.Z+git<commit-date>.<short-hash>` (computed by `pkg/deb/pkg-version.sh`
+  from the built commit of this repository — source and packaging alike), so
+  any change yields a new apt-orderable version above the last `X.Y.Z`
+  release; the former `X.Y.Z-buildN` packaging tags are no longer needed and
+  no longer trigger the workflow;
+- a push of a plain upstream version tag `X.Y.Z` — additionally publishes the
+  `.deb` files (versioned `X.Y.Z-1`) to the matching Release. The release job
+  runs only after the smoke tests pass.
 
 GitHub Actions are pinned to commit SHAs, and the workflow runs with
 least-privilege permissions (only the release job elevates to `contents: write`).

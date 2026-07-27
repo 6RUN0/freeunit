@@ -35,6 +35,10 @@
 #              missing from the base apt sources (Debian trixie main ships one
 #              PHP line, so multi-version PHP normally needs it). Use off to
 #              build against base sources only, on to force-enable.
+#   -r         Release build — stamp the plain NXT_VERSION into the .deb
+#              version instead of the default +git<commit-date>.<short-hash>
+#              snapshot (equivalent to PKG_RELEASE_BUILD=1; see
+#              pkg/deb/pkg-version.sh).
 #   -n         Dry-run — print the docker commands, do not execute.
 #   -h         Show this help.
 #
@@ -43,6 +47,7 @@
 #   ./build-local.sh -m              # rebuild only the modules, then smoke
 #   ./build-local.sh -s              # smoke-test the debs already in debs/
 #   ./build-local.sh -B              # build the debs, skip smoke
+#   ./build-local.sh -r              # release build: plain X.Y.Z package version
 #   ./build-local.sh -C              # remove all generated artifacts and exit
 #   ./build-local.sh -n              # show what would run
 #
@@ -58,6 +63,11 @@
 #   RUSTUP_INIT_URL     rustup installer URL (default https://sh.rustup.rs).
 #   CARGO_MIRROR        crates.io registry replacement (e.g. sparse+https://host/index/).
 #   Plus BRAND / RUNTIME (package identity) and RUST_TOOLCHAIN / RUSTUP_INIT_SHA256.
+#   PKG_VERSION        override the .deb package version outright; by default a
+#                      snapshot version NXT_VERSION+git<commit-date>.<short-hash>
+#                      (+ .dirty on uncommitted tracked changes) is computed from
+#                      this checkout via pkg/deb/pkg-version.sh.
+#   PKG_RELEASE_BUILD  non-empty => release build: stamp the plain NXT_VERSION.
 #
 # Requirements: docker, network access (apt + Rust crates for otel, plus the
 # sury repo when it is enabled — see -S), unless a local mirror is configured for
@@ -85,9 +95,13 @@ CLEAN_ONLY=false
 DRY_RUN=false
 SURY_MODE="auto"
 
-# Read the version the Makefile will stamp into the .deb names.
+# Upstream version the daemon reports (feeds assert_daemon_version in the smoke
+# containers).
 VERSION="$(grep -m1 '^NXT_VERSION=' "${REPO_ROOT}/version" | cut -d= -f2)"
 : "${VERSION:?could not determine version from the version file}"
+
+# PKG_VERSION (the .deb package version) is resolved after argument parsing,
+# once -r has had its chance to set PKG_RELEASE_BUILD.
 
 # Brand/runtime identity, mirroring pkg/deb/Makefile defaults. BRAND drives the
 # .deb package names (freeunit_*.deb, freeunit-<module>_*.deb); RUNTIME drives
@@ -155,7 +169,7 @@ run_oneshot() {
         info "DRY-RUN: docker run --rm -v ${DEBS_DIR}:/debs:ro \\"
         info "         -v ${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro \\"
         info "         -v ${REPO_ROOT}/pkg/deb/pkg-qa.sh:/pkg-qa.sh:ro \\"
-        info "         -e BRAND=${BRAND} -e RUNTIME=${RUNTIME} -e VERSION=${VERSION} \\"
+        info "         -e BRAND=${BRAND} -e RUNTIME=${RUNTIME} -e VERSION=${VERSION} -e PKG_VERSION=${PKG_VERSION} \\"
         info "         -e DEB_MIRROR=${DEB_MIRROR} \\"
         info "         ${IMAGE} bash -s   <<< (${label})"
         return 0
@@ -167,6 +181,7 @@ run_oneshot() {
         -e BRAND="${BRAND}" \
         -e RUNTIME="${RUNTIME}" \
         -e VERSION="${VERSION}" \
+        -e PKG_VERSION="${PKG_VERSION}" \
         -e DEB_MIRROR="${DEB_MIRROR}" \
         "${IMAGE}" bash -s
 }
@@ -179,7 +194,7 @@ usage() {
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-while getopts ":mBscCkI:S:nh" opt; do
+while getopts ":mBscCkI:S:rnh" opt; do
     case $opt in
         m) MODULES_ONLY=true ;;
         B) DO_SMOKE=false ;;
@@ -189,6 +204,7 @@ while getopts ":mBscCkI:S:nh" opt; do
         k) CLEAN=false ;;
         I) IMAGE="$OPTARG" ;;
         S) SURY_MODE="$OPTARG" ;;
+        r) PKG_RELEASE_BUILD=1 ;;
         n) DRY_RUN=true ;;
         h) usage ;;
         :) err "Option -$OPTARG requires an argument."; exit 1 ;;
@@ -200,6 +216,19 @@ case "$SURY_MODE" in
     auto|on|off) ;;
     *) err "invalid -S '$SURY_MODE' (expected auto|on|off)"; exit 1 ;;
 esac
+
+# Package version the Makefile stamps into the .deb names: the plain NXT_VERSION
+# on release builds (-r / PKG_RELEASE_BUILD), a +git snapshot of this checkout
+# otherwise; a pre-set PKG_VERSION wins outright (see pkg-version.sh).
+. "${SCRIPT_DIR}/pkg-version.sh"
+PKG_VERSION="${PKG_VERSION:-$(pkg_version "${REPO_ROOT}")}"
+
+# A release build stamps the plain version, hiding the git state — make an
+# unclean tree loudly visible instead of silently misrepresenting it.
+if [ -n "${PKG_RELEASE_BUILD:-}" ] \
+   && [ -n "$(git -C "${REPO_ROOT}" status --porcelain -uno 2>/dev/null)" ]; then
+    warn "release build (-r) from a tree with uncommitted tracked changes"
+fi
 
 # With sury disabled only the Debian trixie-native PHP line is buildable, so the
 # active set (and everything derived from it — build targets, container dev
@@ -270,7 +299,7 @@ fi
 info "============================================================"
 info "FreeUnit local .deb build"
 info "  Repo     : ${REPO_ROOT}"
-info "  Version  : ${VERSION}"
+info "  Version  : ${VERSION} (package: ${PKG_VERSION})"
 info "  Image    : ${IMAGE}"
 info "  Build    : ${DO_BUILD} (modules-only: ${MODULES_ONLY}, targets: ${BUILD_TARGETS})"
 info "  Smoke    : ${DO_SMOKE} (combined: ${COMBINED_SMOKE})"
@@ -399,7 +428,8 @@ rm -f "$rustup_init"
 export PATH="$CARGO_HOME/bin:$PATH"
 rustc --version
 
-make -C pkg/deb BRAND="$BRAND" RUNTIME="$RUNTIME" RUNDIR="$RUNDIR" $TARGETS
+make -C pkg/deb BRAND="$BRAND" RUNTIME="$RUNTIME" RUNDIR="$RUNDIR" \
+     VERSION="$PKG_VERSION" $TARGETS
 echo "=== produced debs ==="
 ls -la pkg/deb/debs/
 EOS
@@ -430,7 +460,7 @@ case "$MODULE" in
 esac
 setup_sury_if_needed "$NEED_PHP"
 # core + exactly one module (single PHP version per instance)
-apt_retry apt-get install -y --no-install-recommends /debs/${BRAND}_*.deb "/debs/${MODULE}_${VERSION}"*.deb
+apt_retry apt-get install -y --no-install-recommends /debs/${BRAND}_*.deb "/debs/${MODULE}_${PKG_VERSION}"*.deb
 
 # Packaging/rebrand assertions on the freshly installed set (shared with the
 # combined path); fatal on a broken rebrand, before any request is served.
@@ -636,7 +666,7 @@ if $DO_BUILD; then
         info "         -v ${REPO_ROOT}/pkg/deb/sury-setup.sh:/sury-setup.sh:ro \\"
         info "         -v ${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro \\"
         info "         -e TARGETS=\"${BUILD_TARGETS}\" -e CLEAN=${CLEAN} -e MODULES_ONLY=${MODULES_ONLY} \\"
-        info "         -e SURY=${SURY_MODE} -e NEED_PHP=\"${PHP_VERSIONS}\" -e RUNDIR=${RUNDIR} \\"
+        info "         -e SURY=${SURY_MODE} -e NEED_PHP=\"${PHP_VERSIONS}\" -e RUNDIR=${RUNDIR} -e PKG_VERSION=${PKG_VERSION} \\"
         info "         -e DEB_MIRROR=${DEB_MIRROR} -e SURY_MIRROR=${SURY_MIRROR} \\"
         info "         -e RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} -e RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT} -e RUSTUP_INIT_URL=${RUSTUP_INIT_URL} -e CARGO_MIRROR=${CARGO_MIRROR} \\"
         info "         ${IMAGE} bash -s   <<< (build script)"
@@ -653,6 +683,7 @@ if $DO_BUILD; then
             -e BRAND="${BRAND}" \
             -e RUNTIME="${RUNTIME}" \
             -e RUNDIR="${RUNDIR}" \
+            -e PKG_VERSION="${PKG_VERSION}" \
             -e RUST_TOOLCHAIN="${RUST_TOOLCHAIN}" \
             -e RUSTUP_INIT_SHA256="${RUSTUP_INIT_SHA256}" \
             -e DEB_MIRROR="${DEB_MIRROR}" \
@@ -726,8 +757,8 @@ if $DO_SMOKE; then
             IFS='|' read -r module kind type port expect <<< "$row"
             # Second guard (the matrix already tracks the active PHP set): skip a
             # module whose .deb is absent, e.g. a partial -m/-s run.
-            if ! $DRY_RUN && ! ls "${DEBS_DIR}/${module}_${VERSION}"*.deb >/dev/null 2>&1; then
-                warn "Skipping ${module}: no ${module}_${VERSION}*.deb in ${DEBS_DIR}"
+            if ! $DRY_RUN && ! ls "${DEBS_DIR}/${module}_${PKG_VERSION}"*.deb >/dev/null 2>&1; then
+                warn "Skipping ${module}: no ${module}_${PKG_VERSION}*.deb in ${DEBS_DIR}"
                 continue
             fi
             info "Smoke-testing ${module} (isolated) ..."
@@ -737,7 +768,7 @@ if $DO_SMOKE; then
                 info "         -v ${REPO_ROOT}/pkg/deb/mirror-setup.sh:/mirror-setup.sh:ro \\"
                 info "         -v ${REPO_ROOT}/pkg/deb/smoke-asserts.sh:/smoke-asserts.sh:ro \\"
                 info "         -e MODULE=${module} -e APP_KIND=${kind} -e APP_TYPE=\"${type}\" \\"
-                info "         -e PORT=${port} -e EXPECT=${expect} -e VERSION=${VERSION} -e RUNDIR=${RUNDIR} \\"
+                info "         -e PORT=${port} -e EXPECT=${expect} -e VERSION=${VERSION} -e PKG_VERSION=${PKG_VERSION} -e RUNDIR=${RUNDIR} \\"
                 info "         -e SURY=${SURY_MODE} -e DEB_MIRROR=${DEB_MIRROR} -e SURY_MIRROR=${SURY_MIRROR} \\"
                 info "         ${IMAGE} bash -s   <<< (isolated smoke)"
                 continue
@@ -753,6 +784,7 @@ if $DO_SMOKE; then
                 -e PORT="${port}" \
                 -e EXPECT="${expect}" \
                 -e VERSION="${VERSION}" \
+                -e PKG_VERSION="${PKG_VERSION}" \
                 -e SURY="${SURY_MODE}" \
                 -e BRAND="${BRAND}" \
                 -e RUNTIME="${RUNTIME}" \

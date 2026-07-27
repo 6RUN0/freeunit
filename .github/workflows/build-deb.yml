@@ -11,11 +11,13 @@ name: "Build deb packages (Debian trixie)"
 #   * unit-python3.13  - Python 3.13 module (native trixie)
 #
 # Trigger manually (workflow_dispatch) or by pushing one of the fork's
-# development branches to produce build artifacts, or push a version tag to
-# additionally attach the .deb files to the matching GitHub Release. Tag
-# patterns cover the upstream "X.Y.Z" scheme plus the fork-specific
-# packaging-build suffix (e.g. 1.35.5-build1). The release job runs only
-# after the smoke tests pass.
+# development branches to produce build artifacts, or push an upstream "X.Y.Z"
+# version tag to additionally attach the .deb files to the matching GitHub
+# Release. Tag builds stamp the plain X.Y.Z package version; branch/dispatch
+# builds are snapshots versioned X.Y.Z+git<commit-date>.<short-hash> (see
+# pkg/deb/pkg-version.sh), so any change — packaging-only included — yields a
+# new apt-orderable version and no separate "-buildN" packaging tag is needed.
+# The release job runs only after the smoke tests pass.
 
 on:
   workflow_dispatch:
@@ -37,7 +39,6 @@ on:
     branches: [current, stable, develop]
     tags:
       - "[0-9]+.[0-9]+.[0-9]+"
-      - "[0-9]+.[0-9]+.[0-9]+-build[0-9]+"
 
 # Default to least privilege; only the release job elevates to contents: write.
 permissions:
@@ -65,6 +66,11 @@ env:
   # /var/run; set /run for the pure FHS path). Forwarded to make and used by the
   # smoke paths, mirroring $RUNDIR in pkg/deb/build-local.sh.
   RUNDIR: /var/run
+  # Tag pushes are release builds: the .deb version is the plain NXT_VERSION.
+  # Branch/dispatch builds are snapshots: pkg/deb/pkg-version.sh appends
+  # +git<commit-date>.<short-hash> of the built commit, so every job below
+  # derives the same PKG_VERSION from the same checkout.
+  PKG_RELEASE_BUILD: ${{ startsWith(github.ref, 'refs/tags/') && '1' || '' }}
 
 jobs:
   build-trixie:
@@ -137,11 +143,21 @@ jobs:
           export PATH="$CARGO_HOME/bin:$PATH"
           rustc --version
 
+          # Package version: the plain NXT_VERSION on tag (release) builds, a
+          # +git<commit-date>.<short-hash> snapshot otherwise — the same
+          # pkg-version.sh logic build-local.sh uses, keyed on PKG_RELEASE_BUILD
+          # from the workflow env.
+          VERSION="$(grep -m1 '^NXT_VERSION=' version | cut -d= -f2)"; export VERSION
+          . ./pkg/deb/pkg-version.sh
+          PKG_VERSION="$(pkg_version .)"
+          echo "package version: ${PKG_VERSION}"
+
           # unit*/python313 are make TARGET names (upstream-derived, unaffected by
           # brand); BRAND/RUNTIME/RUNDIR are forwarded as make vars so the built
           # package names + on-disk paths match what the smoke and package-QA jobs
           # probe — exactly as pkg/deb/build-local.sh forwards them.
           make -C pkg/deb BRAND="$BRAND" RUNTIME="$RUNTIME" RUNDIR="$RUNDIR" \
+            VERSION="$PKG_VERSION" \
             unit unit-php83 unit-php84 unit-php85 unit-python313
           ls -la pkg/deb/debs/
 
@@ -235,6 +251,10 @@ jobs:
           # Upstream version the daemon reports, read from the source tree exactly
           # as pkg/deb/build-local.sh does (NXT_VERSION) — feeds assert_daemon_version.
           VERSION="$(grep -m1 '^NXT_VERSION=' version | cut -d= -f2)"; export VERSION
+          # Package version stamped into the .deb names (same checkout + logic as
+          # the build job, so it resolves to the identical value).
+          . ./pkg/deb/pkg-version.sh
+          PKG_VERSION="$(pkg_version .)"; export PKG_VERSION
           . ./pkg/deb/sury-setup.sh
           # Shared smoke/rebrand assertions — the same file the local runner
           # sources; consumes BRAND/RUNTIME/RUNDIR/VERSION from the job env.
@@ -259,9 +279,9 @@ jobs:
           # artifact holds exactly one build's debs; the core uses a version-
           # agnostic glob (underscore separator disambiguates it from the
           # ${BRAND}-<module> packages), while the module glob is pinned to
-          # ${VERSION} to match the local runner (build-local.sh).
+          # ${PKG_VERSION} to match the local runner (build-local.sh).
           apt_retry apt-get install -y --no-install-recommends \
-            ./debs/"${BRAND}"_*.deb "./debs/${MODULE}_${VERSION}"*.deb
+            ./debs/"${BRAND}"_*.deb "./debs/${MODULE}_${PKG_VERSION}"*.deb
 
           # Packaging/rebrand assertions on the freshly installed set, before any
           # request is served — fatal on a broken rebrand (mirrors SMOKE_ONE).
@@ -368,10 +388,13 @@ jobs:
           # package identity + expected version from $BRAND/$RUNTIME/$VERSION.
           DEBS_DIR="$PWD/debs"; export DEBS_DIR
           # Upstream version from the source tree (NXT_VERSION), exactly as
-          # pkg/deb/build-local.sh derives it; a valid glob prefix for the built
-          # ${BRAND}_<version>-<rev>~<suite> package names that pkg-qa.sh matches.
+          # pkg/deb/build-local.sh derives it, plus the package version stamped
+          # into the built ${BRAND}_<pkg-version>-<rev>~<suite> file names that
+          # pkg-qa.sh matches (same checkout + logic as the build job).
           VERSION="$(grep -m1 '^NXT_VERSION=' version | cut -d= -f2)"; export VERSION
-          echo "gate=$GATE brand=$BRAND runtime=$RUNTIME version=$VERSION"
+          . ./pkg/deb/pkg-version.sh
+          PKG_VERSION="$(pkg_version .)"; export PKG_VERSION
+          echo "gate=$GATE brand=$BRAND runtime=$RUNTIME version=$VERSION pkg_version=$PKG_VERSION"
           . ./pkg/deb/pkg-qa.sh
           "$GATE"
 
