@@ -10,10 +10,11 @@ name: "Build deb packages (Debian trixie)"
 #   * unit-php8.5      - PHP 8.5 module (from deb.sury.org)
 #   * unit-python3.13  - Python 3.13 module (native trixie)
 #
-# Trigger manually (workflow_dispatch) or by pushing one of the fork's
-# development branches to produce build artifacts, or push an upstream "X.Y.Z"
-# version tag to additionally attach the .deb files to the matching GitHub
-# Release. Tag builds stamp the plain X.Y.Z package version; branch/dispatch
+# Trigger manually (workflow_dispatch) or by pushing a branch listed in the
+# repo's DEB_BUILD_BRANCHES Actions variable (each repo — upstream or fork —
+# configures its own set; see the branch gate on build-trixie) to produce
+# build artifacts, or push an upstream "X.Y.Z" version tag to additionally
+# attach the .deb files to the matching GitHub Release. Tag builds stamp the plain X.Y.Z package version; branch/dispatch
 # builds are snapshots versioned X.Y.Z+git<commit-timestamp>.<short-hash> (see
 # pkg/deb/pkg-version.sh), so any change — packaging-only included — yields a
 # new apt-orderable version and no separate "-buildN" packaging tag is needed.
@@ -36,7 +37,13 @@ on:
         default: ""
         type: string
   push:
-    branches: [current, stable, develop]
+    # Branch filtering lives in the build-trixie job gate, not here: GitHub
+    # evaluates `on:` before any context exists, so a repository variable
+    # cannot parameterize this list. Triggering on every branch and gating in
+    # the job keeps this file identical across upstream and forks — each repo
+    # picks its own branch set via the DEB_BUILD_BRANCHES variable (runs on
+    # unlisted branches appear as "skipped" and cost nothing).
+    branches: ["**"]
     tags:
       - "[0-9]+.[0-9]+.[0-9]+"
 
@@ -82,6 +89,17 @@ env:
 
 jobs:
   build-trixie:
+    # Branch gate (see the push-trigger comment): tag and manual runs always
+    # build; a branch push builds only when the branch is listed in the
+    # repo's DEB_BUILD_BRANCHES Actions variable (space-separated, e.g.
+    # "current stable develop" — also the default when the variable is
+    # unset). The space padding makes the match whole-word, so "dev" never
+    # matches "develop". Every other job needs this one, so a skip here
+    # skips the entire run.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/') ||
+      contains(format(' {0} ', vars.DEB_BUILD_BRANCHES || 'current stable develop'), format(' {0} ', github.ref_name))
     runs-on: ubuntu-latest
     container:
       image: debian:trixie
