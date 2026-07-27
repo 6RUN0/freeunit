@@ -122,9 +122,13 @@ install: build do.tests
 	dh_installsystemd -p%%PACKAGE%% --name=%%RUNTIME%% %%RUNTIME%%.service
 	dh_installsystemd -p%%PACKAGE%% --name=%%RUNTIME%%-debug --no-start --no-enable %%RUNTIME%%-debug.service
 	# SysV init (debian/%%PACKAGE%%.init) and its /etc/default/%%RUNTIME%% env
-	# file, for hosts without systemd. On systemd hosts the .service above wins;
-	# --no-start avoids racing dh_installsystemd's own start of the same unit.
-	dh_installinit -p%%PACKAGE%% --name=%%RUNTIME%% --no-start
+	# file, for hosts without systemd. Its maintainer-script snippets are the
+	# ONLY start/stop path there (the dh_installsystemd snippets above guard on
+	# /run/systemd/system), so no --no-start: it would leave the daemon never
+	# started on install and still running with its binary deleted on remove.
+	# No race with dh_installsystemd on systemd hosts: invoke-rc.d redirects to
+	# systemctl for the same unit, where a repeated start is a serialized no-op.
+	dh_installinit -p%%PACKAGE%% --name=%%RUNTIME%%
 	dh_installlogrotate
 	cd $(BUILDDIR_unit) && DESTDIR=$(INSTALLDIR) make install E=0
 	# The build always emits the daemon as "unitd" (NXT_DAEMON). For a rebrand

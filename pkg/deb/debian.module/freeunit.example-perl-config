@@ -9,7 +9,7 @@
 	},
 
 	"listeners": {
-		"*:8600": {
+		"127.0.0.1:8600": {
 			"pass": "applications/example_perl"
 		}
 	}

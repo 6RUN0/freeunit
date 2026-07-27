@@ -8,7 +8,7 @@
 	},
 
 	"listeners": {
-		"*:8700": {
+		"127.0.0.1:8700": {
 			"pass": "applications/example_ruby"
 		}
 	}

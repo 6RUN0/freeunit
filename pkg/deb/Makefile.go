@@ -37,6 +37,7 @@ The $(MODULE_SUMMARY_go) has been installed.
 To check out the sample app, run these commands:
 
  GOPATH=/usr/share/gocode GO111MODULE=auto go build -o /tmp/go-app /usr/share/doc/$(BRAND)-$(MODULE_SUFFIX_go)/examples/go-app/let-my-people.go
+ sudo install -m 755 /tmp/go-app /usr/local/bin/$(BRAND)-go-app
  sudo service $(RUNTIME) restart
  cd /usr/share/doc/$(BRAND)-$(MODULE_SUFFIX_go)/examples
  $(MODULE_CONFIG_PUT)

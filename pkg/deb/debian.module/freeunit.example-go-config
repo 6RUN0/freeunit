@@ -2,12 +2,12 @@
 	"applications": {
 		"example_go": {
 			"type": "external",
-			"executable": "/tmp/go-app"
+			"executable": "/usr/local/bin/%%PACKAGE%%-go-app"
 		}
 	},
 
 	"listeners": {
-		"*:8500": {
+		"127.0.0.1:8500": {
 			"pass": "applications/example_go"
 		}
 	}

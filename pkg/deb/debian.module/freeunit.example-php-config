@@ -9,7 +9,7 @@
 	},
 
 	"listeners": {
-		"*:8300": {
+		"127.0.0.1:8300": {
 			"pass": "applications/example_php"
 		}
 	}

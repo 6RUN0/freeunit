@@ -9,7 +9,7 @@
 	},
 
 	"listeners": {
-		"*:8400": {
+		"127.0.0.1:8400": {
 			"pass": "applications/example_python"
 		}
 	}
