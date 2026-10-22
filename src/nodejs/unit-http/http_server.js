@@ -266,7 +266,9 @@ ServerResponse.prototype._writeBody = function(chunk, encoding, callback) {
         if (typeof chunk === 'string') {
             contentLength = Buffer.byteLength(chunk, encoding);
 
-            if (contentLength > unit_lib.buf_min) {
+            /* The native write encodes a string as utf8 only. */
+            if (contentLength > unit_lib.buf_min ||
+                    (encoding && !/^utf-?8$/i.test(encoding))) {
                 chunk = Buffer.from(chunk, encoding);
 
                 contentLength = chunk.length;

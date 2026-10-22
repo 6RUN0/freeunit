@@ -157,6 +157,18 @@ def test_node_application_write_buffer():
     assert client.get()['body'] == 'buffer', 'write buffer'
 
 
+def test_node_application_write_encoding():
+    # A short string in an encoding other than utf8 must be converted with
+    # that encoding, not written as utf8 under a length counted for it: the
+    # body then disagrees with Content-Length and the response hangs.
+    client.load('write_encoding')
+
+    for url, body in (('/latin1', 'caf\u00e9'), ('/hex', 'ABC')):
+        resp = client.get(url=url, encoding='latin1', read_timeout=5)
+        assert resp['status'] == 200, url
+        assert resp['body'] == body, url
+
+
 def test_node_application_write_array():
     client.load('write_array')
 
