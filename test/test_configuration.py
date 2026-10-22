@@ -726,3 +726,35 @@ def test_json_too_many_object_members():
     assert 'success' in client.conf(
         {"listeners": {}, "routes": [], "applications": {}}
     ), 'controller alive after large object'
+
+
+def test_put_below_scalar():
+    # A PUT addressed below a string, number or boolean once took the
+    # scalar for an object and read its bytes as a member array, which
+    # crashed the controller; it must answer "not found" instead.
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "routes"}},
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+            "settings": {
+                "http": {
+                    "header_read_timeout": 30,
+                    "log_route": True,
+                    "server_version": False,
+                }
+            },
+        }
+    )
+
+    for path in (
+        'listeners/*:8080/pass/x',
+        'routes/0/action/return/x',
+        'settings/http/header_read_timeout/x',
+        'settings/http/log_route/x',
+        'settings/http/server_version/x',
+    ):
+        resp = client.conf('"y"', path)
+        assert resp.get('error') == 'Value doesn\'t exist.', path
+
+    assert client.conf_get('listeners/*:8080/pass') == 'routes'
