@@ -729,13 +729,20 @@ def test_json_too_many_object_members():
 
 
 def test_put_below_scalar():
-    # A PUT addressed below a string, number or boolean once took the
-    # scalar for an object and read its bytes as a member array, which
-    # crashed the controller; it must answer "not found" instead.
+    # A scalar has no members to create: treating its value as an object
+    # pointer crashes the controller (short values) or corrupts memory
+    # (long strings), so a PUT below it must answer "not found".
     assert 'success' in client.conf(
         {
             "listeners": {"*:8080": {"pass": "routes"}},
-            "routes": [{"action": {"return": 200}}],
+            "routes": [
+                {
+                    "action": {
+                        "return": 301,
+                        "location": "http://example.com/a-long-redirect-target",
+                    }
+                }
+            ],
             "applications": {},
             "settings": {
                 "http": {
@@ -750,11 +757,12 @@ def test_put_below_scalar():
     for path in (
         'listeners/*:8080/pass/x',
         'routes/0/action/return/x',
+        'routes/0/action/location/x',
         'settings/http/header_read_timeout/x',
         'settings/http/log_route/x',
         'settings/http/server_version/x',
     ):
         resp = client.conf('"y"', path)
-        assert resp.get('error') == 'Value doesn\'t exist.', path
+        assert resp.get('error') == "Value doesn't exist.", path
 
     assert client.conf_get('listeners/*:8080/pass') == 'routes'
