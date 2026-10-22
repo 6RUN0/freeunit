@@ -182,7 +182,26 @@ prepare_tmp() {
         return 0
     fi
     info "Copying project → $TMP_DIR"
-    rsync -a --exclude='.git' --exclude='/build' "${PROJECT_DIR}/" "${TMP_DIR}/"
+    if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        # Tracked and non-ignored untracked files only: ignored tool state is
+        # large and changes mid-copy. An ignored new file needs `git add -f`.
+        # The contrib tarball cache is ignored yet saves a download per build.
+        file_list="$(mktemp)"
+        git -C "$PROJECT_DIR" ls-files -z --cached --others --exclude-standard \
+            > "$file_list" || { rm -f "$file_list"; err "git ls-files failed"; exit 1; }
+        if [ -d "${PROJECT_DIR}/pkg/contrib/tarballs" ]; then
+            (cd "$PROJECT_DIR" && find pkg/contrib/tarballs -type f -print0) \
+                >> "$file_list"
+        fi
+        rsync -a --from0 --files-from="$file_list" --ignore-missing-args \
+            "${PROJECT_DIR}/" "${TMP_DIR}/" || { rm -f "$file_list"; err "rsync failed"; exit 1; }
+        rm -f "$file_list"
+    else
+        rsync -a --exclude='.git' --exclude='/build' "${PROJECT_DIR}/" "${TMP_DIR}/"
+    fi
+    # mktemp -d makes the root 0700; module discovery runs as nobody and must
+    # traverse it, or every test skips with "Unit has no python module(s)".
+    chmod 755 "$TMP_DIR"
 }
 
 cleanup_tmp() {

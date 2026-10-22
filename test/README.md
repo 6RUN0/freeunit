@@ -59,6 +59,12 @@ so changes on the host are immediately reflected. The container then
 builds FreeUnit with `--tests --openssl --njs --zlib --zstd --brotli --otel`,
 builds the Python module, and runs `sudo -E pytest-3 --print-log`.
 
+The run works on a copy of the tree, not on the checkout itself. In a git
+checkout the copy holds tracked files, untracked files that `.gitignore` does
+not hide, and the `pkg/contrib/tarballs/` download cache. A new file that an
+ignore rule hides (for example a dotfile fixture) is left out until it is
+added with `git add -f`.
+
 To force a rebuild of the image (e.g. after Dockerfile changes):
 ```bash
 docker rmi freeunit-test:local
