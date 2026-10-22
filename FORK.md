@@ -2,14 +2,15 @@
 
 This repository is a **downstream packaging fork** of
 [FreeUnit](https://github.com/freeunitorg/freeunit) (itself the community LTS
-fork of the archived NGINX Unit). It exists to produce Debian packages and
-nothing more.
+fork of the archived NGINX Unit). It exists to produce Debian packages.
 
-**Principle: minimal divergence.** The fork tracks upstream `master` and
-deliberately avoids patching the C core or any language module source. The only
-additions are packaging metadata, CI, and local build tooling. If a source fix
-is ever required, it should be kept as small as possible and, where it makes
-sense, proposed upstream rather than carried here indefinitely.
+**Principle: minimal divergence.** The fork tracks upstream `master`. Besides
+packaging metadata, CI, and local build tooling it carries source fixes that
+upstream does not have yet: crashes, protocol violations, and robustness bugs,
+often ported from unmerged NGINX Unit pull requests and issues. Each such fix
+is one commit with a regression test, kept as small as possible, offered
+upstream, and dropped once upstream merges an equivalent. New features are not
+carried here; they go upstream.
 
 ## What is built
 
