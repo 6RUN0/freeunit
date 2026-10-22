@@ -291,6 +291,38 @@ def test_chunked_transform():
     )
 
 
+def test_chunked_app_transfer_encoding():
+    # Unit owns the response framing: an application's own Transfer-Encoding
+    # must not reach the client next to the one Unit adds, nor next to a
+    # Content-Length, or a proxy in front of Unit misreads the body length.
+    client.load('chunked')
+
+    resp = client.post(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'X-Transfer': 'chunked',
+        },
+        body='body',
+    )
+    assert resp['status'] == 200
+    assert resp['headers']['Transfer-Encoding'] == 'chunked', 'one header'
+    assert resp['body'] == 'body'
+
+    resp = client.post(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'X-Transfer': 'chunked',
+            'X-Length': '1',
+        },
+        body='',
+    )
+    assert resp['status'] == 200
+    assert resp['headers']['Content-Length'] == '0'
+    assert 'Transfer-Encoding' not in resp['headers'], 'no TE with length'
+
+
 def test_chunked_invalid():
     # invalid chunkes
 
