@@ -9,7 +9,10 @@
 #   build  — variant × arch matrix; builds and pushes per-arch images.
 #   merge  — variant matrix; stitches the per-arch images into a manifest.
 #
-# Adding/dropping a variant: edit the VARIANTS list in the `setup` job only.
+# Adding/dropping a variant: edit pkg/eol.json.  The `setup` job derives the
+# variant list from it.  If the variant had an old-style GHCR tag (up to
+# 1.35.5, for example latest-php8.5), also edit the old-style list in
+# `setup`; the run stops if a variant in that list is not built.
 # The Dockerfile path is derived as pkg/docker/Dockerfile.<variant>, so the
 # variant name must match the Dockerfile suffix.
 #
@@ -50,13 +53,15 @@ jobs:
   # Single source of truth for the release version and the variant list,
   # consumed by both `build` and `merge` via fromJSON().
   setup:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.meta.outputs.version }}
       variants: ${{ steps.meta.outputs.variants }}
+      legacy: ${{ steps.meta.outputs.legacy }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Resolve version and variant list
         id: meta
@@ -67,6 +72,18 @@ jobs:
             VERSION="${GITHUB_REF_NAME#v}"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          # The image is tagged and labelled with VERSION and built from the
+          # tag VERSION, so the version file at that tag must name it.  This
+          # job gates every build job, so a mismatch publishes nothing.
+          git fetch --depth=1 origin "refs/tags/${VERSION}:refs/tags/${VERSION}" \
+            || { echo "::error::tag ${VERSION} not found"; exit 1; }
+          tag_ver=$(git show "refs/tags/${VERSION}:version" \
+                    | sed -n 's/^NXT_VERSION=//p')
+          if [ "${tag_ver}" != "${VERSION}" ]; then
+            echo "::error::tag ${VERSION}, but its version file has ${tag_ver:-no NXT_VERSION}"
+            exit 1
+          fi
 
           # Variant list is derived from pkg/eol.json (single source of truth).
           # Each runtime version -> "<runtime>-<version>"; a null version (wasm,
@@ -81,9 +98,34 @@ jobs:
           ] | flatten' pkg/eol.json)
           echo "variants=${variants}" >> "$GITHUB_OUTPUT"
 
+          # Up to 1.35.5 the variants had no hyphen after the language, and
+          # Java was "jsc": latest-php8.5, latest-jsc21.  GHCR still holds
+          # these tags, and some guides cite them.  The merge job points
+          # each one at the same image as latest-<variant>.  Only these
+          # variants had such a tag; no new old-style tag is made.  Each one
+          # must still be built: a renamed or dropped variant stops the run
+          # here, so its old-style tag does not go stale without a notice.
+          legacy=$(jq -cn --argjson built "${variants}" '
+            [ "go-1.25", "go-1.26", "java-17", "java-21",
+              "node-20", "node-22", "node-24", "perl-5.38", "perl-5.40",
+              "php-8.3", "php-8.4", "php-8.5",
+              "python-3.12", "python-3.12-slim", "python-3.13",
+              "python-3.13-slim", "python-3.14", "python-3.14-slim",
+              "ruby-3.3", "ruby-3.4" ] as $old
+            | ($old - $built) as $gone
+            | if ($gone | length) > 0
+              then error("old-style tag for a variant that is not built: "
+                         + ($gone | join(", ")))
+              else [ $old[] | { (.): ("latest-" + (if startswith("java-")
+                       then "jsc" + ltrimstr("java-")
+                       else sub("-"; "") end)) } ] | add
+              end')
+          echo "legacy=${legacy}" >> "$GITHUB_OUTPUT"
+
   build:
     needs: setup
     runs-on: ${{ matrix.arch.runner }}
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
@@ -95,32 +137,24 @@ jobs:
         arch:
           - name: amd64
             platform: linux/amd64
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
           - name: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Pin version in Dockerfile
-        run: |
-          VERSION="${{ needs.setup.outputs.version }}"
-          sed -i \
-            -e "s|-b [0-9][0-9.]*\( https://github.com/freeunitorg/freeunit\)|-b ${VERSION}\1|" \
-            -e "s|image.version=\"[^\"]*\"|image.version=\"${VERSION}\"|" \
-            pkg/docker/Dockerfile.${{ matrix.variant }}
+        uses: actions/checkout@v7
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.GHCR_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -134,6 +168,9 @@ jobs:
           context: pkg/docker
           file: pkg/docker/Dockerfile.${{ matrix.variant }}
           platforms: ${{ matrix.arch.platform }}
+          # The Dockerfile clones this tag and puts it in the version label.
+          build-args: |
+            UNIT_VERSION=${{ needs.setup.outputs.version }}
           push: true
           tags: |
             ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}:${{ needs.setup.outputs.version }}-${{ matrix.variant }}-${{ matrix.arch.name }}
@@ -145,7 +182,8 @@ jobs:
 
   merge:
     needs: [setup, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
@@ -157,14 +195,14 @@ jobs:
 
     steps:
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.GHCR_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -173,13 +211,23 @@ jobs:
         run: |
           VERSION="${{ needs.setup.outputs.version }}"
           VARIANT="${{ matrix.variant }}"
+          GHCR_REPO="${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}"
+          # The old-style tag of this variant, or empty (see the setup job).
+          LEGACY="${{ fromJSON(needs.setup.outputs.legacy)[matrix.variant] }}"
+
           # Per-arch images live in both registries; build a manifest in each.
           for REPO in \
-            "${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}" \
+            "${GHCR_REPO}" \
             "${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}"; do
+            # The old-style tags exist on GHCR only.
+            EXTRA_TAGS=()
+            if [ "${REPO}" = "${GHCR_REPO}" ] && [ -n "${LEGACY}" ]; then
+              EXTRA_TAGS=(--tag "${REPO}:${LEGACY}")
+            fi
             docker buildx imagetools create \
               --tag ${REPO}:${VERSION}-${VARIANT} \
               --tag ${REPO}:latest-${VARIANT} \
+              "${EXTRA_TAGS[@]}" \
               --annotation "index:org.opencontainers.image.description=FreeUnit ${VERSION} (${VARIANT}) — community LTS fork of the NGINX Unit application server" \
               --annotation "index:org.opencontainers.image.title=FreeUnit (${VARIANT})" \
               --annotation "index:org.opencontainers.image.url=https://freeunit.org" \

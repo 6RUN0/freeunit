@@ -9,6 +9,8 @@
 #include <sys/un.h>
 #endif
 
+#include <nxt_span.h>
+
 
 #if (NXT_HAVE_UCRED)
 #define NXT_CRED_USECMSG    1
@@ -42,9 +44,56 @@ typedef struct cmsgcred     nxt_socket_cred_t;
 #endif
 
 
+/*
+ * NXT_OOB_RECV_SIZE is the largest control block Unit can legitimately be
+ * handed: the two descriptors a message may carry -- nxt_port_recv_msg_t
+ * has exactly two fd slots and nxt_socket_msg_oob_init() never attaches
+ * more -- plus, where the platform passes credentials, the one credential
+ * cmsg the kernel or the sender adds.  A receive buffer of that size can
+ * therefore never truncate a well-formed message: MSG_CTRUNC means either
+ * that the kernel could not deliver all of the control data it had for this
+ * message (an SCM_RIGHTS it could not install in full, typically under
+ * RLIMIT_NOFILE pressure), or that a peer sent more control data than any
+ * Unit message type uses.  Both are receive errors, not conditions a
+ * handler can be expected to notice: what reaches it is a well-formed,
+ * authenticated message whose descriptor is simply -1.
+ *
+ * What a kernel does with the descriptors it could not fit is not uniform,
+ * and only the Linux behaviour is verified here: scm_detach_fds() installs
+ * the ones that fit into this process and only then raises MSG_CTRUNC, so
+ * they are open, owned, and unreachable unless the accessor reports them --
+ * which is why nxt_socket_msg_oob_get() and nxt_socket_msg_oob_get_fds()
+ * fill fd[] before failing the message.  A kernel that instead discards the
+ * rights leaves nothing to leak, and the same code is correct there because
+ * fd[] simply stays -1.  The refusal itself does not depend on which way a
+ * platform goes; the reporting is what the Linux semantics make necessary.
+ * MSG_CTRUNC is POSIX, so the flag is available wherever Unit builds, but
+ * only the Linux side of this is covered by a test (see
+ * src/test/nxt_port_ctrunc_test.c, whose kernel-driven cases skip on macOS
+ * and whose queue case is gated on NXT_HAVE_UCRED).
+ */
+
+#define NXT_OOB_ALIGN       (sizeof(size_t))
+
+
+/*
+ * "buf" holds a control block that CMSG_FIRSTHDR()/CMSG_NXTHDR() walk as
+ * struct cmsghdr, so its address has to carry that struct's alignment.
+ * Nothing here states that alignment: it comes from "buf" following a size_t
+ * directly, since alignof(struct cmsghdr) == alignof(size_t) on the ABIs Unit
+ * builds for (cmsg_len is a size_t on glibc, socklen_t elsewhere).  A field
+ * inserted between the two moves "buf" off that alignment and every cmsg
+ * access becomes undefined -- UBSan reports it as "member access within
+ * misaligned address ... for type 'struct cmsghdr'".  Keep new members after
+ * "buf", as "truncated" is.  nxt_aligned() is not a substitute: it expands to
+ * nothing outside GCC and clang.
+ */
+
 typedef struct {
-    size_t  size;
-    u_char  buf[NXT_OOB_RECV_SIZE];
+    size_t      size;
+    u_char      buf[NXT_OOB_RECV_SIZE] nxt_aligned(NXT_OOB_ALIGN);
+    /* recvmsg() reported MSG_CTRUNC: the control data is incomplete. */
+    nxt_bool_t  truncated;
 } nxt_recv_oob_t;
 
 
@@ -57,9 +106,11 @@ typedef struct {
 /**
  * The nxt_sendmsg is a wrapper for sendmsg.
  * The oob struct must be initialized using nxt_socket_msg_oob_init().
+ * flags go to sendmsg(2) unchanged; pass MSG_DONTWAIT for a send that must
+ * never block (the caller handles EAGAIN).
  */
 NXT_EXPORT ssize_t nxt_sendmsg(nxt_socket_t s, nxt_iobuf_t *iob,
-    nxt_uint_t niob, const nxt_send_oob_t *oob);
+    nxt_uint_t niob, const nxt_send_oob_t *oob, int flags);
 
 /**
  * The nxt_recvmsg is a wrapper for recvmsg.
@@ -69,17 +120,58 @@ NXT_EXPORT ssize_t nxt_recvmsg(nxt_socket_t s,
     nxt_iobuf_t *iob, nxt_uint_t niob, nxt_recv_oob_t *oob);
 
 
+/*
+ * CMSG_NXTHDR() of glibc before 2.37 requires the padding after the data of
+ * the next header.  The kernel cuts off that padding when it truncates
+ * SCM_RIGHTS, so the descriptor in that header leaks.  The check below is
+ * the one of glibc 2.37.  The caller checks the cmsg_len of the next header.
+ */
+
 nxt_inline struct cmsghdr *
 NXT_CMSG_NXTHDR(struct msghdr *msgh, struct cmsghdr *cmsg)
 {
-#if !defined(__GLIBC__) && defined(__clang__)
+#if (defined(__GLIBC__))
+    const u_char  *p;
+    nxt_span_t    span;
+
+    nxt_span_init(&span, (u_char *) cmsg,
+                  (u_char *) msgh->msg_control + msgh->msg_controllen);
+
+    if (cmsg->cmsg_len < sizeof(struct cmsghdr)
+        || nxt_span_take(&span, cmsg->cmsg_len, &p) != 0
+        || nxt_span_take(&span, CMSG_ALIGN(cmsg->cmsg_len) - cmsg->cmsg_len,
+                         &p) != 0
+        || nxt_span_take(&span, sizeof(struct cmsghdr), &p) != 0)
+    {
+        return NULL;
+    }
+
+    return (struct cmsghdr *) p;
+#else
+#if (defined(__clang__))
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wsign-compare"
 #endif
     return CMSG_NXTHDR(msgh, cmsg);
-#if !defined(__GLIBC__) && defined(__clang__)
+#if (defined(__clang__))
 #pragma clang diagnostic pop
 #endif
+#endif
+}
+
+
+/*
+ * Put a receive buffer into the "carries nothing" state.  Callers that fill
+ * oob themselves, or that recycle a buffer, use this rather than assigning
+ * ->size alone, so that every field describing the control data is retired
+ * together.
+ */
+
+nxt_inline void
+nxt_socket_msg_oob_reset(nxt_recv_oob_t *oob)
+{
+    oob->size = 0;
+    oob->truncated = 0;
 }
 
 
@@ -153,6 +245,21 @@ nxt_socket_msg_oob_get_fds(nxt_recv_oob_t *oob, nxt_fd_t *fd)
          cmsg != NULL;
          cmsg = NXT_CMSG_NXTHDR(&msg, cmsg))
     {
+        /*
+         * Fail closed on a header that does not fit the bytes actually
+         * received.  CMSG_FIRSTHDR() only checks that msg_controllen covers
+         * a struct cmsghdr, so the first header's cmsg_len can still claim
+         * more data than arrived, and a block the kernel cut short is
+         * exactly where that happens.  Reading CMSG_DATA() over that claim
+         * would run off the end of oob->buf.
+         */
+        if (nxt_slow_path(cmsg->cmsg_len < CMSG_LEN(0)
+                          || (size_t) ((u_char *) cmsg - oob->buf)
+                             + cmsg->cmsg_len > oob->size))
+        {
+            return NXT_ERROR;
+        }
+
         size = cmsg->cmsg_len - CMSG_LEN(0);
 
         if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
@@ -162,8 +269,17 @@ nxt_socket_msg_oob_get_fds(nxt_recv_oob_t *oob, nxt_fd_t *fd)
 
             nxt_memcpy(fd, CMSG_DATA(cmsg), size);
 
-            return NXT_OK;
+            break;
         }
+    }
+
+    /*
+     * Checked after the loop, not before it: a truncated control block can
+     * still have delivered a descriptor, and the caller can only close what
+     * it has been told about.
+     */
+    if (nxt_slow_path(oob->truncated)) {
+        return NXT_ERROR;
     }
 
     return NXT_OK;
@@ -177,7 +293,7 @@ nxt_socket_msg_oob_get(nxt_recv_oob_t *oob, nxt_fd_t *fd, nxt_pid_t *pid)
     struct msghdr   msg;
     struct cmsghdr  *cmsg;
 
-    if (oob->size == 0) {
+    if (oob->size == 0 && !oob->truncated) {
         return NXT_OK;
     }
 
@@ -192,6 +308,21 @@ nxt_socket_msg_oob_get(nxt_recv_oob_t *oob, nxt_fd_t *fd, nxt_pid_t *pid)
          cmsg != NULL;
          cmsg = NXT_CMSG_NXTHDR(&msg, cmsg))
     {
+        /*
+         * Fail closed on a header that does not fit the bytes actually
+         * received.  CMSG_FIRSTHDR() only checks that msg_controllen covers
+         * a struct cmsghdr, so the first header's cmsg_len can still claim
+         * more data than arrived, and a block the kernel cut short is
+         * exactly where that happens.  Reading CMSG_DATA() over that claim
+         * would run off the end of oob->buf.
+         */
+        if (nxt_slow_path(cmsg->cmsg_len < CMSG_LEN(0)
+                          || (size_t) ((u_char *) cmsg - oob->buf)
+                             + cmsg->cmsg_len > oob->size))
+        {
+            return NXT_ERROR;
+        }
+
         size = cmsg->cmsg_len - CMSG_LEN(0);
 
         if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
@@ -220,6 +351,11 @@ nxt_socket_msg_oob_get(nxt_recv_oob_t *oob, nxt_fd_t *fd, nxt_pid_t *pid)
             *pid = NXT_CRED_GETPID(creds);
         }
 #endif
+    }
+
+    /* See nxt_socket_msg_oob_get_fds() on why this follows the loop. */
+    if (nxt_slow_path(oob->truncated)) {
+        return NXT_ERROR;
     }
 
 #if (NXT_CRED_USECMSG)

@@ -55,7 +55,6 @@ typedef uint16_t                     nxt_port_id_t;
 #include <nxt_thread_time.h>
 #include <nxt_rbtree.h>
 #include <nxt_timer.h>
-#include <nxt_fiber.h>
 #include <nxt_thread.h>
 #include <nxt_process_type.h>
 #include <nxt_capability.h>
@@ -83,7 +82,6 @@ typedef struct nxt_sockaddr_s           nxt_sockaddr_t;
 #include <nxt_malloc.h>
 #include <nxt_mem_map.h>
 #include <nxt_socket.h>
-#include <nxt_dyld.h>
 
 
 typedef void *(*nxt_mem_proto_alloc_t)(void *pool, size_t size);
@@ -95,7 +93,6 @@ typedef struct {
 } nxt_mem_proto_t;
 
 
-#include <nxt_mem_zone.h>
 #include <nxt_signal.h>
 #include <nxt_semaphore.h>
 
@@ -146,7 +143,6 @@ typedef void (*nxt_event_conn_handler_t)(nxt_thread_t *thr, nxt_conn_t *c);
 #include <nxt_conn.h>
 #include <nxt_event_engine.h>
 
-#include <nxt_job.h>
 
 #include <nxt_sockaddr.h>
 
@@ -161,9 +157,23 @@ typedef void (*nxt_event_conn_handler_t)(nxt_thread_t *thr, nxt_conn_t *c);
  */
 NXT_EXPORT nxt_int_t nxt_lib_start(const char *app, char **argv, char ***envp);
 NXT_EXPORT void nxt_lib_stop(void);
+NXT_EXPORT nxt_uint_t nxt_cgroup_cpu_max_parse(const u_char *p, size_t len);
+NXT_EXPORT void nxt_cgroup_mountinfo_unescape(char *s);
+NXT_EXPORT const char *nxt_cgroup_relative_path(const char *cgroup,
+    const char *root);
+NXT_EXPORT nxt_int_t nxt_cgroup_mountinfo_parse(char *line, char **root,
+    char **mnt);
+NXT_EXPORT nxt_uint_t nxt_cgroup_cpu_limit_walk(char *dir, size_t base,
+    nxt_uint_t (*reader)(const char *dir, void *data), void *data);
+#if (NXT_LINUX)
+NXT_EXPORT nxt_int_t nxt_cgroup_mountinfo_find(FILE *fp, const char *cgroup,
+    char *dir, size_t size, size_t *base);
+#endif
 
 
 NXT_EXPORT extern nxt_uint_t    nxt_ncpu;
+/* The CPU count before the cgroup CPU limit lowered it, or 0. */
+NXT_EXPORT extern nxt_uint_t    nxt_ncpu_unlimited;
 NXT_EXPORT extern nxt_uint_t    nxt_pagesize;
 NXT_EXPORT extern nxt_task_t    nxt_main_task;
 NXT_EXPORT extern nxt_atomic_t  nxt_task_ident;

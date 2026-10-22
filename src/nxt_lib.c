@@ -5,14 +5,22 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_span.h>
 
 
 nxt_uint_t    nxt_ncpu = 1;
+nxt_uint_t    nxt_ncpu_unlimited;
 nxt_uint_t    nxt_pagesize;
 nxt_task_t    nxt_main_task;
 nxt_atomic_t  nxt_task_ident;
 
 nxt_thread_declare_data(nxt_thread_t, nxt_thread_context);
+
+
+#if (NXT_LINUX)
+static nxt_uint_t nxt_cgroup_cpu_limit(void);
+static nxt_uint_t nxt_cgroup_cpu_max_read(const char *dir, void *data);
+#endif
 
 
 #if (NXT_DEBUG && NXT_FREEBSD)
@@ -36,6 +44,9 @@ nxt_lib_start(const char *app, char **argv, char ***envp)
     nxt_int_t     flags;
     nxt_bool_t    update;
     nxt_thread_t  *thread;
+#if (NXT_LINUX)
+    nxt_uint_t    limit;
+#endif
 
     flags = nxt_stderr_start();
 
@@ -115,6 +126,23 @@ nxt_lib_start(const char *app, char **argv, char ***envp)
 
 #endif
 
+#if (NXT_LINUX)
+    /*
+     * A CPU bandwidth limit (cgroup v2 "cpu.max") does not change the
+     * affinity mask.  A container limited to 2 CPUs on a 64-CPU host
+     * otherwise starts 64 router threads.
+     */
+    if (n > 1) {
+        limit = nxt_cgroup_cpu_limit();
+
+        if (limit != 0 && limit < (nxt_uint_t) n) {
+            /* nxt_runtime_start() writes the record to unit.log. */
+            nxt_ncpu_unlimited = n;
+            n = (int) limit;
+        }
+    }
+#endif
+
     nxt_debug(&nxt_main_task, "ncpu: %d", n);
 
     if (n > 1) {
@@ -141,6 +169,467 @@ nxt_lib_start(const char *app, char **argv, char ***envp)
 
     return NXT_OK;
 }
+
+
+/*
+ * Parses the contents of a cgroup v2 "cpu.max" file: "<quota> <period>",
+ * or "max <period>" for no limit.  Returns the quota in whole CPUs, rounded
+ * up, or 0 if there is no limit or the contents are not valid.
+ */
+
+nxt_uint_t
+nxt_cgroup_cpu_max_parse(const u_char *p, size_t len)
+{
+    size_t        n;
+    nxt_off_t     quota, period;
+    nxt_span_t    span;
+    const u_char  *sp, *field;
+
+    /* A trailing newline or space is not part of the value. */
+
+    while (len != 0 && (p[len - 1] == '\n' || p[len - 1] == ' ')) {
+        len--;
+    }
+
+    nxt_span_init(&span, p, p + len);
+
+    /* The quota is the bytes before the first space. */
+
+    sp = memchr(p, ' ', len);
+    if (sp == NULL) {
+        return 0;
+    }
+
+    n = sp - p;
+
+    if (nxt_span_take(&span, n, &field) != 0) {
+        return 0;
+    }
+
+    quota = nxt_off_t_parse(field, n);
+
+    /* The space. */
+
+    if (nxt_span_take(&span, 1, &field) != 0) {
+        return 0;
+    }
+
+    /* The period is the rest. */
+
+    n = nxt_span_len(&span);
+
+    if (nxt_span_take(&span, n, &field) != 0) {
+        return 0;
+    }
+
+    period = nxt_off_t_parse(field, n);
+
+    if (quota <= 0 || period <= 0) {
+        return 0;
+    }
+
+    /* Rounds up without an addition that could overflow. */
+    quota = quota / period + (quota % period != 0);
+
+    return (quota > (nxt_off_t) NXT_INT32_T_MAX) ? 0 : (nxt_uint_t) quota;
+}
+
+
+/*
+ * /proc/self/mountinfo writes a space, a tab, a newline and a backslash in
+ * a path as a backslash and three octal digits, such as "\040" for a space.
+ * Decodes these escapes in place.  /proc/self/cgroup does not escape a
+ * path, so the decoded mount root can be compared with it.
+ */
+
+void
+nxt_cgroup_mountinfo_unescape(char *s)
+{
+    char  *d;
+
+    d = s;
+
+    while (*s != '\0') {
+
+        if (s[0] == '\\'
+            && s[1] >= '0' && s[1] <= '3'
+            && s[2] >= '0' && s[2] <= '7'
+            && s[3] >= '0' && s[3] <= '7')
+        {
+            *d++ = (char) (((s[1] - '0') << 6) | ((s[2] - '0') << 3)
+                           | (s[3] - '0'));
+            s += 4;
+            continue;
+        }
+
+        *d++ = *s++;
+    }
+
+    *d = '\0';
+}
+
+
+/*
+ * Returns the path of "cgroup" below the root "root" of the cgroup2 mount:
+ * "" for the root itself, else a path that starts with "/".  Returns NULL
+ * if the cgroup is not below the root, or if its path has a ".." component.
+ * Such a cgroup is outside the cgroup namespace, and the mount does not
+ * show it.
+ */
+
+const char *
+nxt_cgroup_relative_path(const char *cgroup, const char *root)
+{
+    size_t      len;
+    const char  *rel, *p;
+
+    rel = cgroup;
+
+    if (strcmp(root, "/") != 0) {
+        len = strlen(root);
+
+        if (strncmp(cgroup, root, len) != 0
+            || (cgroup[len] != '/' && cgroup[len] != '\0'))
+        {
+            return NULL;
+        }
+
+        rel = cgroup + len;
+    }
+
+    /* Only a whole ".." component: a cgroup can be named "..foo". */
+
+    for (p = strstr(rel, "/.."); p != NULL; p = strstr(p + 1, "/..")) {
+
+        if (p[3] == '/' || p[3] == '\0') {
+            return NULL;
+        }
+    }
+
+    if (strcmp(rel, "/") == 0) {
+        return "";
+    }
+
+    return rel;
+}
+
+
+/*
+ * Takes one field and the space after it off the span.  Fails if no
+ * space follows the field.
+ */
+
+static nxt_int_t
+nxt_cgroup_mountinfo_field(nxt_span_t *span, const u_char **field,
+    size_t *len)
+{
+    size_t        n;
+    const u_char  *sp, *space;
+
+    sp = memchr(span->pos, ' ', nxt_span_len(span));
+    if (sp == NULL) {
+        return NXT_DECLINED;
+    }
+
+    n = sp - span->pos;
+
+    if (nxt_span_take(span, n, field) != 0
+        || nxt_span_take(span, 1, &space) != 0)
+    {
+        return NXT_DECLINED;
+    }
+
+    *len = n;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Parses one line of /proc/self/mountinfo:
+ *
+ *   <id> <parent id> <major:minor> <root> <mount point> <options>
+ *   [<optional field> ...] - <type> <source> <super options>
+ *
+ * For a line of the type "cgroup2" with a mount point that is not empty,
+ * ends the root and the mount point with a NUL in place, decodes their
+ * escapes, sets "root" and "mnt" to them, and returns NXT_OK.  For any
+ * other line, returns NXT_DECLINED and does not change "root" or "mnt".
+ */
+
+nxt_int_t
+nxt_cgroup_mountinfo_parse(char *line, char **root, char **mnt)
+{
+    char          *root_start, *mnt_start;
+    size_t        n, root_len;
+    u_char        *start, *sep;
+    nxt_uint_t    i;
+    nxt_span_t    span;
+    const u_char  *field, *root_field;
+
+    start = (u_char *) line;
+
+    /* A path writes a space as "\040", so this is the separator. */
+
+    sep = (u_char *) strstr(line, " - cgroup2 ");
+    if (sep == NULL) {
+        return NXT_DECLINED;
+    }
+
+    /*
+     * The span keeps the space that starts the separator.  So a space ends
+     * every field, the mount point too.
+     */
+
+    nxt_span_init(&span, start, sep + 1);
+
+    /* The mount ID, the parent ID, "major:minor" and the root, last. */
+
+    root_field = NULL;
+    root_len = 0;
+
+    for (i = 0; i < 4; i++) {
+        if (nxt_cgroup_mountinfo_field(&span, &root_field, &root_len)
+            != NXT_OK)
+        {
+            return NXT_DECLINED;
+        }
+    }
+
+    /*
+     * The mount point ends at the next space.  It can be empty, or decode
+     * to empty, so it is checked after the unescape.
+     */
+
+    field = NULL;
+    n = 0;
+
+    if (nxt_cgroup_mountinfo_field(&span, &field, &n) != NXT_OK) {
+        return NXT_DECLINED;
+    }
+
+    /* Both fields end at a space inside "line". */
+
+    root_start = line + (root_field - start);
+    mnt_start = line + (field - start);
+
+    root_start[root_len] = '\0';
+    mnt_start[n] = '\0';
+
+    nxt_cgroup_mountinfo_unescape(root_start);
+    nxt_cgroup_mountinfo_unescape(mnt_start);
+
+    if (*mnt_start == '\0') {
+        return NXT_DECLINED;
+    }
+
+    *root = root_start;
+    *mnt = mnt_start;
+
+    return NXT_OK;
+}
+
+
+/*
+ * Returns the lowest CPU limit that "reader" returns for the directory
+ * "dir" and for each parent of it, up to the first "base" bytes of "dir".
+ * These bytes are the mount point of the cgroup2 file system, and that
+ * directory is read too.  Returns 0 if no level sets a limit.  Changes
+ * "dir".
+ */
+
+nxt_uint_t
+nxt_cgroup_cpu_limit_walk(char *dir, size_t base,
+    nxt_uint_t (*reader)(const char *dir, void *data), void *data)
+{
+    char        *slash;
+    size_t      len;
+    nxt_uint_t  limit, cpus;
+
+    limit = 0;
+    len = strlen(dir);
+
+    for ( ;; ) {
+        cpus = reader(dir, data);
+
+        if (cpus != 0 && (limit == 0 || cpus < limit)) {
+            limit = cpus;
+        }
+
+        if (len <= base) {
+            break;
+        }
+
+        slash = strrchr(dir + base, '/');
+        if (slash == NULL) {
+            break;
+        }
+
+        *slash = '\0';
+        len = slash - dir;
+    }
+
+    return limit;
+}
+
+
+#if (NXT_LINUX)
+
+/*
+ * Finds in the mountinfo lines of "fp" the first cgroup2 mount whose root
+ * contains "cgroup".  A mount whose root does not contain the cgroup does
+ * not show it.  Go takes the first such mount too.  Writes the directory
+ * of the cgroup to "dir" and the length of the mount point to "base".
+ * Returns NXT_DECLINED if no mount contains the cgroup, or if the
+ * directory does not fit in "size" bytes.
+ */
+
+nxt_int_t
+nxt_cgroup_mountinfo_find(FILE *fp, const char *cgroup, char *dir,
+    size_t size, size_t *base)
+{
+    int         len;
+    char        *line, *root, *mnt;
+    size_t      line_size;
+    nxt_int_t   ret;
+    const char  *rel;
+
+    line = NULL;
+    line_size = 0;
+    ret = NXT_DECLINED;
+
+    while (getline(&line, &line_size, fp) > 0) {
+        if (nxt_cgroup_mountinfo_parse(line, &root, &mnt) != NXT_OK) {
+            continue;
+        }
+
+        /* The cgroup path is relative to the root of the cgroup namespace. */
+
+        rel = nxt_cgroup_relative_path(cgroup, root);
+        if (rel == NULL) {
+            continue;
+        }
+
+        len = snprintf(dir, size, "%s%s", mnt, rel);
+
+        if (len >= 0 && (size_t) len < size) {
+            *base = strlen(mnt);
+            ret = NXT_OK;
+        }
+
+        break;
+    }
+
+    nxt_free(line);
+
+    return ret;
+}
+
+
+/*
+ * Returns the lowest CPU limit of the cgroup v2 directories from the
+ * cgroup of this process up to the root of the cgroup2 mount, or 0 if
+ * no level sets a limit.  The root of the mount is the root of the cgroup
+ * namespace of the process.  With a private cgroup namespace, as in a
+ * container, a limit on a parent of the namespace root is not seen.  The
+ * cgroup v1 "cpu" controller is not read.
+ */
+
+static nxt_uint_t
+nxt_cgroup_cpu_limit(void)
+{
+    char        *line, *cgroup;
+    FILE        *fp;
+    size_t      size, base;
+    ssize_t     nread;
+    nxt_int_t   ret;
+    nxt_uint_t  limit;
+    char        dir[NXT_MAX_PATH_LEN];
+
+    line = NULL;
+    size = 0;
+    cgroup = NULL;
+    limit = 0;
+
+    fp = fopen("/proc/self/cgroup", "re");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    while ((nread = getline(&line, &size, fp)) > 0) {
+        if (nread > 3 && memcmp(line, "0::", 3) == 0) {
+            if (line[nread - 1] == '\n') {
+                line[nread - 1] = '\0';
+            }
+
+            cgroup = strdup(line + 3);
+            break;
+        }
+    }
+
+    fclose(fp);
+
+    if (cgroup == NULL) {
+        goto done;
+    }
+
+    fp = fopen("/proc/self/mountinfo", "re");
+    if (fp == NULL) {
+        goto done;
+    }
+
+    ret = nxt_cgroup_mountinfo_find(fp, cgroup, dir, sizeof(dir), &base);
+
+    fclose(fp);
+
+    if (ret != NXT_OK) {
+        goto done;
+    }
+
+    limit = nxt_cgroup_cpu_limit_walk(dir, base, nxt_cgroup_cpu_max_read,
+                                      NULL);
+
+done:
+
+    nxt_free(cgroup);
+    nxt_free(line);
+
+    return limit;
+}
+
+
+static nxt_uint_t
+nxt_cgroup_cpu_max_read(const char *dir, void *data)
+{
+    int      fd, len;
+    ssize_t  n;
+    u_char   buf[64];
+    char     path[NXT_MAX_PATH_LEN];
+
+    len = snprintf(path, sizeof(path), "%s/cpu.max", dir);
+    if (len < 0 || (size_t) len >= sizeof(path)) {
+        return 0;
+    }
+
+    /* The root cgroup and a cgroup without the "cpu" controller have none. */
+
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd == -1) {
+        return 0;
+    }
+
+    n = read(fd, buf, sizeof(buf));
+
+    close(fd);
+
+    if (n <= 0) {
+        return 0;
+    }
+
+    return nxt_cgroup_cpu_max_parse(buf, n);
+}
+
+#endif
 
 
 void

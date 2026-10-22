@@ -9,7 +9,7 @@
 
 ssize_t
 nxt_sendmsg(nxt_socket_t s, nxt_iobuf_t *iob, nxt_uint_t niob,
-    const nxt_send_oob_t *oob)
+    const nxt_send_oob_t *oob, int flags)
 {
     struct msghdr  msg;
 
@@ -29,7 +29,7 @@ nxt_sendmsg(nxt_socket_t s, nxt_iobuf_t *iob, nxt_uint_t niob,
         msg.msg_controllen = 0;
     }
 
-    return sendmsg(s, &msg, 0);
+    return sendmsg(s, &msg, flags);
 }
 
 
@@ -47,10 +47,16 @@ nxt_recvmsg(nxt_socket_t s, nxt_iobuf_t *iob, nxt_uint_t niob,
     msg.msg_control = oob->buf;
     msg.msg_controllen = sizeof(oob->buf);
 
+    /* Cleared so that MSG_CTRUNC below is read from what recvmsg() wrote. */
+    msg.msg_flags = 0;
+
     n = recvmsg(s, &msg, 0);
 
     if (nxt_fast_path(n != -1)) {
         oob->size = msg.msg_controllen;
+
+        /* Recorded for nxt_socket_msg_oob_get(); see NXT_OOB_RECV_SIZE. */
+        oob->truncated = (msg.msg_flags & MSG_CTRUNC) != 0;
     }
 
     return n;

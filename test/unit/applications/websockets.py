@@ -3,6 +3,7 @@ import hashlib
 import itertools
 import random
 import select
+import socket
 import struct
 
 import pytest
@@ -13,6 +14,14 @@ GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 class ApplicationWebsocket(ApplicationProto):
+
+    # Seconds to wait for the echo of a large message (the 9_x tests).
+    # A debug build needs 3.6-4.4 s to echo 65536 fragments of 64 bytes.
+    LARGE_MESSAGE_TIMEOUT = 30
+
+    # Seconds a blocking socket call may wait.  Without it, a server that
+    # stops reading blocks sendall() for ever and the test never ends.
+    SOCKET_TIMEOUT = 60
 
     OP_CONT = 0x00
     OP_TEXT = 0x01
@@ -30,7 +39,7 @@ class ApplicationWebsocket(ApplicationProto):
         sha1 = hashlib.sha1((key + GUID).encode()).digest()
         return base64.b64encode(sha1).decode()
 
-    def upgrade(self, headers=None):
+    def upgrade(self, headers=None, sock=None):
         key = None
 
         if headers is None:
@@ -44,10 +53,9 @@ class ApplicationWebsocket(ApplicationProto):
                 'Sec-WebSocket-Version': 13,
             }
 
-        sock = self.get(
-            headers=headers,
-            no_recv=True,
-        )
+        kwargs = {} if sock is None else {'sock': sock}
+
+        sock = self.get(headers=headers, no_recv=True, **kwargs)
 
         resp = ''
         while True:
@@ -60,6 +68,8 @@ class ApplicationWebsocket(ApplicationProto):
             if resp.startswith('HTTP/') and '\r\n\r\n' in resp:
                 resp = self._resp_to_dict(resp)
                 break
+
+        sock.settimeout(self.SOCKET_TIMEOUT)
 
         return (resp, sock, key)
 
@@ -81,7 +91,13 @@ class ApplicationWebsocket(ApplicationProto):
                         pytest.fail("Can't read response from server.")
                     break
 
-                data += sock.recv(bytes_len - len(data))
+                chunk = sock.recv(bytes_len - len(data))
+                if not chunk:
+                    # Without this, select() reports the closed socket as
+                    # readable for ever and the loop never ends.
+                    pytest.fail('The server closed the connection.')
+
+                data += chunk
 
                 if len(data) == bytes_len:
                     break
@@ -140,6 +156,27 @@ class ApplicationWebsocket(ApplicationProto):
 
         return frame
 
+    def pongs_read(self, sock, pings, read_timeout=60):
+        # RFC 6455 Section 5.5.3: while a PONG is not sent, the server can
+        # answer only the most recent PING.  Read PONGs until the one for the
+        # last PING.  They must answer PINGs in the order they were sent.
+
+        pings = [p.encode() if isinstance(p, str) else p for p in pings]
+        answered = []
+
+        while not answered or answered[-1] != len(pings) - 1:
+            frame = self.frame_read(sock, read_timeout)
+
+            assert frame['opcode'] == self.OP_PONG, 'pong opcode'
+            assert frame['data'] in pings, 'pong payload'
+
+            i = pings.index(frame['data'])
+            assert not answered or i > answered[-1], 'pong order'
+
+            answered.append(i)
+
+        return answered
+
     def frame_to_send(
         self,
         opcode,
@@ -189,23 +226,26 @@ class ApplicationWebsocket(ApplicationProto):
         chopsize = kwargs.pop('chopsize') if 'chopsize' in kwargs else None
 
         frame = self.frame_to_send(*args, **kwargs)
+        frame_len = len(frame)
 
         if chopsize is None:
-            try:
-                sock.sendall(frame)
-            except BrokenPipeError:
-                pass
+            chopsize = frame_len
 
-        else:
-            pos = 0
-            frame_len = len(frame)
-            while pos < frame_len:
-                end = min(pos + chopsize, frame_len)
-                try:
-                    sock.sendall(frame[pos:end])
-                except BrokenPipeError:
-                    end = frame_len
-                pos = end
+        pos = 0
+        while pos < frame_len:
+            end = min(pos + chopsize, frame_len)
+            try:
+                sock.sendall(frame[pos:end])
+            except (BrokenPipeError, ConnectionResetError):
+                # The server has closed the connection.  If it closed with
+                # unread data, it reset the connection.
+                end = frame_len
+            except socket.timeout:
+                pytest.fail(
+                    f'A {frame_len}-byte frame was not sent in '
+                    f'{sock.gettimeout()} s: the server does not read.'
+                )
+            pos = end
 
     def message(self, sock, mes_type, message, fragmention_size=None, **kwargs):
         message_len = len(message)

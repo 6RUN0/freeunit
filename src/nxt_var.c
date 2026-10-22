@@ -40,6 +40,9 @@ struct nxt_var_query_s {
 #define nxt_var_raw_start(var)                                                \
     ((var)->data + (var)->vars * sizeof(nxt_var_sub_t))
 
+#define NXT_VAR_ONES   ((uint64_t) 0x0101010101010101ULL)
+#define NXT_VAR_HIGH   ((uint64_t) 0x8080808080808080ULL)
+
 
 static nxt_int_t nxt_var_hash_test(nxt_lvlhsh_query_t *lhq, void *data);
 static nxt_var_decl_t *nxt_var_hash_find(nxt_str_t *name);
@@ -51,7 +54,7 @@ static nxt_int_t nxt_var_cache_test(nxt_lvlhsh_query_t *lhq, void *data);
 static nxt_str_t *nxt_var_cache_value(nxt_task_t *task, nxt_tstr_state_t *state,
     nxt_var_cache_t *cache, nxt_var_ref_t *ref, void *ctx);
 
-static u_char *nxt_var_next_part(u_char *start, u_char *end, nxt_str_t *part);
+u_char *nxt_var_next_part(u_char *start, u_char *end, nxt_str_t *part);
 
 
 static const nxt_lvlhsh_proto_t  nxt_var_hash_proto  nxt_aligned(64) = {
@@ -70,9 +73,6 @@ static const nxt_lvlhsh_proto_t  nxt_var_cache_proto  nxt_aligned(64) = {
 
 
 static nxt_lvlhsh_t       nxt_var_hash;
-static uint32_t           nxt_var_count;
-
-static nxt_var_decl_t     **nxt_vars;
 
 
 static nxt_int_t
@@ -286,33 +286,6 @@ nxt_var_register(nxt_var_decl_t *decl, size_t n)
         }
     }
 
-    nxt_var_count += n;
-
-    return NXT_OK;
-}
-
-
-nxt_int_t
-nxt_var_index_init(void)
-{
-    nxt_uint_t         i;
-    nxt_var_decl_t     *decl, **vars;
-    nxt_lvlhsh_each_t  lhe;
-
-    vars = nxt_memalign(64, nxt_var_count * sizeof(nxt_var_decl_t *));
-    if (vars == NULL) {
-        return NXT_ERROR;
-    }
-
-    nxt_lvlhsh_each_init(&lhe, &nxt_var_hash_proto);
-
-    for (i = 0; i < nxt_var_count; i++) {
-        decl = nxt_lvlhsh_each(&nxt_var_hash, &lhe);
-        vars[i] = decl;
-    }
-
-    nxt_vars = vars;
-
     return NXT_OK;
 }
 
@@ -423,7 +396,7 @@ nxt_var_test(nxt_tstr_state_t *state, nxt_str_t *str, u_char *error)
 }
 
 
-static u_char *
+u_char *
 nxt_var_next_part(u_char *start, u_char *end, nxt_str_t *part)
 {
     size_t      length;
@@ -493,13 +466,143 @@ nxt_var_next_part(u_char *start, u_char *end, nxt_str_t *part)
 }
 
 
+/*
+ * Escape one byte of a variable's value the way nginx's access log does
+ * (ngx_http_log_escape()): the quote, the backslash and everything outside
+ * printable ASCII become "\xHH".  nginx has one emit path and no short forms
+ * such as "\\\"", so a reader that already unescapes an nginx log reads this
+ * one correctly; emitting "\\\"" here would make such a reader see a literal
+ * backslash followed by a field-terminating quote.
+ *
+ * The high half is escaped too, not only the control characters.  A reader
+ * that decodes the log as UTF-8 and splits it on Unicode line breaks treats
+ * U+0085, U+2028 and U+2029 as terminators, so a raw 0xC2 0x85 in a value
+ * would end a record just as a raw newline does.
+ */
+
+nxt_inline nxt_bool_t
+nxt_var_escaped(u_char c)
+{
+    return c < 0x20 || c >= 0x7F || c == '"' || c == '\\';
+}
+
+
+/*
+ * nxt_var_escape_word() is true if one of eight bytes is a byte that
+ * nxt_var_escaped() escapes.  Each term sets the high bit of such a byte:
+ * "w + 1" of a byte from 0x7F to 0xFE, "w - 0x20" of a byte below 0x20 or
+ * from 0xA0 to 0xFF, and "(w ^ c) - 1" of a byte equal to c.  A term may set
+ * the high bit of another byte too, but only of a byte to escape anyway, or,
+ * by a carry or a borrow, of the byte after one; so the test is zero for a
+ * word with no byte to escape and non-zero for a word with one.  It does not
+ * depend on the byte order.
+ *
+ * The escape functions test each block of eight bytes once.  A clean block,
+ * the common case, is passed or copied whole; a block with a byte to escape
+ * goes through the byte loop, so a value with many such bytes costs about
+ * what the plain byte loop costs.
+ */
+
+nxt_inline nxt_bool_t
+nxt_var_escape_word(const u_char *p)
+{
+    uint64_t  w;
+
+    nxt_memcpy(&w, p, 8);
+
+    return (((w + NXT_VAR_ONES)
+             | (w - NXT_VAR_ONES * 0x20)
+             | ((w ^ NXT_VAR_ONES * '"') - NXT_VAR_ONES)
+             | ((w ^ NXT_VAR_ONES * '\\') - NXT_VAR_ONES))
+            & NXT_VAR_HIGH) != 0;
+}
+
+
+size_t
+nxt_var_escape_length(const u_char *p, size_t length)
+{
+    size_t  size, i, stop;
+
+    size = length;
+    i = 0;
+
+    while (i < length) {
+
+        if (length - i >= 8) {
+            stop = i + 8;
+
+            if (!nxt_var_escape_word(&p[i])) {
+                i = stop;
+                continue;
+            }
+
+        } else {
+            stop = length;
+        }
+
+        while (i < stop) {
+            if (nxt_var_escaped(p[i++])) {
+                /* One byte becomes the four of "\xHH". */
+                size += 3;
+            }
+        }
+    }
+
+    return size;
+}
+
+
+u_char *
+nxt_var_escape(u_char *dst, const u_char *src, size_t length)
+{
+    u_char  c;
+    size_t  i, stop;
+
+    static const u_char  hex[] = "0123456789ABCDEF";
+
+    i = 0;
+
+    while (i < length) {
+
+        if (length - i >= 8) {
+            stop = i + 8;
+
+            if (!nxt_var_escape_word(&src[i])) {
+                dst = nxt_cpymem(dst, &src[i], 8);
+                i = stop;
+                continue;
+            }
+
+        } else {
+            stop = length;
+        }
+
+        while (i < stop) {
+            c = src[i++];
+
+            if (!nxt_var_escaped(c)) {
+                *dst++ = c;
+                continue;
+            }
+
+            *dst++ = '\\';
+            *dst++ = 'x';
+            *dst++ = hex[c >> 4];
+            *dst++ = hex[c & 0xf];
+        }
+    }
+
+    return dst;
+}
+
+
 nxt_int_t
 nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
     nxt_var_cache_t *cache, nxt_var_t *var, nxt_str_t *str, void *ctx,
-    nxt_bool_t logging)
+    nxt_uint_t flags)
 {
     u_char         *p, *src;
-    size_t         length, last, next;
+    size_t         length, size, escaped, last, next;
     uint32_t       index;
     nxt_str_t      *value, **part;
     nxt_uint_t     i;
@@ -514,6 +617,7 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
     subs = nxt_var_subs(var);
 
     length = var->length;
+    escaped = 0;
 
     for (i = 0; i < var->vars; i++) {
         index = subs[i].index;
@@ -529,11 +633,26 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
 
         *part = value;
 
-        length += value->length - subs[i].length;
+        length -= subs[i].length;
 
-        if (logging && value->start == NULL) {
+        if (flags & NXT_VAR_ESCAPE) {
+            size = nxt_var_escape_length(value->start, value->length);
+            escaped += size - value->length;
+            length += size;
+
+        } else {
+            length += value->length;
+        }
+
+        if ((flags & NXT_VAR_LOGGING) && value->start == NULL) {
             length += 1;
         }
+    }
+
+    /* No value has a byte to escape, the common case: copy them as they are. */
+
+    if (escaped == 0) {
+        flags &= ~NXT_VAR_ESCAPE;
     }
 
     p = nxt_mp_nget(cache->pool, length);
@@ -556,9 +675,14 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
             p = nxt_cpymem(p, &src[last], next - last);
         }
 
-        p = nxt_cpymem(p, part[i]->start, part[i]->length);
+        if (flags & NXT_VAR_ESCAPE) {
+            p = nxt_var_escape(p, part[i]->start, part[i]->length);
 
-        if (logging && part[i]->start == NULL) {
+        } else {
+            p = nxt_cpymem(p, part[i]->start, part[i]->length);
+        }
+
+        if ((flags & NXT_VAR_LOGGING) && part[i]->start == NULL) {
             *p++ = '-';
         }
 
@@ -566,8 +690,15 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
     }
 
     if (last != var->length) {
-        nxt_cpymem(p, &src[last], var->length - last);
+        p = nxt_cpymem(p, &src[last], var->length - last);
     }
+
+    /*
+     * The pass above and the length computed for nxt_mp_nget() are written by
+     * hand and have to agree.  Say so, rather than letting them drift apart
+     * quietly: what a variable expands to is escaped in one of them.
+     */
+    nxt_assert(p == str->start + str->length);
 
     return NXT_OK;
 }

@@ -37,7 +37,7 @@ RUN_go ?=			/bin/true
 MODULE_PREBUILD_go ?= /bin/true
 
 VERSIONS_java ?=	$(call eol_versions,java)
-VARIANT_java ?=		noble
+VARIANT_java ?=		resolute
 $(foreach javaversion, $(VERSIONS_java), $(eval CONTAINER_java-$(javaversion) = eclipse-temurin:$(javaversion)-jdk-$(VARIANT_java)))
 CONFIGURE_java ?=	java --jars=/usr/share/unit-jsc-common/
 INSTALL_java ?=		java-shared-install java-install
@@ -123,7 +123,7 @@ Dockerfile.%: ../../version template.Dockerfile
 
 build-%: Dockerfile.%
 	docker pull $(CONTAINER_$*)
-	docker build --no-cache -t unit:$(VERSION)-$* -f Dockerfile.$* .
+	docker build --no-cache --build-arg UNIT_VERSION=$(VERSION) -t unit:$(VERSION)-$* -f Dockerfile.$* .
 	touch $@
 
 # TODO(#milestone-1.35.8): uncomment and update GitFetch when publishing to

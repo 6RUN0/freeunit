@@ -17,6 +17,22 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 
+/*
+ * The X509 name accessors were constified in stages, and not together:
+ * X509_NAME_get_entry() and X509_NAME_ENTRY_get_data() took const arguments
+ * from 1.1.0, but X509_NAME_get_index_by_NID() only from 3.0, and it is 4.0
+ * that constified the values all three return.  Qualifying from 3.0 is what
+ * satisfies every version at once -- an older header takes these pointers
+ * non-const, and 4.0 hands them back const -- so the boundary is 3.0 rather
+ * than the 1.1.0 the other guards in this file use.
+ */
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#define NXT_X509_CONST  const
+#else
+#define NXT_X509_CONST
+#endif
+
 
 typedef struct {
     SSL               *session;
@@ -29,6 +45,38 @@ typedef struct {
     nxt_tls_conf_t    *conf;
     nxt_buf_mem_t     buffer;
 } nxt_openssl_conn_t;
+
+
+#if (NXT_HAVE_OPENSSL_TLSEXT)
+
+/*
+ * OpenSSL 3.0 deprecated the HMAC_CTX flavour of the session ticket key
+ * callback in favour of SSL_CTX_set_tlsext_ticket_key_evp_cb(), which hands
+ * the callback an EVP_MAC_CTX instead.  The deprecation covers the
+ * SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB control behind the old registration
+ * macro as well, so the feature guard has to follow the callback flavour:
+ * once OpenSSL 5.0 drops the deprecated symbols, testing for the control
+ * would silently turn Session Tickets off.
+ */
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+
+#include <openssl/core_names.h>
+#include <openssl/params.h>
+
+#define NXT_OPENSSL_TICKET_KEY_CB  1
+typedef EVP_MAC_CTX  nxt_tls_ticket_mac_t;
+
+#elif defined(SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB)
+
+#include <openssl/hmac.h>
+
+#define NXT_OPENSSL_TICKET_KEY_CB  1
+typedef HMAC_CTX     nxt_tls_ticket_mac_t;
+
+#endif
+
+#endif /* NXT_HAVE_OPENSSL_TLSEXT */
 
 
 struct nxt_tls_ticket_s {
@@ -55,12 +103,6 @@ typedef enum {
 
 static nxt_int_t nxt_openssl_library_init(nxt_task_t *task);
 static void nxt_openssl_library_free(nxt_task_t *task);
-#if OPENSSL_VERSION_NUMBER < 0x10100004L
-static nxt_int_t nxt_openssl_locks_init(void);
-static void nxt_openssl_lock(int mode, int type, const char *file, int line);
-static unsigned long nxt_openssl_thread_id(void);
-static void nxt_openssl_locks_free(void);
-#endif
 static nxt_int_t nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
     nxt_tls_init_t *tls_init, nxt_bool_t last);
 static nxt_int_t nxt_openssl_chain_file(nxt_task_t *task, SSL_CTX *ctx,
@@ -72,13 +114,18 @@ static nxt_int_t nxt_ssl_conf_commands(nxt_task_t *task, SSL_CTX *ctx,
 #if (NXT_HAVE_OPENSSL_TLSEXT)
 static nxt_int_t nxt_tls_ticket_keys(nxt_task_t *task, SSL_CTX *ctx,
     nxt_tls_init_t *tls_init, nxt_mp_t *mp);
+#ifdef NXT_OPENSSL_TICKET_KEY_CB
 static int nxt_tls_ticket_key_callback(SSL *s, unsigned char *name,
-    unsigned char *iv, EVP_CIPHER_CTX *ectx, HMAC_CTX *hctx, int enc);
+    unsigned char *iv, EVP_CIPHER_CTX *ectx, nxt_tls_ticket_mac_t *hctx,
+    int enc);
+#endif
 #endif
 static void nxt_ssl_session_cache(SSL_CTX *ctx, size_t cache_size,
     time_t timeout);
 static nxt_uint_t nxt_openssl_cert_get_names(nxt_task_t *task, X509 *cert,
     nxt_tls_conf_t *conf, nxt_mp_t *mp);
+static nxt_int_t nxt_openssl_name_text(NXT_X509_CONST X509_NAME *x509_name,
+    int nid, nxt_str_t *str);
 static nxt_int_t nxt_openssl_bundle_hash_test(nxt_lvlhsh_query_t *lhq,
     void *data);
 static nxt_int_t nxt_openssl_bundle_hash_insert(nxt_task_t *task,
@@ -114,6 +161,11 @@ const nxt_tls_lib_t  nxt_openssl_lib = {
 };
 
 
+#if (NXT_TESTS)
+nxt_uint_t  nxt_openssl_test_fail;
+#endif
+
+
 static nxt_conn_io_t  nxt_openssl_conn_io = {
     .read = nxt_conn_io_read,
     .recvbuf = nxt_openssl_conn_io_recvbuf,
@@ -138,55 +190,13 @@ nxt_openssl_library_init(nxt_task_t *task)
         return NXT_OK;
     }
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100003L
-
     OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, NULL);
-
-#else
-    {
-        nxt_int_t  ret;
-
-        SSL_load_error_strings();
-
-        OPENSSL_config(NULL);
-
-        /*
-         * SSL_library_init(3):
-         *
-         *   SSL_library_init() always returns "1",
-         *   so it is safe to discard the return value.
-         */
-        (void) SSL_library_init();
-
-        ret = nxt_openssl_locks_init();
-        if (nxt_slow_path(ret != NXT_OK)) {
-            return ret;
-        }
-    }
-
-#endif
 
     nxt_openssl_version = OpenSSL_version_num();
 
     nxt_log(task, NXT_LOG_INFO, "%s, %xl",
             OpenSSL_version(OPENSSL_VERSION), nxt_openssl_version);
 
-#ifndef SSL_OP_NO_COMPRESSION
-    {
-        /*
-         * Disable gzip compression in OpenSSL prior to 1.0.0
-         * version, this saves about 522K per connection.
-         */
-        int                 n;
-        STACK_OF(SSL_COMP)  *ssl_comp_methods;
-
-        ssl_comp_methods = SSL_COMP_get_compression_methods();
-
-        for (n = sk_SSL_COMP_num(ssl_comp_methods); n != 0; n--) {
-            (void) sk_SSL_COMP_pop(ssl_comp_methods);
-        }
-    }
-#endif
 
     index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
 
@@ -202,92 +212,10 @@ nxt_openssl_library_init(nxt_task_t *task)
 }
 
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100003L
-
 static void
 nxt_openssl_library_free(nxt_task_t *task)
 {
 }
-
-#else
-
-static nxt_thread_mutex_t  *nxt_openssl_locks;
-
-static nxt_int_t
-nxt_openssl_locks_init(void)
-{
-    int        i, n;
-    nxt_int_t  ret;
-
-    n = CRYPTO_num_locks();
-
-    nxt_openssl_locks = OPENSSL_malloc(n * sizeof(nxt_thread_mutex_t));
-    if (nxt_slow_path(nxt_openssl_locks == NULL)) {
-        return NXT_ERROR;
-    }
-
-    for (i = 0; i < n; i++) {
-        ret = nxt_thread_mutex_create(&nxt_openssl_locks[i]);
-        if (nxt_slow_path(ret != NXT_OK)) {
-            return ret;
-        }
-    }
-
-    CRYPTO_set_locking_callback(nxt_openssl_lock);
-
-    CRYPTO_set_id_callback(nxt_openssl_thread_id);
-
-    return NXT_OK;
-}
-
-
-static void
-nxt_openssl_lock(int mode, int type, const char *file, int line)
-{
-    nxt_thread_mutex_t  *lock;
-
-    lock = &nxt_openssl_locks[type];
-
-    if ((mode & CRYPTO_LOCK) != 0) {
-        (void) nxt_thread_mutex_lock(lock);
-
-    } else {
-        (void) nxt_thread_mutex_unlock(lock);
-    }
-}
-
-
-static u_long
-nxt_openssl_thread_id(void)
-{
-    return (u_long) nxt_thread_handle();
-}
-
-
-static void
-nxt_openssl_library_free(nxt_task_t *task)
-{
-    nxt_openssl_locks_free();
-}
-
-
-static void
-nxt_openssl_locks_free(void)
-{
-    int  i, n;
-
-    n = CRYPTO_num_locks();
-
-    CRYPTO_set_locking_callback(NULL);
-
-    for (i = 0; i < n; i++) {
-        nxt_thread_mutex_destroy(&nxt_openssl_locks[i]);
-    }
-
-    OPENSSL_free(nxt_openssl_locks);
-}
-
-#endif
 
 
 static nxt_int_t
@@ -300,16 +228,32 @@ nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
     STACK_OF(X509_NAME)    *list;
     nxt_tls_bundle_conf_t  *bundle;
 
-    ctx = SSL_CTX_new(SSLv23_server_method());
-    if (ctx == NULL) {
-        nxt_openssl_log_error(task, NXT_LOG_ALERT, "SSL_CTX_new() failed");
-        return NXT_ERROR;
-    }
-
     conf = tls_init->conf;
 
     bundle = conf->bundle;
     nxt_assert(bundle != NULL);
+
+    /* nxt_router_conf_error() frees the context of every bundle. */
+    bundle->ctx = NULL;
+
+    ctx = SSL_CTX_new(SSLv23_server_method());
+
+#if (NXT_TESTS)
+    if (nxt_openssl_test_fail == NXT_OPENSSL_TEST_FAIL_CTX_NEW) {
+        SSL_CTX_free(ctx);
+        ctx = NULL;
+    }
+#endif
+
+    if (ctx == NULL) {
+        nxt_openssl_log_error(task, NXT_LOG_ALERT, "SSL_CTX_new() failed");
+
+        /* nxt_openssl_chain_file() does not run, so close the file here. */
+        nxt_fd_close(bundle->chain_file);
+        bundle->chain_file = -1;
+
+        return NXT_ERROR;
+    }
 
     bundle->ctx = ctx;
 
@@ -437,6 +381,9 @@ fail:
 
     SSL_CTX_free(ctx);
 
+    /* nxt_router_conf_error() frees the contexts of the other bundles. */
+    bundle->ctx = NULL;
+
 #if (OPENSSL_VERSION_NUMBER >= 0x1010100fL \
      && OPENSSL_VERSION_NUMBER < 0x1010101fL)
     RAND_keep_random_devices_open(0);
@@ -460,14 +407,28 @@ nxt_openssl_chain_file(nxt_task_t *task, SSL_CTX *ctx, nxt_tls_conf_t *conf,
     ret = NXT_ERROR;
     cert = NULL;
 
+    bundle = conf->bundle;
+
     bio = BIO_new(BIO_s_fd());
+
+#if (NXT_TESTS)
+    if (nxt_openssl_test_fail == NXT_OPENSSL_TEST_FAIL_BIO_NEW) {
+        BIO_free(bio);
+        bio = NULL;
+    }
+#endif
+
     if (bio == NULL) {
+        /* No BIO owns the file yet, so close it here. */
+        nxt_fd_close(bundle->chain_file);
+        bundle->chain_file = -1;
+
         goto end;
     }
 
-    bundle = conf->bundle;
-
+    /* The BIO owns the file now: BIO_free() below closes it. */
     BIO_set_fd(bio, bundle->chain_file, BIO_CLOSE);
+    bundle->chain_file = -1;
 
     cert = PEM_read_bio_X509_AUX(bio, NULL, NULL, NULL);
     if (cert == NULL) {
@@ -660,7 +621,7 @@ nxt_tls_ticket_keys(nxt_task_t *task, SSL_CTX *ctx, nxt_tls_init_t *tls_init,
         goto no_ticket;
     }
 
-#ifdef SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB
+#ifdef NXT_OPENSSL_TICKET_KEY_CB
 
     tickets = nxt_mp_get(mp, sizeof(nxt_tls_tickets_t)
                              + count * sizeof(nxt_tls_ticket_t));
@@ -701,8 +662,13 @@ nxt_tls_ticket_keys(nxt_task_t *task, SSL_CTX *ctx, nxt_tls_init_t *tls_init,
 
     } while (i < count);
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    if (SSL_CTX_set_tlsext_ticket_key_evp_cb(ctx, nxt_tls_ticket_key_callback)
+        == 0)
+#else
     if (SSL_CTX_set_tlsext_ticket_key_cb(ctx, nxt_tls_ticket_key_callback)
         == 0)
+#endif
     {
         nxt_openssl_log_error(task, NXT_LOG_ALERT,
                       "Unit was built with Session Tickets support, however, "
@@ -731,11 +697,11 @@ no_ticket:
 }
 
 
-#ifdef SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB
+#ifdef NXT_OPENSSL_TICKET_KEY_CB
 
 static int
 nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
-    EVP_CIPHER_CTX *ectx, HMAC_CTX *hctx, int enc)
+    EVP_CIPHER_CTX *ectx, nxt_tls_ticket_mac_t *hctx, int enc)
 {
     nxt_uint_t          i;
     nxt_conn_t          *c;
@@ -743,6 +709,9 @@ nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
     const EVP_CIPHER    *cipher;
     nxt_tls_ticket_t    *ticket;
     nxt_openssl_conn_t  *tls;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    OSSL_PARAM          params[2];
+#endif
 
     c = SSL_get_ex_data(s, nxt_openssl_connection_index);
 
@@ -815,6 +784,28 @@ nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
     digest = EVP_sha256();
 #endif
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+
+    /*
+     * The EVP_MAC_CTX handed to this callback is an already created HMAC
+     * context; it only needs the digest and the key.  EVP_MAC_init() takes
+     * both, so the key material, its length and the digest are exactly the
+     * ones HMAC_Init_ex() used to be given, and the tag length still follows
+     * from the digest.
+     */
+
+    params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST,
+                                       (char *) EVP_MD_get0_name(digest), 0);
+    params[1] = OSSL_PARAM_construct_end();
+
+    if (EVP_MAC_init(hctx, ticket[i].hmac_key, ticket[i].size, params) != 1) {
+        nxt_openssl_log_error(c->socket.task, NXT_LOG_ALERT,
+                              "EVP_MAC_init() failed");
+        return -1;
+    }
+
+#else
+
     if (HMAC_Init_ex(hctx, ticket[i].hmac_key, ticket[i].size, digest, NULL)
         != 1)
     {
@@ -823,10 +814,12 @@ nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
         return -1;
     }
 
+#endif
+
     return enc;
 }
 
-#endif /* SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB */
+#endif /* NXT_OPENSSL_TICKET_KEY_CB */
 
 #endif /* NXT_HAVE_OPENSSL_TLSEXT */
 
@@ -851,9 +844,8 @@ static nxt_uint_t
 nxt_openssl_cert_get_names(nxt_task_t *task, X509 *cert, nxt_tls_conf_t *conf,
     nxt_mp_t *mp)
 {
-    int                         len;
     nxt_str_t                   domain, str;
-    X509_NAME                   *x509_name;
+    NXT_X509_CONST              X509_NAME     *x509_name;
     nxt_uint_t                  i, n;
     GENERAL_NAME                *name;
     nxt_tls_bundle_conf_t       *bundle;
@@ -875,11 +867,7 @@ nxt_openssl_cert_get_names(nxt_task_t *task, X509 *cert, nxt_tls_conf_t *conf,
             }
 
             str.length = ASN1_STRING_length(name->d.dNSName);
-#if OPENSSL_VERSION_NUMBER > 0x10100000L
             str.start = (u_char *) ASN1_STRING_get0_data(name->d.dNSName);
-#else
-            str.start = ASN1_STRING_data(name->d.dNSName);
-#endif
 
             domain.start = nxt_mp_nget(mp, str.length);
             if (nxt_slow_path(domain.start == NULL)) {
@@ -909,23 +897,22 @@ nxt_openssl_cert_get_names(nxt_task_t *task, X509 *cert, nxt_tls_conf_t *conf,
 
     } else {
         x509_name = X509_get_subject_name(cert);
-        len = X509_NAME_get_text_by_NID(x509_name, NID_commonName,
-                                        NULL, 0);
-        if (len <= 0) {
+
+        if (nxt_openssl_name_text(x509_name, NID_commonName, &str) != NXT_OK
+            || str.length == 0)
+        {
             nxt_log(task, NXT_LOG_WARN, "certificate \"%V\" has neither "
                     "Subject Alternative Name nor Common Name", &bundle->name);
             return NXT_OK;
         }
 
-        domain.start = nxt_mp_nget(mp, len + 1);
+        domain.start = nxt_mp_nget(mp, str.length);
         if (nxt_slow_path(domain.start == NULL)) {
             return NXT_ERROR;
         }
 
-        domain.length = X509_NAME_get_text_by_NID(x509_name, NID_commonName,
-                                                  (char *) domain.start,
-                                                  len + 1);
-        nxt_memcpy_lowcase(domain.start, domain.start, domain.length);
+        domain.length = str.length;
+        nxt_memcpy_lowcase(domain.start, str.start, str.length);
 
         item = nxt_mp_get(mp, sizeof(nxt_tls_bundle_hash_item_t));
         if (nxt_slow_path(item == NULL)) {
@@ -950,6 +937,53 @@ fail:
     sk_GENERAL_NAME_pop_free(alt_names, GENERAL_NAME_free);
 
     return NXT_ERROR;
+}
+
+
+/*
+ * Return the raw contents of the first entry of x509_name that carries nid,
+ * or NXT_DECLINED if there is none.
+ *
+ * This replaces X509_NAME_get_text_by_NID(), deprecated in OpenSSL 4.0.  The
+ * only property of that function the callers ever used was "the bytes of the
+ * first matching entry, verbatim", which is what the entry accessors give
+ * directly and without the copy: the returned string points into the
+ * certificate and stays valid for as long as it does.
+ *
+ * The bytes are not NUL terminated and, exactly as before, may contain
+ * embedded NULs -- the callers must keep handling them with an explicit
+ * length and never as a C string.
+ */
+
+static nxt_int_t
+nxt_openssl_name_text(NXT_X509_CONST X509_NAME *x509_name, int nid,
+    nxt_str_t *str)
+{
+    int             i, len;
+    NXT_X509_CONST  ASN1_STRING      *data;
+    NXT_X509_CONST  X509_NAME_ENTRY  *entry;
+
+    i = X509_NAME_get_index_by_NID(x509_name, nid, -1);
+    if (i < 0) {
+        return NXT_DECLINED;
+    }
+
+    entry = X509_NAME_get_entry(x509_name, i);
+    if (nxt_slow_path(entry == NULL)) {
+        return NXT_DECLINED;
+    }
+
+    data = X509_NAME_ENTRY_get_data(entry);
+
+    len = ASN1_STRING_length(data);
+    if (nxt_slow_path(len < 0)) {
+        return NXT_DECLINED;
+    }
+
+    str->length = len;
+    str->start = (u_char *) ASN1_STRING_get0_data(data);
+
+    return NXT_OK;
 }
 
 
@@ -1675,9 +1709,57 @@ nxt_openssl_conn_error(nxt_task_t *task, nxt_err_t err, const char *fmt, ...)
 }
 
 
+/*
+ * OpenSSL 4.0 renamed the SSLv3-era alert reason codes to SSL_R_TLS_ALERT_*
+ * and removed the old spellings, so a build against it with deprecated APIs
+ * disabled cannot see SSL_R_SSLV3_ALERT_*.  1.1.1 and 3.x have only the old
+ * names.  Define the new spelling in terms of the old one where it is
+ * missing, so the switch below needs one spelling rather than a version
+ * conditional per label.
+ *
+ * The SSL_R_TLSV1_ALERT_* codes are deliberately not bridged: 4.0 kept those
+ * names, and no SSL_R_TLS_ALERT_ spelling exists for them.
+ */
+
+#ifndef SSL_R_TLS_ALERT_UNEXPECTED_MESSAGE
+#define SSL_R_TLS_ALERT_UNEXPECTED_MESSAGE  SSL_R_SSLV3_ALERT_UNEXPECTED_MESSAGE
+#endif
+#ifndef SSL_R_TLS_ALERT_BAD_RECORD_MAC
+#define SSL_R_TLS_ALERT_BAD_RECORD_MAC  SSL_R_SSLV3_ALERT_BAD_RECORD_MAC
+#endif
+#ifndef SSL_R_TLS_ALERT_DECOMPRESSION_FAILURE
+#define SSL_R_TLS_ALERT_DECOMPRESSION_FAILURE  SSL_R_SSLV3_ALERT_DECOMPRESSION_FAILURE
+#endif
+#ifndef SSL_R_TLS_ALERT_HANDSHAKE_FAILURE
+#define SSL_R_TLS_ALERT_HANDSHAKE_FAILURE  SSL_R_SSLV3_ALERT_HANDSHAKE_FAILURE
+#endif
+#ifndef SSL_R_TLS_ALERT_ILLEGAL_PARAMETER
+#define SSL_R_TLS_ALERT_ILLEGAL_PARAMETER  SSL_R_SSLV3_ALERT_ILLEGAL_PARAMETER
+#endif
+#ifndef SSL_R_TLS_ALERT_NO_CERTIFICATE
+#define SSL_R_TLS_ALERT_NO_CERTIFICATE  SSL_R_SSLV3_ALERT_NO_CERTIFICATE
+#endif
+#ifndef SSL_R_TLS_ALERT_BAD_CERTIFICATE
+#define SSL_R_TLS_ALERT_BAD_CERTIFICATE  SSL_R_SSLV3_ALERT_BAD_CERTIFICATE
+#endif
+#ifndef SSL_R_TLS_ALERT_UNSUPPORTED_CERTIFICATE
+#define SSL_R_TLS_ALERT_UNSUPPORTED_CERTIFICATE  SSL_R_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE
+#endif
+#ifndef SSL_R_TLS_ALERT_CERTIFICATE_REVOKED
+#define SSL_R_TLS_ALERT_CERTIFICATE_REVOKED  SSL_R_SSLV3_ALERT_CERTIFICATE_REVOKED
+#endif
+#ifndef SSL_R_TLS_ALERT_CERTIFICATE_EXPIRED
+#define SSL_R_TLS_ALERT_CERTIFICATE_EXPIRED  SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED
+#endif
+#ifndef SSL_R_TLS_ALERT_CERTIFICATE_UNKNOWN
+#define SSL_R_TLS_ALERT_CERTIFICATE_UNKNOWN  SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN
+#endif
+
+
 static nxt_uint_t
 nxt_openssl_log_error_level(nxt_err_t err)
 {
+    int            reason;
     unsigned long  lib_err;
 
     lib_err = ERR_peek_error();
@@ -1688,38 +1770,185 @@ nxt_openssl_log_error_level(nxt_err_t err)
      * carry a reason that is a plain errno, not an SSL_R_* code.  Classify them
      * by errno so a peer disconnect is logged at info, not alert; otherwise the
      * errno value falls through the SSL_R_* switch to the NXT_LOG_ALERT default.
+     *
+     * This check reads the first error on purpose.  SSL_get_error() returns
+     * SSL_ERROR_SYSCALL when the first error is in ERR_LIB_SYS.  nginx
+     * classifies SSL_ERROR_SYSCALL by errno and SSL_ERROR_SSL by the last
+     * error.  This check and the one below follow the same two rules.
      */
     if (ERR_GET_LIB(lib_err) == ERR_LIB_SYS) {
         return nxt_socket_error_level(ERR_GET_REASON(lib_err));
     }
 
-    switch (ERR_GET_REASON(lib_err)) {
+    /*
+     * Classify by the last error, as ngx_ssl_connection_error() does.  A bad
+     * key share queues the EC or provider error first and the SSL reason
+     * after it.  The reason codes below are SSL_R_* values, and other
+     * libraries reuse the same numbers (RAND_R_ERROR_RETRIEVING_ENTROPY is
+     * 110, as is SSL_R_BAD_EXTENSION), so a queue that ends in another
+     * library's error must not match them.
+     */
+    lib_err = ERR_peek_last_error();
+
+    if (lib_err != 0 && ERR_GET_LIB(lib_err) != ERR_LIB_SSL) {
+        return NXT_LOG_ALERT;
+    }
+
+    reason = ERR_GET_REASON(lib_err);
+
+    switch (reason) {
 
     case 0:
         return nxt_socket_error_level(err);
 
+    /*
+     * Handshake and record failures caused by what the peer sent.  The list
+     * follows ngx_ssl_connection_error() in nginx; the TLS 1.3 era reasons
+     * (key share, signature algorithm, version too low, unsupported protocol)
+     * are what internet scanners trigger most.  A TLS 1.3 resumption with a
+     * binder that does not verify (253) is not in nginx's list; the binder
+     * comes from the client, so it is listed here too.  The same holds for
+     * a TLS 1.3 key share without the supported groups extension (209):
+     * RFC 8446 requires the extension, and only the client can omit it.
+     *
+     * Three reasons are left out on purpose, so they reach the default
+     * branch below and log at alert.  In Unit, all three point at the
+     * server, not at the peer.  When the SNI callback,
+     * nxt_openssl_servername(), fails, OpenSSL raises SSL_R_CALLBACK_FAILED
+     * (234) and LibreSSL raises SSL_R_CLIENTHELLO_TLSEXT (226) in TLS 1.2.
+     * OpenSSL raises 226 only when the OCSP status or SRP callback fails,
+     * and Unit sets neither.  SSL_R_CERT_CB_ERROR (377) comes from a
+     * certificate callback, which Unit does not set today.
+     *
+     * LibreSSL has no SSL_R_CALLBACK_FAILED.  It uses 234 for
+     * SSL_R_TLS_RSA_ENCRYPTED_VALUE_LENGTH_IS_WRONG, which it raises only
+     * when the RSA key exchange from the peer has the wrong length.  No
+     * library defines both names, so the #ifdef on the LibreSSL name keeps
+     * OpenSSL's 234 out of the list.
+     */
+#ifdef SSL_R_NO_SUITABLE_KEY_SHARE
+    case SSL_R_NO_SUITABLE_KEY_SHARE:                     /*  101 */
+#endif
     case SSL_R_BAD_CHANGE_CIPHER_SPEC:                    /*  103 */
+#ifdef SSL_R_BAD_KEY_SHARE
+    case SSL_R_BAD_KEY_SHARE:                             /*  108 */
+#endif
+#ifdef SSL_R_BAD_EXTENSION
+    case SSL_R_BAD_EXTENSION:                             /*  110 */
+#endif
+#ifdef SSL_R_BAD_DIGEST_LENGTH
+    case SSL_R_BAD_DIGEST_LENGTH:                         /*  111 */
+#endif
+#ifdef SSL_R_MISSING_SIGALGS_EXTENSION
+    case SSL_R_MISSING_SIGALGS_EXTENSION:                 /*  112 */
+#endif
+#ifdef SSL_R_BAD_PACKET_LENGTH
+    case SSL_R_BAD_PACKET_LENGTH:                         /*  115 */
+#endif
+#ifdef SSL_R_NO_SUITABLE_SIGNATURE_ALGORITHM
+    case SSL_R_NO_SUITABLE_SIGNATURE_ALGORITHM:           /*  118 */
+#endif
+#ifdef SSL_R_BAD_KEY_UPDATE
+    case SSL_R_BAD_KEY_UPDATE:                            /*  122 */
+#endif
     case SSL_R_BLOCK_CIPHER_PAD_IS_WRONG:                 /*  129 */
+#ifdef SSL_R_CCS_RECEIVED_EARLY
+    case SSL_R_CCS_RECEIVED_EARLY:                        /*  133 */
+#endif
+#ifdef SSL_R_DATA_BETWEEN_CCS_AND_FINISHED
+    case SSL_R_DATA_BETWEEN_CCS_AND_FINISHED:             /*  145 */
+#endif
+#ifdef SSL_R_DATA_LENGTH_TOO_LONG
+    case SSL_R_DATA_LENGTH_TOO_LONG:                      /*  146 */
+#endif
     case SSL_R_DIGEST_CHECK_FAILED:                       /*  149 */
+#ifdef SSL_R_ENCRYPTED_LENGTH_TOO_LONG
+    case SSL_R_ENCRYPTED_LENGTH_TOO_LONG:                 /*  150 */
+#endif
     case SSL_R_ERROR_IN_RECEIVED_CIPHER_LIST:             /*  151 */
     case SSL_R_EXCESSIVE_MESSAGE_SIZE:                    /*  152 */
+#ifdef SSL_R_GOT_A_FIN_BEFORE_A_CCS
+    case SSL_R_GOT_A_FIN_BEFORE_A_CCS:                    /*  154 */
+#endif
+#ifdef SSL_R_HTTPS_PROXY_REQUEST
+    case SSL_R_HTTPS_PROXY_REQUEST:                       /*  155 */
+#endif
+#ifdef SSL_R_HTTP_REQUEST
+    case SSL_R_HTTP_REQUEST:                              /*  156 */
+#endif
     case SSL_R_LENGTH_MISMATCH:                           /*  159 */
+#ifdef SSL_R_LENGTH_TOO_SHORT
+    case SSL_R_LENGTH_TOO_SHORT:                          /*  160 */
+#endif
 #ifdef SSL_R_NO_CIPHERS_PASSED
     case SSL_R_NO_CIPHERS_PASSED:                         /*  182 */
 #endif
     case SSL_R_NO_CIPHERS_SPECIFIED:                      /*  183 */
+#ifdef SSL_R_BAD_CIPHER
+    case SSL_R_BAD_CIPHER:                                /*  186 */
+#endif
     case SSL_R_NO_COMPRESSION_SPECIFIED:                  /*  187 */
     case SSL_R_NO_SHARED_CIPHER:                          /*  193 */
+#ifdef SSL_R_PACKET_LENGTH_TOO_LONG
+    case SSL_R_PACKET_LENGTH_TOO_LONG:                    /*  198 */
+#endif
+#ifdef SSL_R_INVALID_ALERT
+    case SSL_R_INVALID_ALERT:                             /*  205 */
+#endif
+#ifdef SSL_R_MISSING_SUPPORTED_GROUPS_EXTENSION
+    case SSL_R_MISSING_SUPPORTED_GROUPS_EXTENSION:        /*  209 */
+#endif
     case SSL_R_RECORD_LENGTH_MISMATCH:                    /*  213 */
 #ifdef SSL_R_PARSE_TLSEXT
     case SSL_R_PARSE_TLSEXT:                              /*  227 */
+#endif
+#ifdef SSL_R_TLS_RSA_ENCRYPTED_VALUE_LENGTH_IS_WRONG
+    case SSL_R_TLS_RSA_ENCRYPTED_VALUE_LENGTH_IS_WRONG:   /*  234 */
+#endif
+#ifdef SSL_R_NO_APPLICATION_PROTOCOL
+    case SSL_R_NO_APPLICATION_PROTOCOL:                   /*  235 */
 #endif
     case SSL_R_UNEXPECTED_MESSAGE:                        /*  244 */
     case SSL_R_UNEXPECTED_RECORD:                         /*  245 */
     case SSL_R_UNKNOWN_ALERT_TYPE:                        /*  246 */
     case SSL_R_UNKNOWN_PROTOCOL:                          /*  252 */
+#ifdef SSL_R_BINDER_DOES_NOT_VERIFY
+    case SSL_R_BINDER_DOES_NOT_VERIFY:                    /*  253 */
+#endif
+#ifdef SSL_R_UNSUPPORTED_PROTOCOL
+    case SSL_R_UNSUPPORTED_PROTOCOL:                      /*  258 */
+#endif
     case SSL_R_WRONG_VERSION_NUMBER:                      /*  267 */
+#ifdef SSL_R_BAD_LENGTH
+    case SSL_R_BAD_LENGTH:                                /*  271 */
+#endif
     case SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC:       /*  281 */
+#ifdef SSL_R_APPLICATION_DATA_AFTER_CLOSE_NOTIFY
+    case SSL_R_APPLICATION_DATA_AFTER_CLOSE_NOTIFY:       /*  291 */
+#endif
+#ifdef SSL_R_BAD_LEGACY_VERSION
+    case SSL_R_BAD_LEGACY_VERSION:                        /*  292 */
+#endif
+#ifdef SSL_R_MIXED_HANDSHAKE_AND_NON_HANDSHAKE_DATA
+    case SSL_R_MIXED_HANDSHAKE_AND_NON_HANDSHAKE_DATA:    /*  293 */
+#endif
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+    case SSL_R_UNEXPECTED_EOF_WHILE_READING:              /*  294 */
+#endif
+#ifdef SSL_R_RECORD_TOO_SMALL
+    case SSL_R_RECORD_TOO_SMALL:                          /*  298 */
+#endif
+#ifdef SSL_R_SSL3_SESSION_ID_TOO_LONG
+    case SSL_R_SSL3_SESSION_ID_TOO_LONG:                  /*  300 */
+#elif defined SSL_R_TLS_SESSION_ID_TOO_LONG
+    case SSL_R_TLS_SESSION_ID_TOO_LONG:                   /*  300 */
+#endif
+#ifdef SSL_R_BAD_ECPOINT
+    case SSL_R_BAD_ECPOINT:                               /*  306 */
+#endif
+#ifdef SSL_R_RECORD_LAYER_FAILURE
+    case SSL_R_RECORD_LAYER_FAILURE:                      /*  313 */
+#endif
 #ifdef SSL_R_RENEGOTIATE_EXT_TOO_LONG
     case SSL_R_RENEGOTIATE_EXT_TOO_LONG:                  /*  335 */
     case SSL_R_RENEGOTIATION_ENCODING_ERR:                /*  336 */
@@ -1728,25 +1957,43 @@ nxt_openssl_log_error_level(nxt_err_t err)
 #ifdef SSL_R_UNSAFE_LEGACY_RENEGOTIATION_DISABLED
     case SSL_R_UNSAFE_LEGACY_RENEGOTIATION_DISABLED:      /*  338 */
 #endif
+#ifdef SSL_R_NO_RENEGOTIATION
+    case SSL_R_NO_RENEGOTIATION:                          /*  339 */
+#endif
 #ifdef SSL_R_SCSV_RECEIVED_WHEN_RENEGOTIATING
     case SSL_R_SCSV_RECEIVED_WHEN_RENEGOTIATING:          /*  345 */
 #endif
+#ifdef SSL_R_INAPPROPRIATE_FALLBACK
+    case SSL_R_INAPPROPRIATE_FALLBACK:                    /*  373 */
+#endif
+#ifdef SSL_R_NO_SHARED_SIGNATURE_ALGORITHMS
+    case SSL_R_NO_SHARED_SIGNATURE_ALGORITHMS:            /*  376 */
+#endif
+#ifdef SSL_R_VERSION_TOO_LOW
+    case SSL_R_VERSION_TOO_LOW:                           /*  396 */
+#endif
+#ifdef SSL_R_TOO_MANY_WARN_ALERTS
+    case SSL_R_TOO_MANY_WARN_ALERTS:                      /*  409 */
+#endif
+#ifdef SSL_R_BAD_RECORD_TYPE
+    case SSL_R_BAD_RECORD_TYPE:                           /*  443 */
+#endif
     case 1000:/* SSL_R_SSLV3_ALERT_CLOSE_NOTIFY */
-    case SSL_R_SSLV3_ALERT_UNEXPECTED_MESSAGE:            /* 1010 */
-    case SSL_R_SSLV3_ALERT_BAD_RECORD_MAC:                /* 1020 */
+    case SSL_R_TLS_ALERT_UNEXPECTED_MESSAGE:            /* 1010 */
+    case SSL_R_TLS_ALERT_BAD_RECORD_MAC:                /* 1020 */
     case SSL_R_TLSV1_ALERT_DECRYPTION_FAILED:             /* 1021 */
     case SSL_R_TLSV1_ALERT_RECORD_OVERFLOW:               /* 1022 */
-    case SSL_R_SSLV3_ALERT_DECOMPRESSION_FAILURE:         /* 1030 */
-    case SSL_R_SSLV3_ALERT_HANDSHAKE_FAILURE:             /* 1040 */
-    case SSL_R_SSLV3_ALERT_ILLEGAL_PARAMETER:             /* 1047 */
+    case SSL_R_TLS_ALERT_DECOMPRESSION_FAILURE:         /* 1030 */
+    case SSL_R_TLS_ALERT_HANDSHAKE_FAILURE:             /* 1040 */
+    case SSL_R_TLS_ALERT_ILLEGAL_PARAMETER:             /* 1047 */
         break;
 
-    case SSL_R_SSLV3_ALERT_NO_CERTIFICATE:                /* 1041 */
-    case SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:               /* 1042 */
-    case SSL_R_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE:       /* 1043 */
-    case SSL_R_SSLV3_ALERT_CERTIFICATE_REVOKED:           /* 1044 */
-    case SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED:           /* 1045 */
-    case SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:           /* 1046 */
+    case SSL_R_TLS_ALERT_NO_CERTIFICATE:                /* 1041 */
+    case SSL_R_TLS_ALERT_BAD_CERTIFICATE:               /* 1042 */
+    case SSL_R_TLS_ALERT_UNSUPPORTED_CERTIFICATE:       /* 1043 */
+    case SSL_R_TLS_ALERT_CERTIFICATE_REVOKED:           /* 1044 */
+    case SSL_R_TLS_ALERT_CERTIFICATE_EXPIRED:           /* 1045 */
+    case SSL_R_TLS_ALERT_CERTIFICATE_UNKNOWN:           /* 1046 */
     case SSL_R_TLSV1_ALERT_UNKNOWN_CA:                    /* 1048 */
     case SSL_R_TLSV1_ALERT_ACCESS_DENIED:                 /* 1049 */
     case SSL_R_TLSV1_ALERT_DECODE_ERROR:                  /* 1050 */
@@ -1757,14 +2004,67 @@ nxt_openssl_log_error_level(nxt_err_t err)
     case SSL_R_TLSV1_ALERT_INTERNAL_ERROR:                /* 1080 */
     case SSL_R_TLSV1_ALERT_USER_CANCELLED:                /* 1090 */
     case SSL_R_TLSV1_ALERT_NO_RENEGOTIATION:              /* 1100 */
+#ifdef SSL_R_TLSV1_CERTIFICATE_UNOBTAINABLE
+    case SSL_R_TLSV1_CERTIFICATE_UNOBTAINABLE:            /* 1111 */
+#endif
+#ifdef SSL_R_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE
+    case SSL_R_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE:     /* 1113 */
+#endif
+#ifdef SSL_R_TLSV1_BAD_CERTIFICATE_HASH_VALUE
+    case SSL_R_TLSV1_BAD_CERTIFICATE_HASH_VALUE:          /* 1114 */
+#endif
         return NXT_LOG_ERR;
 
     default:
+        /*
+         * Any other alert the peer sent (1000..1255, e.g. unrecognized name,
+         * certificate required) is the peer's decision, not a server fault.
+         * The certificate alerts above point at the server's certificate or
+         * OCSP response, so they stay at err.
+         */
+        if (reason >= SSL_AD_REASON_OFFSET
+            && reason <= SSL_AD_REASON_OFFSET + 255)
+        {
+            return NXT_LOG_INFO;
+        }
+
         return NXT_LOG_ALERT;
     }
 
     return NXT_LOG_INFO;
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * Returns the level that nxt_openssl_log_error_level() gives to an SSL error
+ * with this reason, for src/test/nxt_openssl_log_level_test.c.  A peer can
+ * send only alert codes 0 to 255, so a reason outside the alert range cannot
+ * come over the wire.
+ */
+
+nxt_uint_t
+nxt_openssl_test_log_level(int reason)
+{
+    nxt_uint_t  level;
+
+    ERR_clear_error();
+
+#ifdef ERR_raise
+    ERR_raise(ERR_LIB_SSL, reason);
+#else
+    ERR_put_error(ERR_LIB_SSL, 0, reason, __FILE__, __LINE__);
+#endif
+
+    level = nxt_openssl_log_error_level(0);
+
+    ERR_clear_error();
+
+    return level;
+}
+
+#endif
 
 
 void nxt_cdecl

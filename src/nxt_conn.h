@@ -146,12 +146,11 @@ struct nxt_conn_s {
 
     nxt_conn_io_t                 *io;
 
-    union {
 #if (NXT_TLS)
+    union {
         void                      *tls;
-#endif
-        nxt_thread_pool_t         *thread_pool;
     } u;
+#endif
 
     nxt_mp_t                      *mem_pool;
 
@@ -167,6 +166,9 @@ struct nxt_conn_s {
     uint8_t                       block_read;   /* 1 bit */
     uint8_t                       block_write;  /* 1 bit */
     uint8_t                       delayed;      /* 1 bit */
+
+    /* Makes a repeated nxt_conn_close() a no-op; never cleared. */
+    uint8_t                       closing;      /* 1 bit */
 
 #define NXT_CONN_TRACK_NONE       0
 #define NXT_CONN_TRACK_IDLE       1
@@ -193,6 +195,7 @@ struct nxt_conn_s {
     uint8_t                       tcp_nodelay;  /* 1 bit */
 
     nxt_queue_link_t              link;
+    nxt_conn_t                    *next;
 };
 
 
@@ -244,6 +247,7 @@ struct nxt_conn_s {
 
 NXT_EXPORT nxt_conn_t *nxt_conn_create(nxt_mp_t *mp, nxt_task_t *task);
 NXT_EXPORT void nxt_conn_free(nxt_task_t *task, nxt_conn_t *c);
+NXT_EXPORT void nxt_conn_recycle_pending(nxt_event_engine_t *engine);
 NXT_EXPORT void nxt_conn_close(nxt_event_engine_t *engine, nxt_conn_t *c);
 
 NXT_EXPORT void nxt_conn_timer(nxt_event_engine_t *engine, nxt_conn_t *c,
@@ -261,6 +265,12 @@ void nxt_conn_connect_error(nxt_task_t *task, void *obj, void *data);
 NXT_EXPORT nxt_listen_event_t *nxt_listen_event(nxt_task_t *task,
     nxt_listen_socket_t *ls);
 void nxt_conn_io_accept(nxt_task_t *task, void *obj, void *data);
+
+#if (NXT_TESTS)
+extern nxt_uint_t  nxt_conn_test_nonblocking_failures;
+extern nxt_uint_t  nxt_listen_event_test_alloc_failures;
+#endif
+
 NXT_EXPORT void nxt_conn_accept(nxt_task_t *task, nxt_listen_event_t *lev,
     nxt_conn_t *c);
 void nxt_conn_accept_error(nxt_task_t *task, nxt_listen_event_t *lev,
@@ -286,9 +296,6 @@ nxt_bool_t nxt_event_conn_write_delayed(nxt_event_engine_t *engine,
 ssize_t nxt_event_conn_io_writev(nxt_conn_t *c, nxt_iobuf_t *iob,
     nxt_uint_t niob);
 ssize_t nxt_event_conn_io_send(nxt_conn_t *c, void *buf, size_t size);
-
-NXT_EXPORT void nxt_event_conn_job_sendfile(nxt_task_t *task,
-    nxt_conn_t *c);
 
 
 #define nxt_conn_connect(engine, c)                                           \
@@ -340,13 +347,13 @@ NXT_EXPORT void nxt_event_conn_job_sendfile(nxt_task_t *task,
         if (c->idle != NXT_CONN_TRACK_IDLE) {                                 \
             if (c->idle == NXT_CONN_TRACK_ACTIVE) {                           \
                 nxt_queue_remove(&c->link);                                   \
-                e->active_conns_cnt--;                                        \
             }                                                                 \
                                                                               \
             nxt_queue_insert_head(&e->idle_connections, &c->link);           \
                                                                               \
             c->idle = NXT_CONN_TRACK_IDLE;                                    \
-            e->idle_conns_cnt++;                                              \
+            nxt_atomic_store(&e->idle_conns_cnt,                              \
+                             nxt_atomic_load(&e->idle_conns_cnt) + 1);        \
         }                                                                     \
     } while (0)
 
@@ -372,12 +379,12 @@ NXT_EXPORT void nxt_event_conn_job_sendfile(nxt_task_t *task,
                                                                               \
         if (c->idle == NXT_CONN_TRACK_IDLE) {                                 \
             nxt_queue_remove(&c->link);                                       \
-            e->idle_conns_cnt--;                                              \
+            nxt_atomic_store(&e->idle_conns_cnt,                              \
+                             nxt_atomic_load(&e->idle_conns_cnt) - 1);        \
                                                                               \
             nxt_queue_insert_head(&e->active_connections, &c->link);         \
                                                                               \
             c->idle = NXT_CONN_TRACK_ACTIVE;                                  \
-            e->active_conns_cnt++;                                            \
         }                                                                     \
     } while (0)
 
@@ -391,7 +398,7 @@ NXT_EXPORT void nxt_event_conn_job_sendfile(nxt_task_t *task,
  *   NXT_CONN_TRACK_NONE   - untracked (controller clients, proxy peers, or a
  *                           conn already untracked here): no-op (idempotent).
  *
- * Unlinks the conn, decrements the queue's counter, increments
+ * Unlinks the conn, decrements idle_conns_cnt if idle, increments
  * closed_conns_cnt, and sets c->idle = TRACK_NONE.  Being idempotent, a conn
  * untracked by nxt_runtime_close_idle_connections() before it scheduled the
  * async close is not unlinked or counted a second time in the close handler.
@@ -404,14 +411,13 @@ NXT_EXPORT void nxt_event_conn_job_sendfile(nxt_task_t *task,
             nxt_queue_remove(&c->link);                                       \
                                                                               \
             if (c->idle == NXT_CONN_TRACK_IDLE) {                             \
-                e->idle_conns_cnt--;                                          \
-                                                                              \
-            } else {                                                          \
-                e->active_conns_cnt--;                                        \
+                nxt_atomic_store(&e->idle_conns_cnt,                          \
+                                 nxt_atomic_load(&e->idle_conns_cnt) - 1);    \
             }                                                                 \
                                                                               \
             c->idle = NXT_CONN_TRACK_NONE;                                    \
-            e->closed_conns_cnt++;                                            \
+            nxt_atomic_store(&e->closed_conns_cnt,                            \
+                             nxt_atomic_load(&e->closed_conns_cnt) + 1);      \
         }                                                                     \
     } while (0)
 

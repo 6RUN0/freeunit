@@ -12,6 +12,7 @@
 #include <nxt_status.h>
 #include <nxt_cert.h>
 #include <nxt_script.h>
+#include <nxt_checked.h>
 
 
 typedef struct {
@@ -29,6 +30,36 @@ typedef struct {
 } nxt_controller_request_t;
 
 
+#if (NXT_TLS)
+typedef struct {
+    nxt_str_t                 name;
+    nxt_cert_info_t           *info;
+    nxt_cert_info_t           *old;
+    nxt_controller_request_t  *req;
+} nxt_controller_cert_store_t;
+
+
+typedef struct {
+    nxt_str_t                 name;
+    nxt_controller_request_t  *req;
+} nxt_controller_cert_delete_t;
+#endif
+
+
+#if (NXT_HAVE_NJS)
+typedef struct {
+    nxt_str_t                 name;
+    nxt_controller_request_t  *req;
+} nxt_controller_script_store_t;
+
+
+typedef struct {
+    nxt_str_t                 name;
+    nxt_controller_request_t  *req;
+} nxt_controller_script_delete_t;
+#endif
+
+
 typedef struct {
     nxt_uint_t        status;
     nxt_conf_value_t  *conf;
@@ -38,6 +69,8 @@ typedef struct {
     ssize_t           offset;
     nxt_uint_t        line;
     nxt_uint_t        column;
+    nxt_str_t         pointer;     /* RFC 6901 path to validation error. */
+    nxt_str_t         suggestion;  /* "Did you mean" member name. */
 } nxt_controller_response_t;
 
 
@@ -86,6 +119,7 @@ static void nxt_controller_process_request(nxt_task_t *task,
     nxt_controller_request_t *req);
 static void nxt_controller_process_config(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path);
+static nxt_bool_t nxt_controller_store_in_flight(void);
 static nxt_bool_t nxt_controller_check_postpone_request(nxt_task_t *task);
 static void nxt_controller_process_status(nxt_task_t *task,
     nxt_controller_request_t *req);
@@ -96,7 +130,13 @@ static void nxt_controller_status_response(nxt_task_t *task,
 #if (NXT_TLS)
 static void nxt_controller_process_cert(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path);
-static void nxt_controller_process_cert_save(nxt_task_t *task,
+static void nxt_controller_cert_store_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static void nxt_controller_cert_delete_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static void nxt_controller_cert_apply(nxt_task_t *task,
+    nxt_controller_cert_store_t *store);
+static void nxt_controller_cert_apply_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static nxt_bool_t nxt_controller_cert_in_use(nxt_str_t *name);
 static void nxt_controller_cert_cleanup(nxt_task_t *task, void *obj,
@@ -106,6 +146,8 @@ static void nxt_controller_cert_cleanup(nxt_task_t *task, void *obj,
 static void nxt_controller_process_script(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path);
 static void nxt_controller_process_script_save(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static void nxt_controller_process_script_delete(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static nxt_bool_t nxt_controller_script_in_use(nxt_str_t *name);
 static void nxt_controller_script_cleanup(nxt_task_t *task, void *obj,
@@ -117,8 +159,10 @@ static void nxt_controller_app_restart_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
 static void nxt_controller_conf_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg, void *data);
-static void nxt_controller_conf_store(nxt_task_t *task,
-    nxt_conf_value_t *conf);
+static void nxt_controller_process_conf_store(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data);
+static nxt_int_t nxt_controller_conf_store(nxt_task_t *task,
+    nxt_conf_value_t *conf, nxt_controller_request_t *req);
 static void nxt_controller_response(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_controller_response_t *resp);
 static u_char *nxt_controller_date(u_char *buf, nxt_realtime_t *now,
@@ -137,6 +181,18 @@ static nxt_uint_t              nxt_controller_router_ready;
 static nxt_controller_conf_t   nxt_controller_conf;
 static nxt_queue_t             nxt_controller_waiting_requests;
 static nxt_bool_t              nxt_controller_waiting_init_conf;
+/* The configuration is applied, and main still stores it. */
+static nxt_bool_t              nxt_controller_conf_storing;
+#if (NXT_TLS)
+static nxt_bool_t              nxt_controller_cert_storing;
+static nxt_bool_t              nxt_controller_cert_deleting;
+/* A stored bundle that waits for the first configuration of a router. */
+static nxt_controller_cert_store_t  *nxt_controller_cert_stored;
+#endif
+#if (NXT_HAVE_NJS)
+static nxt_bool_t              nxt_controller_script_storing;
+static nxt_bool_t              nxt_controller_script_deleting;
+#endif
 static nxt_conf_value_t        *nxt_controller_status;
 
 
@@ -203,7 +259,10 @@ nxt_controller_prefork(nxt_task_t *task, nxt_process_t *process, nxt_mp_t *mp)
         }
 
         if (ret == NXT_OK) {
-            num = nxt_int_parse(ver.start, ver.length);
+            /* unitd writes no line end, but an editor may add one. */
+            num = nxt_int_parse(ver.start,
+                                nxt_str_strip(ver.start,
+                                              ver.start + ver.length));
 
             if (nxt_slow_path(num < 0)) {
                 nxt_alert(task, "failed to restore previous configuration: "
@@ -377,6 +436,36 @@ nxt_controller_start(nxt_task_t *task, nxt_process_data_t *data)
     vldt.conf_pool = mp;
     vldt.ver = nxt_conf_ver;
 
+    /* nxt_conf_vldt_size() keeps a stored negative size, with a warning. */
+    vldt.restored = 1;
+
+    /*
+     * nxt_conf_vldt_app_shm() keeps a stored "shm" that is out of
+     * range.
+     */
+    vldt.restored = 1;
+
+    /*
+     * A state file written before this check existed can hold bytes the
+     * control API would now refuse.  Rejecting it here would drop the whole
+     * configuration on the next restart -- the daemon would come back serving
+     * nothing -- and repairing it would silently rewrite an operator's value,
+     * which is how a working non-UTF-8 "share" path becomes a broken one.  So
+     * it is loaded exactly as written and reported, once, with the pointer
+     * that names it.  The API refuses to store any more of them.
+     */
+
+    if (nxt_conf_validate_encoding(&vldt) == NXT_DECLINED) {
+        nxt_log(task, NXT_LOG_WARN, "the restored configuration holds a value "
+                "at \"%V\" that the control API would now reject: %V  It is "
+                "kept as written, and the configuration is running; correct it "
+                "to be able to update the configuration.",
+                &vldt.pointer, &vldt.error);
+
+        nxt_memzero(&vldt.error, sizeof(nxt_str_t));
+        nxt_memzero(&vldt.pointer, sizeof(nxt_str_t));
+    }
+
     ret = nxt_conf_validate(&vldt);
 
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -409,9 +498,20 @@ static void
 nxt_controller_process_new_port_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg)
 {
+    nxt_port_t  *port;
+
     nxt_port_new_port_handler(task, msg);
 
-    if (msg->u.new_port->type != NXT_PROCESS_ROUTER
+    port = msg->u.new_port;
+
+    /*
+     * The controller never maps a port queue, so the descriptor
+     * nxt_port_new_port_handler() leaves to its caller has no use here.
+     */
+    nxt_port_recv_msg_close_fds(msg);
+
+    if (port == NULL
+        || port->type != NXT_PROCESS_ROUTER
         || !nxt_controller_router_ready)
     {
         return;
@@ -495,6 +595,8 @@ nxt_controller_remove_pid_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 
     nxt_memcpy(&pid, msg->buf->mem.pos, sizeof(pid));
 
+    /* Unreferenced: the controller process runs a single engine. */
+
     process = nxt_runtime_process_find(rt, pid);
     if (process != NULL && nxt_process_type(process) == NXT_PROCESS_ROUTER) {
         nxt_controller_router_ready = 0;
@@ -537,7 +639,10 @@ static void
 nxt_controller_conf_init_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    nxt_runtime_t  *rt;
+    nxt_runtime_t                *rt;
+#if (NXT_TLS)
+    nxt_controller_cert_store_t  *store;
+#endif
 
     nxt_controller_waiting_init_conf = 0;
 
@@ -562,6 +667,18 @@ nxt_controller_conf_init_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         nxt_controller_listening = 1;
     }
+
+#if (NXT_TLS)
+    store = nxt_controller_cert_stored;
+
+    if (store != NULL) {
+        /* It runs the waiting requests when it ends. */
+        nxt_controller_cert_stored = NULL;
+
+        nxt_controller_cert_apply(task, store);
+        return;
+    }
+#endif
 
     nxt_controller_flush_requests(task);
 }
@@ -608,6 +725,9 @@ nxt_controller_conf_send(nxt_task_t *task, nxt_mp_t *mp, nxt_conf_value_t *conf,
     controller_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
 
     size = nxt_conf_json_length(conf, NULL);
+    if (nxt_slow_path(size == SIZE_MAX)) {
+        return NXT_ERROR;
+    }
 
     b = nxt_buf_mem_alloc(mp, sizeof(size_t), 0);
     if (nxt_slow_path(b == NULL)) {
@@ -696,6 +816,17 @@ nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt)
         const char *path = ls->sockaddr->u.sockaddr_un.sun_path;
 
         nxt_fs_mkdir_p_dirname((const u_char *) path, 0755);
+
+        /*
+         * Resolve --control-user / --control-group once.  The same ids
+         * are used to chown the socket and to check the peer credentials.
+         */
+        if (nxt_file_owner_ids(rt->control_user, rt->control_group,
+                               &rt->control_uid, &rt->control_gid)
+            != NXT_OK)
+        {
+            return NXT_ERROR;
+        }
     }
 #endif
 
@@ -709,6 +840,88 @@ nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt)
 }
 
 
+/*
+ * A peer may use the control API if it is root, runs as unitd's effective
+ * UID, or is one of the principals the control socket was delegated to with
+ * --control-user / --control-group.  The socket's file permissions are
+ * still enforced by the kernel on connect(), so this never grants more
+ * than those permissions already do.
+ */
+
+nxt_bool_t
+nxt_controller_peer_allowed(nxt_uid_t uid, nxt_gid_t gid,
+    const nxt_gid_t *groups, nxt_uint_t ngroups, nxt_uid_t euid,
+    nxt_uid_t ctl_uid, nxt_gid_t ctl_gid)
+{
+    nxt_uint_t  i;
+
+    if (uid == 0 || uid == euid) {
+        return 1;
+    }
+
+    if (ctl_uid != (nxt_uid_t) -1 && uid == ctl_uid) {
+        return 1;
+    }
+
+    if (ctl_gid != (nxt_gid_t) -1) {
+        if (gid == ctl_gid) {
+            return 1;
+        }
+
+        for (i = 0; i < ngroups; i++) {
+            if (groups[i] == ctl_gid) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+
+#if (NXT_HAVE_UNIX_DOMAIN && NXT_HAVE_UCRED && defined SO_PEERGROUPS)
+
+static nxt_gid_t *
+nxt_controller_peer_groups(nxt_socket_t fd, nxt_uint_t *ngroups)
+{
+    nxt_err_t   err;
+    nxt_uint_t  try;
+    nxt_gid_t   *groups;
+    socklen_t   len;
+
+    len = 64 * sizeof(nxt_gid_t);
+
+    for (try = 0; try < 2; try++) {
+        groups = nxt_malloc(len);
+        if (nxt_slow_path(groups == NULL)) {
+            return NULL;
+        }
+
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERGROUPS, groups, &len) == 0) {
+            *ngroups = len / sizeof(nxt_gid_t);
+            return groups;
+        }
+
+        err = nxt_errno;
+
+        nxt_free(groups);
+
+        /*
+         * On ERANGE the kernel stores the required size in len.  A kernel
+         * older than Linux 4.13 returns ENOPROTOOPT: then only the primary
+         * group is checked.
+         */
+        if (err != ERANGE) {
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+#endif
+
+
 static nxt_int_t
 nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
 {
@@ -717,8 +930,9 @@ nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
      * The control socket is the privilege boundary for the REST API:
      * filesystem perms on `control.unit.sock` are defense-in-depth, not the
      * boundary itself.  Require the peer's effective UID to match unitd's
-     * (or be root) so a local user with directory-write permission cannot
-     * mutate config by hand-crafting connections.
+     * (or be root, or the configured --control-user / --control-group) so
+     * a local user with directory-write permission cannot mutate config by
+     * hand-crafting connections.
      */
     if (c->remote == NULL
         || c->remote->u.sockaddr.sa_family != AF_UNIX)
@@ -728,8 +942,10 @@ nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
 
 #if (NXT_HAVE_UCRED)
     {
-        struct ucred  cred;
-        socklen_t     len = sizeof(cred);
+        nxt_bool_t     allowed;
+        struct ucred   cred;
+        socklen_t      len = sizeof(cred);
+        nxt_runtime_t  *rt = task->thread->runtime;
 
         if (getsockopt(c->socket.fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0
             || len < (socklen_t) sizeof(cred))
@@ -738,7 +954,29 @@ nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
             return NXT_ERROR;
         }
 
-        if (cred.uid != 0 && cred.uid != nxt_euid) {
+        allowed = nxt_controller_peer_allowed(cred.uid, cred.gid, NULL, 0,
+                                              nxt_euid, rt->control_uid,
+                                              rt->control_gid);
+
+#if (defined SO_PEERGROUPS)
+        if (!allowed && rt->control_gid != (nxt_gid_t) -1) {
+            nxt_gid_t   *groups;
+            nxt_uint_t  ngroups;
+
+            groups = nxt_controller_peer_groups(c->socket.fd, &ngroups);
+
+            if (groups != NULL) {
+                allowed = nxt_controller_peer_allowed(cred.uid, cred.gid,
+                                                      groups, ngroups,
+                                                      nxt_euid,
+                                                      rt->control_uid,
+                                                      rt->control_gid);
+                nxt_free(groups);
+            }
+        }
+#endif
+
+        if (!allowed) {
             nxt_alert(task, "controller: rejecting connection from uid %d "
                       "(unitd uid %d); set socket permissions accordingly",
                       (int) cred.uid, (int) nxt_euid);
@@ -750,15 +988,18 @@ nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
 #elif (defined(__FreeBSD__) || defined(__APPLE__) || defined(__OpenBSD__) \
        || defined(__NetBSD__) || defined(__DragonFly__))
     {
-        uid_t  euid;
-        gid_t  egid;
+        uid_t          euid;
+        gid_t          egid;
+        nxt_runtime_t  *rt = task->thread->runtime;
 
         if (getpeereid(c->socket.fd, &euid, &egid) != 0) {
             nxt_alert(task, "controller: getpeereid failed %E", nxt_errno);
             return NXT_ERROR;
         }
 
-        if (euid != 0 && euid != nxt_euid) {
+        if (!nxt_controller_peer_allowed(euid, egid, NULL, 0, nxt_euid,
+                                         rt->control_uid, rt->control_gid))
+        {
             nxt_alert(task, "controller: rejecting connection from uid %d "
                       "(unitd uid %d)", (int) euid, (int) nxt_euid);
             return NXT_ERROR;
@@ -1292,6 +1533,16 @@ nxt_controller_process_request(nxt_task_t *task, nxt_controller_request_t *req)
             goto invalid_method;
         }
 
+        /*
+         * The answer has the certificates and the modules.  Wait, as in
+         * their handlers.
+         */
+        if (nxt_controller_store_in_flight()) {
+            nxt_queue_insert_tail(&nxt_controller_waiting_requests,
+                                  &req->link);
+            return;
+        }
+
         if (nxt_controller_status == NULL) {
             nxt_controller_process_status(task, req);
             return;
@@ -1495,13 +1746,30 @@ nxt_controller_process_config(nxt_task_t *task, nxt_controller_request_t *req,
         vldt.conf_pool = mp;
         vldt.ver = NXT_VERNUM;
 
-        rc = nxt_conf_validate(&vldt);
+        /*
+         * Before nxt_conf_validate(), which quotes an offending member name
+         * into its own error text: a name that is not UTF-8 would otherwise
+         * reach the response body and make the error report unreadable for
+         * the very reason it is being reported.
+         *
+         * This runs on the tree that would be installed, so a configuration
+         * that already holds such a value has to have it corrected before any
+         * other part of it can be updated.  The pointer in the error names it.
+         */
+
+        rc = nxt_conf_validate_encoding(&vldt);
+
+        if (nxt_fast_path(rc == NXT_OK)) {
+            rc = nxt_conf_validate(&vldt);
+        }
 
         if (nxt_slow_path(rc != NXT_OK)) {
             nxt_mp_destroy(mp);
 
             if (rc == NXT_DECLINED) {
                 resp.detail = vldt.error;
+                resp.pointer = vldt.pointer;
+                resp.suggestion = vldt.suggestion;
                 goto invalid_conf;
             }
 
@@ -1578,13 +1846,30 @@ nxt_controller_process_config(nxt_task_t *task, nxt_controller_request_t *req,
         vldt.conf_pool = mp;
         vldt.ver = NXT_VERNUM;
 
-        rc = nxt_conf_validate(&vldt);
+        /*
+         * Before nxt_conf_validate(), which quotes an offending member name
+         * into its own error text: a name that is not UTF-8 would otherwise
+         * reach the response body and make the error report unreadable for
+         * the very reason it is being reported.
+         *
+         * This runs on the tree that would be installed, so a configuration
+         * that already holds such a value has to have it corrected before any
+         * other part of it can be updated.  The pointer in the error names it.
+         */
+
+        rc = nxt_conf_validate_encoding(&vldt);
+
+        if (nxt_fast_path(rc == NXT_OK)) {
+            rc = nxt_conf_validate(&vldt);
+        }
 
         if (nxt_slow_path(rc != NXT_OK)) {
             nxt_mp_destroy(mp);
 
             if (rc == NXT_DECLINED) {
                 resp.detail = vldt.error;
+                resp.pointer = vldt.pointer;
+                resp.suggestion = vldt.suggestion;
                 goto invalid_conf;
             }
 
@@ -1647,6 +1932,37 @@ alloc_fail:
 }
 
 
+/*
+ * Whether main is storing a file for a request that waits for the answer.
+ * The store runs in a child of main and can take as long as a few fsync(2)
+ * calls.  The request is not in the waiting queue meanwhile: a router that
+ * restarts flushes the queue (nxt_controller_conf_init_handler()), and a
+ * request in it would run a second time, and be freed while main still
+ * answers it.  So the other requests wait while this is true.
+ */
+static nxt_bool_t
+nxt_controller_store_in_flight(void)
+{
+    nxt_bool_t  storing;
+
+    storing = 0;
+
+    storing |= nxt_controller_conf_storing;
+
+#if (NXT_TLS)
+    storing |= nxt_controller_cert_storing;
+    storing |= nxt_controller_cert_deleting;
+#endif
+
+#if (NXT_HAVE_NJS)
+    storing |= nxt_controller_script_storing;
+    storing |= nxt_controller_script_deleting;
+#endif
+
+    return storing;
+}
+
+
 static nxt_bool_t
 nxt_controller_check_postpone_request(nxt_task_t *task)
 {
@@ -1654,6 +1970,7 @@ nxt_controller_check_postpone_request(nxt_task_t *task)
     nxt_runtime_t  *rt;
 
     if (!nxt_queue_is_empty(&nxt_controller_waiting_requests)
+        || nxt_controller_store_in_flight()
         || nxt_controller_waiting_init_conf
         || !nxt_controller_router_ready)
     {
@@ -1796,13 +2113,14 @@ static void
 nxt_controller_process_cert(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path)
 {
-    u_char                     *p;
-    nxt_str_t                  name;
-    nxt_int_t                  ret;
-    nxt_conn_t                 *c;
-    nxt_cert_t                 *cert;
-    nxt_conf_value_t           *value;
-    nxt_controller_response_t  resp;
+    u_char                       *p;
+    nxt_str_t                    name;
+    nxt_conn_t                   *c;
+    nxt_cert_t                   *cert;
+    nxt_conf_value_t             *value;
+    nxt_controller_response_t    resp;
+    nxt_controller_cert_store_t  *store;
+    nxt_controller_cert_delete_t *del;
 
     name.length = path->length - 1;
     name.start = path->start + 1;
@@ -1824,6 +2142,16 @@ nxt_controller_process_cert(nxt_task_t *task,
     c = req->conn;
 
     if (nxt_str_eq(&req->parser.method, "GET", 3)) {
+
+        /*
+         * While main stores or deletes a bundle, its metadata can roll
+         * back, or name a file that is already gone.  Wait.
+         */
+        if (nxt_controller_cert_storing || nxt_controller_cert_deleting) {
+            nxt_queue_insert_tail(&nxt_controller_waiting_requests,
+                                  &req->link);
+            return;
+        }
 
         if (name.length != 0) {
             value = nxt_cert_info_get(&name);
@@ -1852,14 +2180,30 @@ nxt_controller_process_cert(nxt_task_t *task,
         return;
     }
 
-    if (name.length == 0 || path != NULL) {
+    /*
+     * Names starting with "." are reserved for the store's own files.  A
+     * name over NAME_MAX cannot be stored, so it is refused here with 400,
+     * not by main with ENAMETOOLONG and 500.
+     */
+    if (name.length == 0 || path != NULL || name.start[0] == '.'
+        || name.length > NXT_CERT_NAME_MAX_LENGTH)
+    {
         goto invalid_name;
     }
 
+    /*
+     * A store or a delete waits for the current reconfiguration: the router
+     * reads the bundles while it applies a configuration.
+     */
+    if (nxt_controller_check_postpone_request(task)) {
+        nxt_queue_insert_tail(&nxt_controller_waiting_requests, &req->link);
+        return;
+    }
+
     if (nxt_str_eq(&req->parser.method, "PUT", 3)) {
-        value = nxt_cert_info_get(&name);
-        if (value != NULL) {
-            goto exists_cert;
+        /* Main refuses a larger bundle.  Send 413 here, not 500. */
+        if (nxt_buf_mem_used_size(&c->read->mem) > NXT_CERT_STORE_MAX_SIZE) {
+            goto too_large;
         }
 
         cert = nxt_cert_mem(task, &c->read->mem);
@@ -1867,16 +2211,56 @@ nxt_controller_process_cert(nxt_task_t *task,
             goto invalid_cert;
         }
 
-        ret = nxt_cert_info_save(&name, cert);
+        /*
+         * The same certificates as the stored bundle, and the router has
+         * them.  A store would write the same file, and a reconfiguration
+         * would build the same contexts.  A script that uploads on a timer
+         * causes no work here.
+         */
+        if (nxt_cert_info_equal(&name, cert)) {
+            nxt_cert_destroy(cert);
+            goto unchanged;
+        }
 
-        nxt_cert_destroy(cert);
-
-        if (nxt_slow_path(ret != NXT_OK)) {
+        store = nxt_mp_get(c->mem_pool, sizeof(nxt_controller_cert_store_t));
+        if (nxt_slow_path(store == NULL)) {
+            nxt_cert_destroy(cert);
             goto alloc_fail;
         }
 
-        nxt_cert_store_get(task, &name, c->mem_pool,
-                           nxt_controller_process_cert_save, req);
+        /*
+         * Publish the new metadata before main replaces the file.  All the
+         * allocations are here, so a failure changes nothing on disk, and
+         * the rollback after a failed store cannot fail.
+         */
+        store->info = nxt_cert_info_create(&name, cert);
+
+        nxt_cert_destroy(cert);
+
+        if (nxt_slow_path(store->info == NULL)) {
+            goto alloc_fail;
+        }
+
+        if (nxt_slow_path(nxt_cert_info_replace(store->info, &store->old)
+                          != NXT_OK))
+        {
+            nxt_cert_info_release(store->info);
+            goto alloc_fail;
+        }
+
+        nxt_controller_cert_storing = 1;
+
+        store->name = name;
+        store->req = req;
+
+        /*
+         * Any other change waits until main answers: see
+         * nxt_controller_store_in_flight().  The request itself is not in
+         * the waiting queue, so a flush of the queue cannot run it again.
+         */
+
+        nxt_cert_store_put(task, &name, &c->read->mem, c->mem_pool,
+                           nxt_controller_cert_store_handler, store);
         return;
     }
 
@@ -1886,22 +2270,53 @@ nxt_controller_process_cert(nxt_task_t *task,
             goto cert_in_use;
         }
 
-        if (nxt_cert_info_delete(&name) != NXT_OK) {
+        if (nxt_cert_info_get(&name) == NULL) {
             goto cert_not_found;
         }
 
-        nxt_cert_store_delete(task, &name, c->mem_pool);
+        del = nxt_mp_get(c->mem_pool, sizeof(nxt_controller_cert_delete_t));
+        if (nxt_slow_path(del == NULL)) {
+            goto alloc_fail;
+        }
 
-        resp.status = 200;
-        resp.title = (u_char *) "Certificate deleted.";
+        nxt_controller_cert_deleting = 1;
 
-        nxt_controller_response(task, req, &resp);
+        del->name = name;
+        del->req = req;
+
+        /*
+         * The bundle stays listed, and the answer waits, until the store
+         * child has removed the file: see
+         * nxt_controller_store_in_flight().
+         */
+
+        nxt_cert_store_delete(task, &name, c->mem_pool,
+                              nxt_controller_cert_delete_handler, del);
         return;
     }
 
     resp.status = 405;
     resp.title = (u_char *) "Invalid method.";
     resp.offset = -1;
+
+    nxt_controller_response(task, req, &resp);
+    return;
+
+unchanged:
+
+    /*
+     * The answer a store gives, so that a script keyed on either text
+     * keeps working.  The postpone check above has found a ready router,
+     * so a store of a bundle in use would have applied the configuration.
+     */
+    resp.status = 200;
+
+    if (nxt_controller_cert_in_use(&name)) {
+        resp.title = (u_char *) "Certificate chain updated.";
+
+    } else {
+        resp.title = (u_char *) "Certificate chain uploaded.";
+    }
 
     nxt_controller_response(task, req, &resp);
     return;
@@ -1924,10 +2339,10 @@ invalid_cert:
     nxt_controller_response(task, req, &resp);
     return;
 
-exists_cert:
+too_large:
 
-    resp.status = 400;
-    resp.title = (u_char *) "Certificate already exists.";
+    resp.status = 413;
+    resp.title = (u_char *) "Certificate bundle is too large.";
     resp.offset = -1;
 
     nxt_controller_response(task, req, &resp);
@@ -1971,41 +2386,181 @@ alloc_fail:
 }
 
 
+/*
+ * Main stored the bundle, or the store failed.  On failure, the old metadata
+ * goes back, so a failed store leaves no metadata without a file.
+ */
 static void
-nxt_controller_process_cert_save(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+nxt_controller_cert_store_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    nxt_conn_t                *c;
-    nxt_buf_mem_t             *mbuf;
-    nxt_controller_request_t  *req;
-    nxt_controller_response_t  resp;
+    nxt_controller_response_t    resp;
+    nxt_controller_cert_store_t  *store;
 
-    req = data;
+    store = data;
 
-    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+    nxt_controller_cert_storing = 0;
 
-    if (msg == NULL || msg->port_msg.type == _NXT_PORT_MSG_RPC_ERROR) {
+    if (msg == NULL || msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
+        nxt_cert_info_restore(store->info, store->old);
+
+        nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+
         resp.status = 500;
         resp.title = (u_char *) "Failed to store certificate.";
+        resp.offset = -1;
 
-        nxt_controller_response(task, req, &resp);
+        nxt_controller_response(task, store->req, &resp);
+
+        nxt_controller_flush_requests(task);
         return;
     }
 
-    c = req->conn;
+    nxt_cert_info_release(store->old);
 
-    mbuf = &c->read->mem;
+    /*
+     * The router restarted during the store, and the new router applies
+     * its first configuration now.  A second configuration sent before
+     * that one ends would run at the same time in the router, and the
+     * router does not support that.  nxt_controller_conf_init_handler()
+     * goes on with this store.  The other changes wait meanwhile, because
+     * nxt_controller_waiting_init_conf is set.
+     */
+    if (nxt_controller_waiting_init_conf) {
+        nxt_controller_cert_stored = store;
+        return;
+    }
 
-    nxt_fd_write(msg->fd[0], mbuf->pos, nxt_buf_mem_used_size(mbuf));
+    nxt_controller_cert_apply(task, store);
+}
 
-    nxt_fd_close(msg->fd[0]);
+
+static void
+nxt_controller_cert_delete_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_controller_response_t     resp;
+    nxt_controller_cert_delete_t  *del;
+
+    del = data;
+
+    nxt_controller_cert_deleting = 0;
 
     nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
-    resp.status = 200;
-    resp.title = (u_char *) "Certificate chain uploaded.";
+    if (msg == NULL || msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
+        /*
+         * The bundle could not be removed.  Keep it listed: its file is
+         * still in the store, and the next start loads it again.
+         */
+        resp.status = 500;
+        resp.title = (u_char *) "Failed to delete certificate.";
+        resp.offset = -1;
+
+    } else {
+        (void) nxt_cert_info_delete(&del->name);
+
+        resp.status = 200;
+        resp.title = (u_char *) "Certificate deleted.";
+    }
+
+    nxt_controller_response(task, del->req, &resp);
+
+    nxt_controller_flush_requests(task);
+}
+
+
+/*
+ * When the current configuration names the stored bundle, the controller
+ * sends the configuration to the router again.  The router reads every
+ * bundle during a reconfiguration, so new handshakes get the new
+ * certificate.  Accepted connections keep their old TLS context.  The
+ * first configuration of a new router may have read the old bundle, so a
+ * bundle that waited for it is applied as well.
+ */
+static void
+nxt_controller_cert_apply(nxt_task_t *task, nxt_controller_cert_store_t *store)
+{
+    nxt_int_t                  rc;
+    nxt_runtime_t              *rt;
+    nxt_controller_request_t   *req;
+    nxt_controller_response_t  resp;
+
+    req = store->req;
+
+    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+
+    rt = task->thread->runtime;
+
+    /* When no router is ready, the next router loads the new bundle. */
+
+    if (nxt_controller_cert_in_use(&store->name)
+        && nxt_controller_router_ready
+        && rt->port_by_type[NXT_PROCESS_ROUTER] != NULL)
+    {
+        rc = nxt_controller_conf_send(task, req->conn->mem_pool,
+                                      nxt_controller_conf.root,
+                                      nxt_controller_cert_apply_handler,
+                                      store);
+
+        if (nxt_fast_path(rc == NXT_OK)) {
+            nxt_queue_insert_head(&nxt_controller_waiting_requests,
+                                  &req->link);
+            return;
+        }
+
+        nxt_cert_info_applied(&store->name, 0);
+
+        resp.status = 500;
+        resp.title = (u_char *) "Certificate stored but not applied.";
+        resp.offset = -1;
+
+    } else {
+        resp.status = 200;
+        resp.title = (u_char *) "Certificate chain uploaded.";
+    }
 
     nxt_controller_response(task, req, &resp);
+
+    nxt_controller_flush_requests(task);
+}
+
+
+static void
+nxt_controller_cert_apply_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_bool_t                   applied;
+    nxt_controller_request_t     *req;
+    nxt_controller_response_t    resp;
+    nxt_controller_cert_store_t  *store;
+
+    store = data;
+    req = store->req;
+
+    nxt_queue_remove(&req->link);
+
+    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+
+    applied = (msg->port_msg.type == NXT_PORT_MSG_RPC_READY);
+
+    /* Other changes waited, so the name still holds this bundle. */
+    nxt_cert_info_applied(&store->name, applied);
+
+    if (applied) {
+        resp.status = 200;
+        resp.title = (u_char *) "Certificate chain updated.";
+
+    } else {
+        /* The router kept the old configuration and the old contexts. */
+        resp.status = 500;
+        resp.title = (u_char *) "Certificate stored but not applied.";
+        resp.offset = -1;
+    }
+
+    nxt_controller_response(task, req, &resp);
+
+    nxt_controller_flush_requests(task);
 }
 
 
@@ -2072,15 +2627,17 @@ static void
 nxt_controller_process_script(nxt_task_t *task,
     nxt_controller_request_t *req, nxt_str_t *path)
 {
-    u_char                     *p;
-    nxt_int_t                  ret;
-    nxt_str_t                  name;
-    nxt_conn_t                 *c;
-    nxt_script_t               *script;
-    nxt_buf_mem_t              *bm;
-    nxt_conf_value_t           *value;
-    nxt_controller_response_t  resp;
-    u_char                     error[NXT_MAX_ERROR_STR];
+    u_char                         *p;
+    nxt_int_t                      ret;
+    nxt_str_t                      name;
+    nxt_conn_t                     *c;
+    nxt_script_t                   *script;
+    nxt_buf_mem_t                  *bm;
+    nxt_conf_value_t               *value;
+    nxt_controller_response_t      resp;
+    nxt_controller_script_store_t  *store;
+    nxt_controller_script_delete_t *del;
+    u_char                         error[NXT_MAX_ERROR_STR];
 
     name.length = path->length - 1;
     name.start = path->start + 1;
@@ -2102,6 +2659,16 @@ nxt_controller_process_script(nxt_task_t *task,
     c = req->conn;
 
     if (nxt_str_eq(&req->parser.method, "GET", 3)) {
+
+        /*
+         * While main stores or deletes a module, its metadata can roll
+         * back, or name a file that is already gone.  Wait.
+         */
+        if (nxt_controller_script_storing || nxt_controller_script_deleting) {
+            nxt_queue_insert_tail(&nxt_controller_waiting_requests,
+                                  &req->link);
+            return;
+        }
 
         if (name.length != 0) {
             value = nxt_script_info_get(&name);
@@ -2130,8 +2697,24 @@ nxt_controller_process_script(nxt_task_t *task,
         return;
     }
 
-    if (name.length == 0 || path != NULL) {
+    /*
+     * The name is a file name in the scripts directory.  Main keeps its
+     * temporary file there under a name that starts with ".", and refuses
+     * such a name.  Answer 400 here, not 500 from main.
+     */
+    if (name.length == 0 || path != NULL || name.start[0] == '.'
+        || name.length > NXT_SCRIPT_NAME_MAX_LENGTH)
+    {
         goto invalid_name;
+    }
+
+    /*
+     * A store or a delete waits for the current reconfiguration: the router
+     * reads the modules while it applies a configuration.
+     */
+    if (nxt_controller_check_postpone_request(task)) {
+        nxt_queue_insert_tail(&nxt_controller_waiting_requests, &req->link);
+        return;
     }
 
     if (nxt_str_eq(&req->parser.method, "PUT", 3)) {
@@ -2142,12 +2725,23 @@ nxt_controller_process_script(nxt_task_t *task,
 
         bm = &c->read->mem;
 
+        /* Main refuses a larger module.  Send 413 here, not 500. */
+        if (nxt_buf_mem_used_size(bm) > NXT_SCRIPT_STORE_MAX_SIZE) {
+            goto too_large;
+        }
+
+        store = nxt_mp_get(c->mem_pool, sizeof(nxt_controller_script_store_t));
+        if (nxt_slow_path(store == NULL)) {
+            goto alloc_fail;
+        }
+
         script = nxt_script_new(task, &name, bm->pos,
                                 nxt_buf_mem_used_size(bm), error);
         if (script == NULL) {
             goto invalid_script;
         }
 
+        /* A failed store deletes the metadata again. */
         ret = nxt_script_info_save(&name, script);
 
         nxt_script_destroy(script);
@@ -2156,8 +2750,19 @@ nxt_controller_process_script(nxt_task_t *task,
             goto alloc_fail;
         }
 
-        nxt_script_store_get(task, &name, c->mem_pool,
-                             nxt_controller_process_script_save, req);
+        nxt_controller_script_storing = 1;
+
+        store->name = name;
+        store->req = req;
+
+        /*
+         * Any other change waits until main answers: see
+         * nxt_controller_store_in_flight().  The request itself is not in
+         * the waiting queue, so a flush of the queue cannot run it again.
+         */
+
+        nxt_script_store_put(task, &name, bm, c->mem_pool,
+                             nxt_controller_process_script_save, store);
         return;
     }
 
@@ -2167,16 +2772,28 @@ nxt_controller_process_script(nxt_task_t *task,
             goto script_in_use;
         }
 
-        if (nxt_script_info_delete(&name) != NXT_OK) {
+        if (nxt_script_info_get(&name) == NULL) {
             goto script_not_found;
         }
 
-        nxt_script_store_delete(task, &name, c->mem_pool);
+        del = nxt_mp_get(c->mem_pool, sizeof(nxt_controller_script_delete_t));
+        if (nxt_slow_path(del == NULL)) {
+            goto alloc_fail;
+        }
 
-        resp.status = 200;
-        resp.title = (u_char *) "JS module deleted.";
+        nxt_controller_script_deleting = 1;
 
-        nxt_controller_response(task, req, &resp);
+        del->name = name;
+        del->req = req;
+
+        /*
+         * The module stays listed, and the answer waits, until the store
+         * child has removed the file: see
+         * nxt_controller_store_in_flight().
+         */
+
+        nxt_script_store_delete(task, &name, c->mem_pool,
+                                nxt_controller_process_script_delete, del);
         return;
     }
 
@@ -2212,6 +2829,15 @@ exists_script:
 
     resp.status = 400;
     resp.title = (u_char *) "JS module already exists.";
+    resp.offset = -1;
+
+    nxt_controller_response(task, req, &resp);
+    return;
+
+too_large:
+
+    resp.status = 413;
+    resp.title = (u_char *) "JS module is too large.";
     resp.offset = -1;
 
     nxt_controller_response(task, req, &resp);
@@ -2258,37 +2884,71 @@ static void
 nxt_controller_process_script_save(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    nxt_conn_t                 *c;
-    nxt_buf_mem_t              *mbuf;
-    nxt_controller_request_t   *req;
-    nxt_controller_response_t  resp;
+    nxt_controller_request_t       *req;
+    nxt_controller_response_t      resp;
+    nxt_controller_script_store_t  *store;
 
-    req = data;
+    store = data;
+    req = store->req;
+
+    nxt_controller_script_storing = 0;
 
     nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
-    if (msg == NULL || msg->port_msg.type == _NXT_PORT_MSG_RPC_ERROR) {
+    if (msg == NULL || msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
+        /*
+         * A store child that failed after rename(2) leaves the file, and
+         * the next start loads it.
+         */
+        (void) nxt_script_info_delete(&store->name);
+
         resp.status = 500;
         resp.title = (u_char *) "Failed to store script.";
+        resp.offset = -1;
 
-        nxt_controller_response(task, req, &resp);
-        return;
+    } else {
+        resp.status = 200;
+        resp.title = (u_char *) "JS module uploaded.";
     }
 
-    c = req->conn;
+    nxt_controller_response(task, req, &resp);
 
-    mbuf = &c->read->mem;
+    nxt_controller_flush_requests(task);
+}
 
-    nxt_fd_write(msg->fd[0], mbuf->pos, nxt_buf_mem_used_size(mbuf));
 
-    nxt_fd_close(msg->fd[0]);
+static void
+nxt_controller_process_script_delete(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg, void *data)
+{
+    nxt_controller_response_t       resp;
+    nxt_controller_script_delete_t  *del;
+
+    del = data;
+
+    nxt_controller_script_deleting = 0;
 
     nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
-    resp.status = 200;
-    resp.title = (u_char *) "JS module uploaded.";
+    if (msg == NULL || msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
+        /*
+         * The module could not be removed.  Keep it listed: its file is
+         * still in the store, and the next start loads it again.
+         */
+        resp.status = 500;
+        resp.title = (u_char *) "Failed to delete script.";
+        resp.offset = -1;
 
-    nxt_controller_response(task, req, &resp);
+    } else {
+        (void) nxt_script_info_delete(&del->name);
+
+        resp.status = 200;
+        resp.title = (u_char *) "JS module deleted.";
+    }
+
+    nxt_controller_response(task, del->req, &resp);
+
+    nxt_controller_flush_requests(task);
 }
 
 
@@ -2375,10 +3035,24 @@ nxt_controller_conf_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 
         nxt_controller_conf = req->conf;
 
-        nxt_controller_conf_store(task, req->conf.root);
+        /*
+         * The client waits until the store child of main has written the
+         * configuration and flushed it, so a 200 means "on the disk".  The
+         * answer comes from nxt_controller_process_conf_store().
+         */
+        nxt_controller_conf_storing = 1;
 
-        resp.status = 200;
-        resp.title = (u_char *) "Reconfiguration done.";
+        if (nxt_fast_path(nxt_controller_conf_store(task, req->conf.root, req)
+                          == NXT_OK))
+        {
+            return;
+        }
+
+        nxt_controller_conf_storing = 0;
+
+        resp.status = 500;
+        resp.title = (u_char *) "Failed to store the configuration.";
+        resp.offset = -1;
 
     } else {
         nxt_mp_destroy(req->conf.pool);
@@ -2386,6 +3060,44 @@ nxt_controller_conf_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
         resp.status = 500;
         resp.title = (u_char *) "Failed to apply new configuration.";
         resp.offset = -1;
+    }
+
+    nxt_controller_response(task, req, &resp);
+
+    nxt_controller_flush_requests(task);
+}
+
+
+/*
+ * Main answers the store of a configuration only when its store child has
+ * ended.  The configuration runs either way; this answer says whether it
+ * reached the disk.
+ */
+static void
+nxt_controller_process_conf_store(nxt_task_t *task, nxt_port_recv_msg_t *msg,
+    void *data)
+{
+    nxt_controller_request_t   *req;
+    nxt_controller_response_t  resp;
+
+    req = data;
+
+    nxt_controller_conf_storing = 0;
+
+    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+
+    if (msg == NULL || msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
+        /*
+         * The configuration runs, but a restart loads the one before it.
+         * The client must not read this as stored.
+         */
+        resp.status = 500;
+        resp.title = (u_char *) "Failed to store the configuration.";
+        resp.offset = -1;
+
+    } else {
+        resp.status = 200;
+        resp.title = (u_char *) "Reconfiguration done.";
     }
 
     nxt_controller_response(task, req, &resp);
@@ -2543,27 +3255,35 @@ nxt_controller_app_restart_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
 }
 
 
-static void
-nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
+static nxt_int_t
+nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf,
+    nxt_controller_request_t *req)
 {
     void           *mem;
     u_char         *end;
     size_t         size;
+    uint32_t       stream;
     nxt_fd_t       fd;
     nxt_int_t      rc;
     nxt_buf_t      *b;
-    nxt_port_t     *main_port;
+    nxt_port_t     *main_port, *controller_port;
     nxt_runtime_t  *rt;
 
     rt = task->thread->runtime;
 
     main_port = rt->port_by_type[NXT_PROCESS_MAIN];
+    controller_port = rt->port_by_type[NXT_PROCESS_CONTROLLER];
 
     size = nxt_conf_json_length(conf, NULL);
+    if (nxt_slow_path(size == SIZE_MAX)) {
+        nxt_alert(task, "failed to store current configuration: "
+                  "it is too large");
+        return NXT_ERROR;
+    }
 
     fd = nxt_shm_open(task, size);
     if (nxt_slow_path(fd == -1)) {
-        return;
+        return NXT_ERROR;
     }
 
     mem = nxt_mem_mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -2584,9 +3304,17 @@ nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
 
     b->mem.free = nxt_cpymem(b->mem.pos, &size, sizeof(size_t));
 
+    stream = nxt_port_rpc_register_handler(task, controller_port,
+                                           nxt_controller_process_conf_store,
+                                           nxt_controller_process_conf_store,
+                                           -1, req);
+    if (nxt_slow_path(stream == 0)) {
+        goto fail_b;
+    }
+
     rc = nxt_port_socket_write(task, main_port,
                                NXT_PORT_MSG_CONF_STORE | NXT_PORT_MSG_CLOSE_FD,
-                               fd, 0, -1, b);
+                               fd, stream, controller_port->id, b);
 
     if (nxt_slow_path(rc != NXT_OK)) {
         /*
@@ -2595,17 +3323,28 @@ nxt_controller_conf_store(nxt_task_t *task, nxt_conf_value_t *conf)
          * queue the buffer completion so the engine memory pool is
          * not left with an unreclaimed buffer.
          */
+        nxt_port_rpc_cancel(task, controller_port, stream);
+
         nxt_fd_close(fd);
 
         nxt_work_queue_add(&task->thread->engine->fast_work_queue,
                            b->completion_handler, task, b, b->parent);
+
+        return NXT_ERROR;
     }
 
-    return;
+    return NXT_OK;
+
+fail_b:
+
+    nxt_work_queue_add(&task->thread->engine->fast_work_queue,
+                       b->completion_handler, task, b, b->parent);
 
 fail:
 
     nxt_fd_close(fd);
+
+    return NXT_ERROR;
 }
 
 
@@ -2628,6 +3367,8 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
     static const nxt_str_t  offset_str = nxt_string("offset");
     static const nxt_str_t  line_str = nxt_string("line");
     static const nxt_str_t  column_str = nxt_string("column");
+    static const nxt_str_t  path_str = nxt_string("path");
+    static const nxt_str_t  suggestion_str = nxt_string("suggestion");
 
     static nxt_time_string_t  date_cache = {
         (nxt_atomic_uint_t) -1,
@@ -2656,6 +3397,10 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
         nxt_str_set(&status_line, "405 Method Not Allowed");
         break;
 
+    case 413:
+        nxt_str_set(&status_line, "413 Payload Too Large");
+        break;
+
     default:
         nxt_str_set(&status_line, "500 Internal Server Error");
         break;
@@ -2665,9 +3410,15 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
     value = resp->conf;
 
     if (value == NULL) {
+        nxt_uint_t  loc_n, loc_i, have_offset, have_pointer;
+
+        have_offset = (resp->status >= 400 && resp->offset != -1);
+        have_pointer = (resp->status >= 400 && resp->pointer.start != NULL);
+
         n = 1
             + (resp->detail.length != 0)
-            + (resp->status >= 400 && resp->offset != -1);
+            + (have_offset || have_pointer)
+            + (resp->suggestion.length != 0);
 
         value = nxt_conf_create_object(c->mem_pool, n);
 
@@ -2694,29 +3445,59 @@ nxt_controller_response(nxt_task_t *task, nxt_controller_request_t *req,
             nxt_conf_set_member_string(value, &detail_str, &resp->detail, n);
         }
 
-        if (resp->status >= 400 && resp->offset != -1) {
+        if (have_offset || have_pointer) {
             n++;
 
-            location = nxt_conf_create_object(c->mem_pool,
-                                              resp->line != 0 ? 3 : 1);
+            loc_n = (have_offset ? (resp->line != 0 ? 3 : 1) : 0) + have_pointer;
+
+            location = nxt_conf_create_object(c->mem_pool, loc_n);
+
+            if (nxt_slow_path(location == NULL)) {
+                nxt_controller_conn_close(task, c, req);
+                return;
+            }
 
             nxt_conf_set_member(value, &location_str, location, n);
 
-            nxt_conf_set_member_integer(location, &offset_str, resp->offset, 0);
+            loc_i = 0;
 
-            if (resp->line != 0) {
-                nxt_conf_set_member_integer(location, &line_str,
-                                            resp->line, 1);
+            if (have_offset) {
+                nxt_conf_set_member_integer(location, &offset_str,
+                                            resp->offset, loc_i++);
 
-                nxt_conf_set_member_integer(location, &column_str,
-                                            resp->column, 2);
+                if (resp->line != 0) {
+                    nxt_conf_set_member_integer(location, &line_str,
+                                                resp->line, loc_i++);
+
+                    nxt_conf_set_member_integer(location, &column_str,
+                                                resp->column, loc_i++);
+                }
             }
+
+            if (have_pointer) {
+                nxt_conf_set_member_string(location, &path_str,
+                                           &resp->pointer, loc_i++);
+            }
+        }
+
+        if (resp->suggestion.length != 0) {
+            n++;
+
+            nxt_conf_set_member_string(value, &suggestion_str,
+                                       &resp->suggestion, n);
         }
     }
 
     nxt_memzero(&pretty, sizeof(nxt_conf_json_pretty_t));
 
-    size = nxt_conf_json_length(value, &pretty) + 2;
+    /* The body and "\r\n". */
+    if (nxt_slow_path(nxt_size_add(nxt_conf_json_length(value, &pretty), 2,
+                                   &size)
+                      != 0))
+    {
+        nxt_controller_conn_close(task, c, req);
+        return;
+    }
 
     body = nxt_buf_mem_alloc(c->mem_pool, size, 0);
     if (nxt_slow_path(body == NULL)) {

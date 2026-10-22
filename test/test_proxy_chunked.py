@@ -11,11 +11,12 @@ import pytest
 from conftest import run_process
 from unit.applications.lang.python import ApplicationPython
 from unit.utils import waitforsocket
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
 
 client = ApplicationPython()
-SERVER_PORT = 7999
+SERVER_PORT = port_map.port(7999)
 
 
 @pytest.fixture(autouse=True)
@@ -648,3 +649,32 @@ def test_proxy_chunked_concurrent():
     finally:
         proc.terminate()
         proc.wait()
+
+
+def _handler_counts_content_length(data):
+    headers = data.split('\r\n\r\n', 1)[0].split('\r\n')[1:]
+    count = sum(1 for h in headers if h.lower().startswith('content-length:'))
+    body = str(count)
+    return (
+        "HTTP/1.1 200 OK\r\nConnection: close\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n{body}"
+    )
+
+
+def test_proxy_chunked_request_one_content_length():
+    """A chunked request body goes upstream with exactly one Content-Length."""
+    port = _get_free_port()
+    _run_proxy_server(_handler_counts_content_length, port)
+    _configure_proxy(port, 'counting backend')
+
+    resp = client.post(
+        headers={
+            'Host': 'localhost',
+            'Transfer-Encoding': 'chunked',
+            'Connection': 'close',
+        },
+        body=_chunked_encode(b'0123456789').decode('latin-1'),
+    )
+
+    assert resp['status'] == 200, 'status'
+    assert resp['body'] == '1', 'one Content-Length upstream'

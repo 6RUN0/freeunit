@@ -1,3 +1,4 @@
+import json
 import time
 
 import pytest
@@ -29,7 +30,7 @@ def set_format(log_format):
 
 
 def set_if(condition):
-    assert 'success' in client.conf(f'"{condition}"', 'access_log/if')
+    assert 'success' in client.conf(json.dumps(condition), 'access_log/if')
 
 
 def test_access_log_keepalive(wait_for_record):
@@ -307,6 +308,151 @@ def test_access_log_format(wait_for_record):
     check_format(log_format, '{"status":"200","uri":"/"}')
 
 
+def _read_log_lines():
+    with open(
+        f'{option.temp_dir}/access.log', 'r', encoding='utf-8', errors='strict'
+    ) as f:
+        return [ln for ln in f.read().splitlines() if ln]
+
+
+def test_access_log_text_escape(wait_for_record):
+    load('empty')
+
+    # A percent-encoded CRLF in the target reaches "$uri" decoded, so without
+    # escaping these bytes end the record and start one the client wrote.
+    set_format('$remote_addr "$uri" $status')
+
+    assert (
+        client.get(url='/%0d%0a1.2.3.4 "GET /forged" 200')['status'] == 200
+    )
+    assert wait_for_record(r'\\x0D\\x0A', 'access.log') is not None
+
+    lines = _read_log_lines()
+
+    assert len(lines) == 1, 'one request, one record'
+    assert '\\x0D\\x0A' in lines[0], 'the CRLF is escaped, not written'
+    assert '\\x22GET /forged\\x22 200' in lines[0], 'the quotes are escaped too'
+
+
+def test_access_log_text_escape_leaves_the_format_alone(wait_for_record):
+    load('empty')
+
+    # The operator's own format text is not a value and is written as it is;
+    # only what a variable expands to is escaped.
+    set_format('start\t"$uri"\tend')
+
+    assert client.get(url='/ok')['status'] == 200
+    assert wait_for_record(r'start', 'access.log') is not None
+
+    line = _read_log_lines()[-1]
+
+    assert line == 'start\t"/ok"\tend', 'tabs in the format survive'
+
+
+def test_access_log_text_escape_njs(require, wait_for_record):
+    require({'modules': {'njs': 'any'}})
+
+    load('empty')
+
+    # An njs format produces the whole record, so all of it is escaped --
+    # the quotes written here included.  The client's CRLF must not reach the
+    # file, and the record must be exactly as long as it claims: the newline
+    # it ends with is appended inside the generated function, so a length that
+    # counted the flag bit instead of a 0/1 would report pool memory past the
+    # end of the record.
+    set_format('`${vars.remote_addr} "${vars.uri}"`')
+
+    assert client.get(url='/%0d%0aFORGED')['status'] == 200
+    assert wait_for_record(r'FORGED', 'access.log') is not None
+
+    # On the raw bytes, not on split lines: three stray bytes that happened to
+    # be newlines would vanish into a line split and the record would still
+    # look right.
+    with open(f'{option.temp_dir}/access.log', 'rb') as f:
+        raw = f.read()
+
+    assert (
+        raw == b'127.0.0.1 \\x22/\\x0D\\x0AFORGED\\x22\n'
+    ), 'one record, one newline, nothing after'
+
+
+def test_access_log_object_escape(wait_for_record):
+    load('empty')
+
+    # Every character below is significant inside a JSON string: the first
+    # chunk closes the "ua" member and opens a forged one, then come a bare
+    # quote, a backslash, a control character (HTAB is legal in a field
+    # value) and a multi-byte UTF-8 sequence.
+    evil = '", "injected": "1 " \\ \t \u00e9'
+
+    set_format({'status': '$status', 'ua': '$header_user_agent'})
+
+    assert (
+        client.get(
+            headers={
+                'Host': 'localhost',
+                'User-Agent': evil,
+                'Connection': 'close',
+            }
+        )['status']
+        == 200
+    )
+    assert wait_for_record(r'"status":"200"', 'access.log') is not None
+
+    line = _read_log_lines()[-1]
+
+    record = json.loads(line)
+
+    assert list(record.keys()) == ['status', 'ua'], 'no injected members'
+    assert record['status'] == '200'
+    assert record['ua'] == evil, 'value round-trips'
+
+
+def test_access_log_object_escape_is_not_the_text_escape(wait_for_record):
+    load('empty')
+
+    # The other half of the split: the object format escapes as JSON and must
+    # not also take the text format's escaping, or a reader would get "\x0D"
+    # where JSON says "\r" and the member would no longer round-trip.
+    set_format({'uri': '$uri', 'status': '$status'})
+
+    assert client.get(url='/%0d%0aFORGED')['status'] == 200
+    assert wait_for_record(r'FORGED', 'access.log') is not None
+
+    record = json.loads(_read_log_lines()[-1])
+
+    assert record['uri'] == '/\r\nFORGED', 'the bytes round-trip through JSON'
+    assert '\\x0D' not in record['uri'], 'not escaped twice'
+
+
+def test_access_log_object_escape_njs(require, wait_for_record):
+    require({'modules': {'njs': 'any'}})
+
+    load('empty')
+
+    evil = '", "injected": "1 " \\ \t \u00e9'
+
+    set_format({'uri': '`${vars.uri}`', 'ua': '$header_user_agent'})
+
+    assert (
+        client.get(
+            headers={
+                'Host': 'localhost',
+                'User-Agent': evil,
+                'Connection': 'close',
+            }
+        )['status']
+        == 200
+    )
+    assert wait_for_record(r'"uri":"/"', 'access.log') is not None
+
+    record = json.loads(_read_log_lines()[-1])
+
+    assert list(record.keys()) == ['uri', 'ua'], 'no injected members'
+    assert record['uri'] == '/'
+    assert record['ua'] == evil, 'value round-trips'
+
+
 def test_access_log_variables(wait_for_record):
     load('mirror')
 
@@ -318,6 +464,36 @@ def test_access_log_variables(wait_for_record):
     assert (
         wait_for_record(fr'^\/bbs {len(body)}$', 'access.log') is not None
     ), '$body_bytes_sent'
+
+
+def test_access_log_body_bytes_sent_chunked(wait_for_record):
+    # The application sets no Content-Length, so the response is chunked.
+    # $body_bytes_sent counts the chunk framing.  It does not count the
+    # empty line that ends the header.
+    load('chunked')
+    set_format('$uri $body_bytes_sent')
+
+    body = '0123456789'
+
+    resp = client.post(url='/data', body=body)
+    assert resp['status'] == 200
+    assert resp['headers']['Transfer-Encoding'] == 'chunked'
+    assert resp['body'] == body
+
+    # "a\r\n0123456789\r\n0\r\n\r\n" is 20 bytes.
+    record = wait_for_record(r'^/data \d+$', 'access.log')
+    assert record is not None, 'data record'
+    assert record.group(0) == '/data 20', 'chunked body'
+
+    # An empty body has only the last chunk: "0\r\n\r\n" is 5 bytes.
+    resp = client.get(url='/empty')
+    assert resp['status'] == 200
+    assert resp['headers']['Transfer-Encoding'] == 'chunked'
+    assert resp['body'] == ''
+
+    record = wait_for_record(r'^/empty \d+$', 'access.log')
+    assert record is not None, 'empty record'
+    assert record.group(0) == '/empty 5', 'empty chunked body'
 
 
 def test_access_log_if(search_in_file, wait_for_record):
@@ -376,6 +552,38 @@ def test_access_log_if_njs(require, search_in_file, wait_for_record):
     assert search_in_file(r'^/foo_2$', 'access.log') is None
 
 
+def test_access_log_if_njs_exception(
+    require, search_in_file, skip_alert, wait_for_record
+):
+    require({'modules': {'njs': 'any'}})
+    skip_alert(r'js exception')
+
+    load('empty')
+    set_format('$uri')
+
+    # Without "x" in the query, "args.x" is undefined and the condition
+    # throws.  An unrendered condition is not a true one, so the request
+    # gets no record; the same expression in a route "match" ends the
+    # request with a 500.
+    set_if('`${args.x.length == 1}`')
+
+    assert client.get(url='/throws')['status'] == 200
+    assert client.get(url='/logged?x=a')['status'] == 200
+
+    # "!" negates the value of a condition that renders.  It does not turn
+    # the failure to render one into a record.
+    set_if('!`${args.x.length == 1}`')
+
+    assert client.get(url='/throws_negated')['status'] == 200
+    assert client.get(url='/logged_negated?x=ab')['status'] == 200
+
+    assert wait_for_record(r'^/logged$', 'access.log') is not None
+    assert wait_for_record(r'^/logged_negated$', 'access.log') is not None
+
+    assert search_in_file(r'^/throws$', 'access.log') is None
+    assert search_in_file(r'^/throws_negated$', 'access.log') is None
+
+
 def test_access_log_format_njs(require, search_in_file, wait_for_record):
     require({'modules': {'njs': 'any'}})
 
@@ -392,6 +600,53 @@ def test_access_log_format_njs(require, search_in_file, wait_for_record):
         'uri': '`${vars.uri}`'
     }
     check_format(log_format, '{"status":"200","uri":"/"}')
+
+
+@pytest.mark.parametrize(
+    'log_format',
+    [
+        '`${vars.uri} ${args.x.length}`',
+        {'uri': '`${vars.uri}`', 'x': '`${args.x.length}`'},
+    ],
+)
+def test_access_log_njs_exception(
+    log_format, require, search_in_file, skip_alert, wait_for_record
+):
+    require({'modules': {'njs': 'any'}})
+    skip_alert(r'js exception')
+
+    load('empty')
+    set_format(log_format)
+
+    # Without "x" in the query, "args.x" is undefined and the format throws.
+    # The request gets no record, but it must still be closed: the client
+    # asked for "Connection: close", so the server must close the socket.
+    sock = client.get(url='/fail', no_recv=True)
+    sock.settimeout(10)
+
+    data = b''
+    closed = False
+
+    try:
+        while True:
+            part = sock.recv(4096)
+            if not part:
+                closed = True
+                break
+
+            data += part
+
+    except TimeoutError:
+        pass
+
+    sock.close()
+
+    assert data.startswith(b'HTTP/1.1 200 '), 'response sent'
+    assert closed, 'connection closed after a failed access log format'
+
+    assert client.get(url='/ok?x=abc')['status'] == 200
+    assert wait_for_record(r'/ok', 'access.log') is not None
+    assert search_in_file(r'/fail', 'access.log') is None
 
 
 def test_access_log_incorrect(temp_dir, skip_alert):
@@ -411,3 +666,153 @@ def test_access_log_incorrect(temp_dir, skip_alert):
     ), 'access_log format incorrect'
 
     assert 'error' in client.conf('$arg_', 'access_log/if')
+
+
+def test_access_log_writes_a_large_record(wait_for_record):
+    load('empty')
+
+    # 1.37.1 has no record bound: the JSON object and the text format both
+    # write a long record whole, and it is not counted as a loss.  The bound
+    # and the per-field cap are 1.38 decisions.
+    set_format({'big': '$header_x_big'})
+
+    assert client.get(headers={'X-Big': 'a' * 5000})['status'] == 200
+
+    assert wait_for_record(r'a{5000}', 'access.log') is not None, 'json'
+    assert client.conf_get('/status')['access_log']['lost'] == 0
+
+    set_format('$header_x_big')
+
+    assert client.get(headers={'X-Big': 'b' * 5000})['status'] == 200
+
+    assert wait_for_record(r'b{5000}', 'access.log') is not None, 'text'
+    assert client.conf_get('/status')['access_log']['lost'] == 0
+
+
+def test_access_log_marks_a_build_loss(require, wait_for_record, skip_alert):
+    require({'modules': {'njs': 'any'}})
+
+    load('empty')
+    set_format('`${args.x.length}`')
+    skip_alert(r'js exception:')
+
+    # No "x": the template throws, so the record cannot be built.  The loss
+    # is counted; the next good record writes the marker on its own line.
+    assert client.get()['status'] == 200
+
+    status = {}
+
+    for _ in range(50):
+        status = client.conf_get('/status')
+
+        if status.get('access_log', {}).get('lost'):
+            break
+
+        time.sleep(0.1)
+
+    assert status['access_log']['lost'] == 1, 'build failure counted'
+
+    assert client.get(url='/?x=1')['status'] == 200
+
+    assert (
+        wait_for_record(r'#freeunit: lost 1 record\(s\)', 'access.log')
+        is not None
+    ), 'marker'
+    assert wait_for_record(r'^1$', 'access.log') is not None, 'next record'
+
+    # The marker comes first, where the lost record would have been, and a
+    # record that was never written leaves no blank line.
+    with open(f'{option.temp_dir}/access.log', 'rb') as f:
+        assert f.read() == b'#freeunit: lost 1 record(s)\n1\n', 'marker first'
+
+
+def test_access_log_status_absent():
+    load('empty')
+
+    assert 'success' in client.conf_delete('access_log')
+
+    assert 'access_log' not in client.conf_get('/status')
+    assert 'error' in client.conf_get('/status/access_log')
+
+
+def test_access_log_counts_a_failed_write():
+    load('empty')
+
+    assert 'success' in client.conf(
+        {'path': '/dev/full', 'format': '$request_uri'}, 'access_log'
+    )
+
+    assert client.get()['status'] == 200
+
+    status = {}
+
+    for _ in range(50):
+        status = client.conf_get('/status')
+
+        if status.get('access_log', {}).get('lost'):
+            break
+
+        time.sleep(0.1)
+
+    assert status['access_log'] == {'path': '/dev/full', 'lost': 1}
+
+
+def test_access_log_rate_limits_the_warning(findall):
+    load('empty')
+
+    assert 'success' in client.conf(
+        {'path': '/dev/full', 'format': '$request_uri'}, 'access_log'
+    )
+
+    # The loss warning moderation is one static per router process, and the
+    # log reader only sees text written after its previous read.  An earlier
+    # test may have used the current moderation second, so cross the interval
+    # before the first loss this test relies on.
+    time.sleep(1.1)
+
+    for _ in range(10):
+        assert client.get()['status'] == 200
+
+    status = {}
+
+    for _ in range(50):
+        status = client.conf_get('/status')
+
+        if status.get('access_log', {}).get('lost') == 10:
+            break
+
+        time.sleep(0.1)
+
+    assert status['access_log']['lost'] == 10, 'every loss is counted'
+
+    time.sleep(0.1)
+
+    first = len(findall(r'access log ".+": .+; the record is lost'))
+
+    assert first >= 1, 'the first second warns'
+
+    # Cross the moderation interval: a second loss after it must warn again.
+    # With the old limit 0 the first message is allowed and every later one
+    # is suppressed forever, so this assertion fails on the base code.
+
+    time.sleep(1.2)
+
+    assert client.get()['status'] == 200
+
+    for _ in range(50):
+        status = client.conf_get('/status')
+
+        if status.get('access_log', {}).get('lost') == 11:
+            break
+
+        time.sleep(0.1)
+
+    assert status['access_log']['lost'] == 11
+
+    time.sleep(0.1)
+
+    second = len(findall(r'access log ".+": .+; the record is lost'))
+
+    assert (
+        second == first + 1
+    ), 'one warning per second, not one per lost record'

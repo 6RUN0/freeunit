@@ -11,6 +11,9 @@
 #include <nxt_main_process.h>
 #include <nxt_router.h>
 #include <nxt_regex.h>
+#if (NXT_HAVE_OTEL)
+#include <nxt_otel.h>
+#endif
 
 
 static nxt_int_t nxt_runtime_inherited_listen_sockets(nxt_task_t *task,
@@ -64,6 +67,9 @@ nxt_runtime_create(nxt_task_t *task)
 
     task->thread->runtime = rt;
     rt->mem_pool = mp;
+
+    rt->control_uid = (nxt_uid_t) -1;
+    rt->control_gid = (nxt_gid_t) -1;
 
     nxt_thread_mutex_create(&rt->processes_mutex);
 
@@ -128,10 +134,6 @@ nxt_runtime_create(nxt_task_t *task)
     }
 
     if (nxt_slow_path(nxt_http_register_variables() != NXT_OK)) {
-        goto fail;
-    }
-
-    if (nxt_slow_path(nxt_var_index_init() != NXT_OK)) {
         goto fail;
     }
 
@@ -298,15 +300,14 @@ nxt_runtime_event_engines(nxt_task_t *task, nxt_runtime_t *rt)
 
     thread = task->thread;
     thread->engine = engine;
-#if 0
-    thread->fiber = &engine->fibers->fiber;
-#endif
 
     engine->id = rt->last_engine_id++;
     engine->mem_pool = nxt_mp_create(1024, 128, 256, 32);
 
     nxt_queue_init(&rt->engines);
     nxt_queue_insert_tail(&rt->engines, &engine->link);
+
+    rt->main_engine = engine;
 
     return NXT_OK;
 }
@@ -350,6 +351,25 @@ nxt_runtime_start(nxt_task_t *task, void *obj, void *data)
 
     if (nxt_runtime_log_files_create(task, rt) != NXT_OK) {
         goto fail;
+    }
+
+    if (rt->capabilities.unknown) {
+        /*
+         * nxt_capability_set() could only reach stderr: it runs from
+         * nxt_runtime_conf_init(), before the log file exists.  Repeat it
+         * here so the record survives in unit.log too.
+         */
+        nxt_log(task, NXT_LOG_WARN, "capget() failed; process "
+                "capabilities are unknown and will not be used: user and "
+                "group switching and \"rootfs\" isolation are disabled "
+                "for applications that do not enable the \"credential\" "
+                "namespace, and applications run as uid %d", (int) nxt_euid);
+    }
+
+    if (nxt_ncpu_unlimited != 0) {
+        /* nxt_lib_start() lowers the count before the log file exists. */
+        nxt_log(task, NXT_LOG_INFO, "the cgroup CPU limit lowers the CPU "
+                "count from %ui to %ui", nxt_ncpu_unlimited, nxt_ncpu);
     }
 
     if (nxt_runtime_event_engine_change(task, rt) != NXT_OK) {
@@ -465,6 +485,32 @@ nxt_runtime_quit(nxt_task_t *task, nxt_uint_t status)
 }
 
 
+/*
+ * Close every idle conn of the engine on shutdown.
+ *
+ * Each conn is handed to its own protocol through c->read_state's
+ * close_handler, the same contract nxt_conn_accept_close_idle_handler()
+ * (nxt_conn_accept.c) uses to reclaim idle conns under fd pressure.  That
+ * handler ends in the protocol's free path -- nxt_h1p_conn_free() for a
+ * router conn, nxt_controller_conn_free() for a controller conn -- which
+ * releases everything the runtime cannot know about: the sockaddr from the
+ * engine cache (nxt_conn_accept_alloc()), and for the router the listener
+ * reference taken in nxt_conn_accept(), without which a draining listener
+ * never reaches its final release.  It also satisfies CONN-INV-2 (a
+ * write_state whose ready_handler releases the conn is installed before
+ * nxt_conn_close()), which a bare nxt_conn_close() here would violate: a
+ * keep-alive h1p conn still carries its request-send state, whose
+ * ready_handler is a no-op with c->write == NULL, so the conn would leak.
+ *
+ * A conn with no read_state has been accepted but its listen handler
+ * (nxt_conn_accept(): lev->listen->handler, queued on the read work queue)
+ * has not run yet, so no protocol owns it.  It is left alone: that queued
+ * work item still references it, so closing or freeing it here would be a
+ * use-after-free once the item runs, and nxt_conn_close() on a conn with
+ * write_state == NULL crashes in nxt_conn_close_handler().  It gets its
+ * protocol state when that item runs and is closed by the next pass.
+ */
+
 static void
 nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
 {
@@ -483,22 +529,51 @@ nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
         next = nxt_queue_next(link);
         c = nxt_queue_link_data(link, nxt_conn_t, link);
 
-        if (!c->socket.read_ready) {
-            /*
-             * Unlink and clear the tracking state immediately, before
-             * scheduling the async close.  nxt_runtime_quit() calls this on
-             * every shutdown continuation, so a conn left on idle_connections
-             * would be re-selected and re-closed on the next pass before its
-             * async close handler runs -- a double nxt_conn_close(), i.e. a
-             * use-after-free.  Clearing c->idle to TRACK_NONE also stops the
-             * close handler from unlinking the same conn a second time
-             * (P4.5).  Iteration stays safe: `next` was captured above.
-             */
-            nxt_conn_untrack(engine, c);
-            nxt_conn_close(engine, c);
+        if (c->socket.read_ready) {
+            continue;
         }
+
+        if (c->read_state == NULL || c->read_state->close_handler == NULL) {
+            nxt_debug(c->socket.task, "idle connection: %d not yet "
+                      "initialized, skipped", c->socket.fd);
+            continue;
+        }
+
+        /*
+         * Unlink and clear the tracking state immediately, before the
+         * protocol schedules its async close.  nxt_runtime_quit() calls
+         * this on every shutdown continuation, so a conn left on
+         * idle_connections would be re-selected and re-closed on the next
+         * pass before its async close handler runs -- a double
+         * nxt_conn_close(), i.e. a use-after-free.  Clearing c->idle to
+         * TRACK_NONE also stops the close handler from unlinking the same
+         * conn a second time (P4.5), and makes the nxt_conn_active() at
+         * the top of the h1p close handlers a no-op.  Iteration stays
+         * safe: `next` was captured above.
+         */
+        nxt_conn_untrack(engine, c);
+
+        c->read_state->close_handler(c->socket.task, c, c->socket.data);
     }
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * src/test/nxt_runtime_idle_close_test.c drives the idle-connection close
+ * path (M-11) without going through a full nxt_runtime_quit(): it checks
+ * that every idle conn is closed through its own protocol close handler,
+ * and that a conn without one is left alone.
+ */
+
+void
+nxt_runtime_test_close_idle_connections(nxt_event_engine_t *engine)
+{
+    nxt_runtime_close_idle_connections(engine);
+}
+
+#endif
 
 
 /*
@@ -611,6 +686,16 @@ nxt_runtime_exit(nxt_task_t *task, void *obj, void *data)
     if (!nxt_array_is_empty(rt->thread_pools)) {
         return;
     }
+
+#if (NXT_HAVE_OTEL)
+    /*
+     * Only the router builds spans, and this is the last point before exit()
+     * at which the batch processor can still be flushed.
+     */
+    if (rt->type == NXT_PROCESS_ROUTER) {
+        nxt_otel_shutdown(task);
+    }
+#endif
 
     if (rt->type == NXT_PROCESS_MAIN) {
         if (rt->pid_file != NULL) {
@@ -1535,8 +1620,9 @@ nxt_current_directory(nxt_mp_t *mp)
 static nxt_int_t
 nxt_runtime_pid_file_create(nxt_task_t *task, nxt_file_name_t *pid_file)
 {
-    ssize_t     length;
-    nxt_int_t   n;
+    size_t      size, written;
+    ssize_t     n;
+    nxt_int_t   ret;
     nxt_file_t  file;
     u_char      pid[NXT_INT64_T_LEN + nxt_length("\n")];
 
@@ -1546,17 +1632,35 @@ nxt_runtime_pid_file_create(nxt_task_t *task, nxt_file_name_t *pid_file)
 
     nxt_fs_mkdir_p_dirname(pid_file, 0755);
 
-    n = nxt_file_open(task, &file, O_WRONLY, O_CREAT | O_TRUNC,
-                      NXT_FILE_DEFAULT_ACCESS);
+    ret = nxt_file_open(task, &file, O_WRONLY, O_CREAT | O_TRUNC,
+                        NXT_FILE_DEFAULT_ACCESS);
 
-    if (n != NXT_OK) {
+    if (ret != NXT_OK) {
         return NXT_ERROR;
     }
 
-    length = nxt_sprintf(pid, pid + sizeof(pid), "%PI%n", nxt_pid) - pid;
+    size = nxt_sprintf(pid, pid + sizeof(pid), "%PI%n", nxt_pid) - pid;
 
-    if (nxt_file_write(&file, pid, length, 0) != length) {
-        return NXT_ERROR;
+    /*
+     * pwrite() may store less than it was asked for, so resume from where it
+     * stopped rather than report a short write as a failure.  A zero return
+     * carries no errno and cannot make progress, so it ends the loop.
+     */
+
+    for (written = 0; written < size; written += n) {
+        n = nxt_file_write(&file, pid + written, size - written, written);
+
+        if (nxt_slow_path(n <= 0)) {
+            /* nxt_file_write() logs the errno; a zero return has none. */
+            if (n == 0) {
+                nxt_alert(task, "write(\"%FN\") stored %uz of %uz bytes",
+                          file.name, written, size);
+            }
+
+            nxt_file_close(task, &file);
+
+            return NXT_ERROR;
+        }
     }
 
     nxt_file_close(task, &file);
@@ -1565,25 +1669,18 @@ nxt_runtime_pid_file_create(nxt_task_t *task, nxt_file_name_t *pid_file)
 }
 
 
-void
-nxt_runtime_process_release(nxt_runtime_t *rt, nxt_process_t *process)
+static void
+nxt_runtime_process_free(nxt_runtime_t *rt, nxt_process_t *process)
 {
     nxt_process_t  *child;
 
-    if (process->registered == 1) {
-        nxt_runtime_process_remove(rt, process);
-    }
-
-    if (process->link.next != NULL) {
-        nxt_queue_remove(&process->link);
-    }
+    nxt_process_unlink(process);
 
     nxt_queue_each(child, &process->children, nxt_process_t, link) {
-        nxt_queue_remove(&child->link);
-        child->link.next = NULL;
+        nxt_process_unlink(child);
     } nxt_queue_loop;
 
-    nxt_assert(process->use_count == 0);
+    nxt_assert(nxt_atomic_load(&process->use_count) == 0);
     nxt_assert(process->registered == 0);
     nxt_assert(nxt_queue_is_empty(&process->ports));
 
@@ -1597,6 +1694,101 @@ nxt_runtime_process_release(nxt_runtime_t *rt, nxt_process_t *process)
     }
 
     nxt_mp_free(rt->mem_pool, process);
+}
+
+
+static void
+nxt_runtime_process_free_handler(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_process_t  *process;
+
+    process = obj;
+
+    nxt_runtime_process_free(task->thread->runtime, process);
+}
+
+
+/*
+ * Runs with no lock held, from nxt_process_use(), once the reference count
+ * has reached zero and the process has already been unlinked from
+ * rt->processes under rt->processes_mutex.  Nothing can look the process up
+ * any more, so the teardown itself needs no lock -- but it does need the
+ * right thread.  rt->mem_pool carries no lock of its own, so nxt_mp_free()
+ * of the process, and the parent/children queue surgery that goes with it,
+ * must not run on whichever router worker engine happened to drop the last
+ * reference; hand them to the engine that owns the runtime instead.
+ *
+ * Only the router runs more than one event engine (nxt_router.c,
+ * nxt_router_engines_create()), and only the main process links a process
+ * into a parent's children queue (nxt_main_process_whoami_handler(), and
+ * nxt_proto_process_add() for the prototype's own list).  So a process that
+ * takes the deferred path below is never on a children queue, and the
+ * window between the unlink and the posted free is not observable.
+ */
+
+void
+nxt_runtime_process_release(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_process_t *process)
+{
+    /*
+     * rt->main_engine is the engine that owns rt->mem_pool, recorded when it
+     * is created.  It is deliberately not derived from
+     * rt->port_by_type[rt->type]: that slot is NULL before the runtime
+     * registers its own port and again once nxt_runtime_port_remove() has
+     * cleared it, which nxt_runtime_exit() does while router worker engines
+     * are still running -- so "no port" must never be read as "safe to free
+     * here".  Reading the slot at all would also be a use of a port this
+     * thread holds no reference to.  Before rt->main_engine is set nothing
+     * but the creating thread exists, and it compares equal to a NULL
+     * task->thread->engine.
+     */
+
+    if (task->thread->engine == rt->main_engine) {
+        nxt_runtime_process_free(rt, process);
+
+        return;
+    }
+
+    /*
+     * Reached once cross-thread lookups hold references -- see
+     * nxt_runtime_process_ref().  Until they do, every drop lands on
+     * rt->main_engine: a router worker engine's own port is not on any
+     * process's port queue, so nxt_port_release() never reaches
+     * nxt_process_use() there.
+     *
+     * The work item is embedded in the process rather than allocated, and is
+     * posted straight to the engine instead of through a port, so this path
+     * cannot fail: an allocation failure here would have to either leak the
+     * process -- unbounded, under exactly the memory pressure that caused it
+     * -- or free rt->mem_pool memory from this thread, which is what the
+     * deferral exists to prevent.  The process is unlinked with use_count 0,
+     * so nothing else can reach the field.
+     *
+     * Not guaranteed to be drained: nxt_runtime_exit() destroys rt->mem_pool
+     * and calls exit() without running the engine again, so a free posted
+     * just before shutdown may never happen.  That leak is bounded by the
+     * process exiting immediately afterwards.
+     *
+     * The work item is single-instance, which changes what a double release
+     * would look like here: posting it again while the first is still queued
+     * makes nxt_locked_work_queue_add() do lwq->tail->next = work with
+     * tail == work, and nxt_locked_work_queue_move() then loops on itself.
+     * So a second drop to zero landing on a worker would hang rather than
+     * crash -- the failure mode a sanitizer is least able to show.  That is
+     * why nxt_process_use() latches nxt_process_t.released and refuses the
+     * second teardown outright, rather than only asserting on it.
+     */
+
+    nxt_assert(process->link.next == NULL);
+    nxt_assert(nxt_queue_is_empty(&process->children));
+
+    process->free_work.handler = nxt_runtime_process_free_handler;
+    process->free_work.task = &rt->main_engine->task;
+    process->free_work.obj = process;
+    process->free_work.data = NULL;
+    process->free_work.next = NULL;
+
+    nxt_event_engine_post(rt->main_engine, &process->free_work);
 }
 
 
@@ -1634,6 +1826,16 @@ nxt_runtime_process_lhq_pid(nxt_lvlhsh_query_t *lhq, nxt_pid_t *pid)
 }
 
 
+/*
+ * Returns the process without a reference: the pointer is only valid for as
+ * long as nothing can drop the last reference to it.  That holds when the
+ * caller runs on the single engine that owns the process -- the main, the
+ * prototype or the controller process, each of which has exactly one event
+ * engine -- and nowhere else.  Any caller that can run on a router worker
+ * engine must use nxt_runtime_process_ref() instead; the router's main
+ * engine can be freeing the process concurrently.
+ */
+
 nxt_process_t *
 nxt_runtime_process_find(nxt_runtime_t *rt, nxt_pid_t pid)
 {
@@ -1659,6 +1861,46 @@ nxt_runtime_process_find(nxt_runtime_t *rt, nxt_pid_t pid)
 }
 
 
+/*
+ * Same lookup, but the caller adopts a reference to the result and must drop
+ * it with nxt_process_use(task, process, -1).  The find and the increment
+ * share one rt->processes_mutex critical section, and nxt_process_use()
+ * unlinks the process from rt->processes under that same mutex when the count
+ * reaches zero -- so a lookup that still sees the process in the hash cannot
+ * be racing its teardown, and the reference it takes cannot be an increment
+ * on an object that is already being freed.
+ *
+ * Cost, since this sits on the shared-memory message path: the find already
+ * took the mutex, so the increment itself is free; the matching release in
+ * nxt_process_use() takes no lock unless it drops the last reference.
+ */
+
+nxt_process_t *
+nxt_runtime_process_ref(nxt_runtime_t *rt, nxt_pid_t pid)
+{
+    nxt_process_t       *process;
+    nxt_lvlhsh_query_t  lhq;
+
+    process = NULL;
+
+    nxt_runtime_process_lhq_pid(&lhq, &pid);
+
+    nxt_thread_mutex_lock(&rt->processes_mutex);
+
+    if (nxt_lvlhsh_find(&rt->processes, &lhq) == NXT_OK) {
+        process = lhq.value;
+        (void) nxt_atomic_fetch_add(&process->use_count, 1);
+
+    } else {
+        nxt_thread_log_debug("process %PI not found", pid);
+    }
+
+    nxt_thread_mutex_unlock(&rt->processes_mutex);
+
+    return process;
+}
+
+
 static nxt_process_t *
 nxt_runtime_process_get(nxt_runtime_t *rt, nxt_pid_t pid)
 {
@@ -1672,10 +1914,17 @@ nxt_runtime_process_get(nxt_runtime_t *rt, nxt_pid_t pid)
     if (nxt_lvlhsh_find(&rt->processes, &lhq) == NXT_OK) {
         nxt_thread_log_debug("process %PI found", pid);
 
-        nxt_thread_mutex_unlock(&rt->processes_mutex);
+        /*
+         * The reference has to be taken before the mutex is dropped:
+         * nxt_process_use() unlinks the process under the same mutex when
+         * the count reaches zero, so a lookup that still sees the process
+         * in rt->processes cannot be racing its teardown.
+         */
 
         process = lhq.value;
-        process->use_count++;
+        (void) nxt_atomic_fetch_add(&process->use_count, 1);
+
+        nxt_thread_mutex_unlock(&rt->processes_mutex);
 
         return process;
     }
@@ -1769,21 +2018,44 @@ nxt_runtime_process_add(nxt_task_t *task, nxt_process_t *process)
 }
 
 
+/*
+ * Must be called with rt->processes_mutex held.  Unlinking the process has
+ * to be atomic with the reference count reaching zero, otherwise
+ * nxt_runtime_process_find()/_get() can hand out a pointer to a process
+ * whose teardown has already begun.
+ *
+ * Nothing beyond the hash delete belongs here.  In particular
+ * nxt_port_mmaps_destroy() stays in nxt_runtime_process_free(): a router
+ * worker holds process->incoming.mutex while the main engine can hold
+ * rt->processes_mutex, so taking incoming.mutex under processes_mutex would
+ * add a lock-order edge in the opposite direction.
+ *
+ * The registered check is not defensive: nxt_runtime_exit() unregisters a
+ * process before closing its ports, so a drop to zero on an already
+ * unregistered process is a normal shutdown path.
+ *
+ * The lhq.pool assignment below looks like it frees rt->mem_pool memory on
+ * whichever thread dropped the last reference -- one call before the
+ * deferral that exists to prevent exactly that.  It does not:
+ * lvlhsh_processes_proto uses nxt_lvlhsh_alloc()/_free(), which ignore the
+ * pool argument and use nxt_memalign()/nxt_free().
+ */
+
 void
-nxt_runtime_process_remove(nxt_runtime_t *rt, nxt_process_t *process)
+nxt_runtime_process_unlink_locked(nxt_runtime_t *rt, nxt_process_t *process)
 {
     nxt_pid_t           pid;
     nxt_lvlhsh_query_t  lhq;
 
-    nxt_assert(process->registered != 0);
+    if (process->registered == 0) {
+        return;
+    }
 
     pid = process->pid;
 
     nxt_runtime_process_lhq_pid(&lhq, &pid);
 
     lhq.pool = rt->mem_pool;
-
-    nxt_thread_mutex_lock(&rt->processes_mutex);
 
     switch (nxt_lvlhsh_delete(&rt->processes, &lhq)) {
 
@@ -1801,6 +2073,17 @@ nxt_runtime_process_remove(nxt_runtime_t *rt, nxt_process_t *process)
         nxt_thread_log_alert("process %PI remove failed", pid);
         break;
     }
+}
+
+
+void
+nxt_runtime_process_remove(nxt_runtime_t *rt, nxt_process_t *process)
+{
+    nxt_assert(process->registered != 0);
+
+    nxt_thread_mutex_lock(&rt->processes_mutex);
+
+    nxt_runtime_process_unlink_locked(rt, process);
 
     nxt_thread_mutex_unlock(&rt->processes_mutex);
 }

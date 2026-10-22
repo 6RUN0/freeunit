@@ -71,8 +71,13 @@ typedef struct {
 
 NXT_EXPORT void nxt_thread_init_data(nxt_thread_specific_data_t tsd);
 
+/*
+ * A relaxed load is enough.  A thread calls nxt_thread_init_data() before
+ * it uses the data, and that call makes an acquire load of the key.
+ */
+
 #define nxt_thread_get_data(tsd)                                              \
-    pthread_getspecific((pthread_key_t) tsd->key)
+    pthread_getspecific((pthread_key_t) nxt_atomic_load(&tsd->key))
 
 #endif
 
@@ -147,14 +152,6 @@ struct nxt_thread_s {
     nxt_runtime_t            *runtime;
     nxt_event_engine_t       *engine;
     void                     *data;
-
-#if 0
-    /*
-     * Although pointer to a current fiber should be a property of
-     * engine->fibers, its placement here eliminates 2 memory accesses.
-     */
-    nxt_fiber_t              *fiber;
-#endif
 
     nxt_random_t             random;
 };

@@ -16,6 +16,8 @@
 #include <nxt_unit_request.h>
 #include <nxt_http.h>
 
+#include NXT_PHP_MOUNTS_H
+
 
 #if (PHP_VERSION_ID >= 50400)
 #define NXT_HAVE_PHP_IGNORE_CWD 1
@@ -61,8 +63,7 @@ typedef struct {
     nxt_str_t                script_filename;
     nxt_str_t                script_dirname;
     nxt_unit_request_info_t  *req;
-
-    uint8_t                  chdir;  /* 1 bit */
+    uint8_t                  static_script;  /* 1 bit */
 } nxt_php_run_ctx_t;
 
 
@@ -74,24 +75,11 @@ typedef int (*nxt_php_disable_t)(char *p, size_t size);
 typedef int (*nxt_php_disable_t)(char *p, uint TSRMLS_DC);
 #endif
 
-#if (PHP_VERSION_ID < 70200)
-typedef void (*zif_handler)(INTERNAL_FUNCTION_PARAMETERS);
-#endif
-
 
 static nxt_int_t nxt_php_setup(nxt_task_t *task, nxt_process_t *process,
     nxt_common_app_conf_t *conf);
 static nxt_int_t nxt_php_start(nxt_task_t *task, nxt_process_data_t *data);
 static void nxt_php_cleanup_targets(void);
-#if NXT_PHP_TRUEASYNC
-static nxt_int_t nxt_php_async_load_entrypoint(nxt_task_t *task, nxt_str_t *entrypoint);
-static bool nxt_php_activate_true_async(nxt_task_t *task);
-static void nxt_php_suspend_coroutine(nxt_unit_ctx_t *ctx);
-static int nxt_php_add_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port);
-static void nxt_php_remove_port(nxt_unit_t *unit, nxt_unit_ctx_t *ctx, nxt_unit_port_t *port);
-static void nxt_php_quit_handler(nxt_unit_ctx_t *ctx);
-static void nxt_php_shm_ack_handler(nxt_unit_ctx_t *ctx);
-#endif /* NXT_PHP_TRUEASYNC */
 static nxt_int_t nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     nxt_conf_value_t *conf);
 static nxt_int_t nxt_php_set_ini_path(nxt_task_t *task, nxt_str_t *path,
@@ -109,23 +97,16 @@ static void nxt_php_disable(nxt_task_t *task, const char *type,
 #endif
 
 static nxt_int_t nxt_php_dirname(const nxt_str_t *file, nxt_str_t *dir);
-static void nxt_php_str_trim_trail(nxt_str_t *str, u_char t);
-static void nxt_php_str_trim_lead(nxt_str_t *str, u_char t);
+static nxt_bool_t nxt_php_path_is_under(const nxt_str_t *root,
+    const nxt_str_t *path);
 nxt_inline u_char *nxt_realpath(const void *c);
 
 static nxt_int_t nxt_php_do_301(nxt_unit_request_info_t *req);
 static nxt_int_t nxt_php_handle_fs_err(nxt_unit_request_info_t *req);
 
 static void nxt_php_request_handler(nxt_unit_request_info_t *req);
-#if NXT_PHP_TRUEASYNC
-static void nxt_php_request_handler_async(nxt_unit_request_info_t *req);
-#endif /* NXT_PHP_TRUEASYNC */
 static void nxt_php_dynamic_request(nxt_php_run_ctx_t *ctx,
     nxt_unit_request_t *r);
-#if NXT_PHP_TRUEASYNC
-static void nxt_php_scope_init_superglobals(zend_async_scope_t *scope);
-static void nxt_php_scope_populate_superglobals(zend_async_scope_t *scope);
-#endif /* NXT_PHP_TRUEASYNC */
 #if (PHP_VERSION_ID < 70400)
 static void nxt_zend_stream_init_fp(zend_file_handle *handle, FILE *fp,
     const char *filename);
@@ -138,17 +119,17 @@ static int nxt_php_send_headers(sapi_headers_struct *sapi_headers TSRMLS_DC);
 static void *nxt_php_hash_str_find_ptr(const HashTable *ht,
     const nxt_str_t *str);
 static char *nxt_php_read_cookies(TSRMLS_D);
-static void nxt_php_set_sptr(nxt_unit_request_info_t *req, const char *name,
+static void nxt_php_set_sptr(nxt_unit_request_info_t *req, nxt_uint_t var,
     nxt_unit_sptr_t *v, uint32_t len, zval *track_vars_array TSRMLS_DC);
-nxt_inline void nxt_php_set_str(nxt_unit_request_info_t *req, const char *name,
+static void nxt_php_set_field(nxt_unit_request_info_t *req, const char *name,
+    nxt_unit_sptr_t *v, uint32_t len, zval *track_vars_array TSRMLS_DC);
+nxt_inline void nxt_php_set_str(nxt_unit_request_info_t *req, nxt_uint_t var,
     nxt_str_t *s, zval *track_vars_array TSRMLS_DC);
-static void nxt_php_set_cstr(nxt_unit_request_info_t *req, const char *name,
+static void nxt_php_set_cstr(nxt_unit_request_info_t *req, nxt_uint_t var,
     const char *str, uint32_t len, zval *track_vars_array TSRMLS_DC);
+nxt_inline void nxt_php_register(nxt_uint_t var, const char *str, size_t len,
+    zval *track_vars_array TSRMLS_DC);
 void nxt_php_register_variables(zval *track_vars_array TSRMLS_DC);
-#if NXT_PHP_TRUEASYNC
-static void nxt_php_register_variables_async(nxt_unit_request_info_t *req,
-    nxt_php_run_ctx_t *ctx, zval *track_vars_array TSRMLS_DC);
-#endif /* NXT_PHP_TRUEASYNC */
 #if NXT_PHP8
 static void nxt_php_log_message(const char *message, int syslog_type_int);
 #else
@@ -167,6 +148,7 @@ static size_t nxt_php_read_post(char *buffer, size_t count_bytes TSRMLS_DC);
 static int nxt_php_unbuffered_write(const char *str, uint str_length TSRMLS_DC);
 static int nxt_php_read_post(char *buffer, uint count_bytes TSRMLS_DC);
 #endif
+static void nxt_php_flush(void *server_context);
 
 
 #ifdef NXT_PHP7
@@ -184,24 +166,115 @@ ZEND_END_ARG_INFO()
 
 ZEND_FUNCTION(fastcgi_finish_request);
 
-PHP_MINIT_FUNCTION(nxt_php_ext);
-ZEND_NAMED_FUNCTION(nxt_php_chdir);
-
 /* PHP extension functions */
 static const zend_function_entry  nxt_php_ext_functions[] = {
     ZEND_FE(fastcgi_finish_request, arginfo_fastcgi_finish_request)
     ZEND_FE_END
 };
 
-zif_handler       nxt_php_chdir_handler;
 zend_auto_global  *nxt_php_server_ag;
+
+
+/* The $_SERVER entries with a fixed name. */
+enum {
+    NXT_PHP_SERVER_SOFTWARE = 0,
+    NXT_PHP_SERVER_PROTOCOL,
+    NXT_PHP_PHP_SELF,
+    NXT_PHP_PATH_INFO,
+    NXT_PHP_SCRIPT_NAME,
+    NXT_PHP_SCRIPT_FILENAME,
+    NXT_PHP_DOCUMENT_ROOT,
+    NXT_PHP_REQUEST_METHOD,
+    NXT_PHP_REQUEST_URI,
+    NXT_PHP_QUERY_STRING,
+    NXT_PHP_REMOTE_ADDR,
+    NXT_PHP_SERVER_ADDR,
+    NXT_PHP_SERVER_NAME,
+    NXT_PHP_SERVER_PORT,
+    NXT_PHP_HTTPS,
+    NXT_PHP_CONTENT_LENGTH,
+    NXT_PHP_CONTENT_TYPE,
+    NXT_PHP_SERVER_NVARS,
+};
+
+
+static const nxt_str_t  nxt_php_server_names[NXT_PHP_SERVER_NVARS] = {
+    [NXT_PHP_SERVER_SOFTWARE] = nxt_string("SERVER_SOFTWARE"),
+    [NXT_PHP_SERVER_PROTOCOL] = nxt_string("SERVER_PROTOCOL"),
+    [NXT_PHP_PHP_SELF] = nxt_string("PHP_SELF"),
+    [NXT_PHP_PATH_INFO] = nxt_string("PATH_INFO"),
+    [NXT_PHP_SCRIPT_NAME] = nxt_string("SCRIPT_NAME"),
+    [NXT_PHP_SCRIPT_FILENAME] = nxt_string("SCRIPT_FILENAME"),
+    [NXT_PHP_DOCUMENT_ROOT] = nxt_string("DOCUMENT_ROOT"),
+    [NXT_PHP_REQUEST_METHOD] = nxt_string("REQUEST_METHOD"),
+    [NXT_PHP_REQUEST_URI] = nxt_string("REQUEST_URI"),
+    [NXT_PHP_QUERY_STRING] = nxt_string("QUERY_STRING"),
+    [NXT_PHP_REMOTE_ADDR] = nxt_string("REMOTE_ADDR"),
+    [NXT_PHP_SERVER_ADDR] = nxt_string("SERVER_ADDR"),
+    [NXT_PHP_SERVER_NAME] = nxt_string("SERVER_NAME"),
+    [NXT_PHP_SERVER_PORT] = nxt_string("SERVER_PORT"),
+    [NXT_PHP_HTTPS] = nxt_string("HTTPS"),
+    [NXT_PHP_CONTENT_LENGTH] = nxt_string("CONTENT_LENGTH"),
+    [NXT_PHP_CONTENT_TYPE] = nxt_string("CONTENT_TYPE"),
+};
+
+
+#if NXT_PHP8
+
+/*
+ * The fixed names and the two fixed values are interned in MINIT.  An
+ * entry that this module registers itself then needs no copy, scan, hash
+ * or free of its name.  With the filter extension, that is SERVER_SOFTWARE,
+ * PHP_SELF, PATH_INFO, SCRIPT_NAME, SCRIPT_FILENAME, DOCUMENT_ROOT and
+ * HTTPS; the filter registers the other entries itself.  Interned strings
+ * are immutable: a script that writes to such an entry replaces the value
+ * in its own $_SERVER and does not change the shared string.
+ */
+static zend_string  *nxt_php_server_keys[NXT_PHP_SERVER_NVARS];
+static zend_string  *nxt_php_server_software;
+static zend_string  *nxt_php_https_on;
+
+/*
+ * A bound for the $_SERVER size hint.  The field count comes from the
+ * router; the hint must not depend on it without a limit.
+ */
+#define NXT_PHP_SERVER_FIELDS_HINT  512
+
+
+static PHP_MINIT_FUNCTION(unit)
+{
+    nxt_uint_t       i;
+    const nxt_str_t  *name;
+
+    for (i = 0; i < NXT_PHP_SERVER_NVARS; i++) {
+        name = &nxt_php_server_names[i];
+
+        nxt_php_server_keys[i] = zend_string_init_interned(
+                                     (const char *) name->start,
+                                     name->length, 1);
+    }
+
+    nxt_php_server_software = zend_string_init_interned(
+                                  (const char *) nxt_server.start,
+                                  nxt_server.length, 1);
+
+    nxt_php_https_on = zend_string_init_interned("on", nxt_length("on"), 1);
+
+    return SUCCESS;
+}
+
+#endif
 
 
 static zend_module_entry  nxt_php_unit_module = {
     STANDARD_MODULE_HEADER,
     "unit",
     nxt_php_ext_functions,       /* function table */
-    PHP_MINIT(nxt_php_ext),      /* initialization */
+#if NXT_PHP8
+    PHP_MINIT(unit),             /* initialization */
+#else
+    NULL,                        /* initialization */
+#endif
     NULL,                        /* shutdown */
     NULL,                        /* request initialization */
     NULL,                        /* request shutdown */
@@ -209,45 +282,6 @@ static zend_module_entry  nxt_php_unit_module = {
     NXT_VERSION,
     STANDARD_MODULE_PROPERTIES
 };
-
-
-PHP_MINIT_FUNCTION(nxt_php_ext)
-{
-    zend_function    *func;
-
-    static const nxt_str_t  chdir = nxt_string("chdir");
-
-    func = nxt_php_hash_str_find_ptr(CG(function_table), &chdir);
-    if (nxt_slow_path(func == NULL)) {
-        return FAILURE;
-    }
-
-    nxt_php_chdir_handler = func->internal_function.handler;
-    func->internal_function.handler = nxt_php_chdir;
-
-#if NXT_PHP_TRUEASYNC
-    /* Register NginxUnit PHP extension classes (TrueAsync only) */
-    if (nxt_php_extension_init() != NXT_OK) {
-        return FAILURE;
-    }
-#endif /* NXT_PHP_TRUEASYNC */
-
-    return SUCCESS;
-}
-
-
-ZEND_NAMED_FUNCTION(nxt_php_chdir)
-{
-    nxt_php_run_ctx_t  *ctx;
-
-    ctx = SG(server_context);
-
-    if (nxt_fast_path(ctx != NULL)) {
-        ctx->chdir = 1;
-    }
-
-    nxt_php_chdir_handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
-}
 
 
 PHP_FUNCTION(fastcgi_finish_request)
@@ -292,7 +326,16 @@ PHP_FUNCTION(fastcgi_finish_request)
 #endif
     }
 
-    nxt_unit_request_done(ctx->req, NXT_UNIT_OK);
+    /*
+     * Detached, not plain done: the script keeps running after this returns.
+     * Without telling the router that, the worker is counted idle from here
+     * -- its slot goes back to "processes": {"max"} and its idle timer can
+     * reap a process that is still executing.  libunit reports the work
+     * finished by itself when this request handler returns, which covers the
+     * exit() and fatal paths as well as an ordinary return.
+     */
+
+    nxt_unit_request_done_detached(ctx->req, NXT_UNIT_OK);
     ctx->req = NULL;
 
     PG(connection_status) = PHP_CONNECTION_ABORTED;
@@ -322,7 +365,7 @@ static sapi_module_struct  nxt_php_sapi_module =
     NULL,                        /* deactivate */
 
     nxt_php_unbuffered_write,    /* unbuffered write */
-    NULL,                        /* flush */
+    nxt_php_flush,               /* flush */
     NULL,                        /* get uid */
     NULL,                        /* getenv */
 
@@ -384,8 +427,8 @@ NXT_EXPORT nxt_app_module_t  nxt_app_module = {
     compat,
     nxt_string("php"),
     PHP_VERSION,
-    NULL,
-    0,
+    NXT_PHP_MOUNTS,
+    NXT_PHP_NMOUNTS,
     nxt_php_setup,
     nxt_php_start,
 };
@@ -393,10 +436,8 @@ NXT_EXPORT nxt_app_module_t  nxt_app_module = {
 
 static nxt_php_target_t  *nxt_php_targets;
 static nxt_uint_t        nxt_php_targets_count;
-static nxt_int_t         nxt_php_last_target = -1;
 
-/* Global Unit context - needed by nxt_php_extension.c */
-nxt_unit_ctx_t              *nxt_php_unit_ctx;
+static nxt_unit_ctx_t    *nxt_php_unit_ctx;
 
 #if defined(ZTS) && (PHP_VERSION_ID < 70400)
 static void              ***tsrm_ls;
@@ -415,7 +456,6 @@ nxt_php_setup(nxt_task_t *task, nxt_process_t *process,
     static const nxt_str_t  file_str = nxt_string("file");
     static const nxt_str_t  user_str = nxt_string("user");
     static const nxt_str_t  admin_str = nxt_string("admin");
-
 
     c = &conf->u.php;
 
@@ -487,205 +527,6 @@ nxt_php_setup(nxt_task_t *task, nxt_process_t *process,
 }
 
 
-#if NXT_PHP_TRUEASYNC
-
-/**
- * Add pending write to drain_queue
- */
-nxt_php_pending_write_t *
-nxt_php_drain_queue_add(nxt_unit_ctx_t *ctx,
-                        nxt_unit_request_info_t *req,
-                        zend_string *str,
-                        size_t offset)
-{
-    nxt_php_async_ctx_data_t *async_data = ctx->data;
-    nxt_php_pending_write_t  *pw;
-
-    if (async_data == NULL) {
-        return NULL;
-    }
-
-    pw = malloc(sizeof(nxt_php_pending_write_t));
-    if (pw == NULL) {
-        return NULL;
-    }
-
-    pw->req = req;
-    pw->offset = offset;
-
-    /* Increase refcount - string won't be freed */
-    pw->data = zend_string_copy(str);
-
-    nxt_queue_insert_tail(&async_data->drain_queue, &pw->link);
-
-    return pw;
-}
-
-
-/**
- * Remove and free pending write from drain_queue
- */
-static void
-nxt_php_drain_queue_remove(nxt_php_pending_write_t *pw)
-{
-    nxt_queue_remove(&pw->link);
-
-    /* Decrease refcount - will be freed when refcount reaches 0 */
-    zend_string_release(pw->data);
-
-    free(pw);
-}
-
-
-/**
- * Callback function called when port fd becomes readable
- */
-static void
-nxt_php_port_event_callback(zend_async_event_t *event, zend_async_event_callback_t *callback, void *result, zend_object *exception)
-{
-    nxt_php_port_event_data_t  *event_data;
-
-    /* Get pointer to our extra data using extra_offset */
-    event_data = (nxt_php_port_event_data_t *)((char *)event + event->extra_offset);
-
-    /* Process messages from this port */
-    nxt_unit_process_port_msg(event_data->ctx, event_data->port);
-}
-
-
-/**
- * Callback to add port - called by Unit for each port
- */
-static int
-nxt_php_add_port(nxt_unit_ctx_t *ctx, nxt_unit_port_t *port)
-{
-    zend_async_poll_event_t      *poll_event;
-    nxt_php_port_event_data_t    *event_data;
-
-    nxt_php_unit_ctx = ctx;
-
-    /* Skip ports without input fd */
-    if (port->in_fd == -1) {
-        return NXT_UNIT_OK;
-    }
-
-    /* Set port to non-blocking mode */
-    if (fcntl(port->in_fd, F_SETFL, O_NONBLOCK) == -1) {
-        nxt_unit_warn(ctx, "fcntl(%d, O_NONBLOCK) failed: %s (%d)",
-                      port->in_fd, strerror(errno), errno);
-        return NXT_UNIT_ERROR;
-    }
-
-    /* Create TrueAsync poll event with extra space for our data */
-    poll_event = ZEND_ASYNC_NEW_POLL_EVENT_EX(
-        port->in_fd, false, ASYNC_READABLE, sizeof(nxt_php_port_event_data_t)
-    );
-
-    if (poll_event == NULL) {
-        nxt_unit_alert(ctx, "Failed to create TrueAsync poll event for port fd=%d", port->in_fd);
-        return NXT_UNIT_ERROR;
-    }
-
-    /* Get pointer to our extra data */
-    event_data = (nxt_php_port_event_data_t *)((char *)poll_event + poll_event->base.extra_offset);
-    event_data->ctx = ctx;
-    event_data->port = port;
-
-    /* Register callback with poll event */
-    if (!poll_event->base.add_callback(&poll_event->base, ZEND_ASYNC_EVENT_CALLBACK(nxt_php_port_event_callback))) {
-        nxt_unit_alert(ctx, "Failed to add callback for port fd=%d", port->in_fd);
-        poll_event->base.dispose(&poll_event->base);
-        return NXT_UNIT_ERROR;
-    }
-
-    /* Start polling */
-    if (!poll_event->base.start(&poll_event->base)) {
-        nxt_unit_alert(ctx, "Failed to start polling for port fd=%d", port->in_fd);
-        poll_event->base.dispose(&poll_event->base);
-        return NXT_UNIT_ERROR;
-    }
-
-    /* Save poll_event in port->data for cleanup */
-    port->data = poll_event;
-
-    return NXT_UNIT_OK;
-}
-
-
-/**
- * Callback to remove port
- */
-static void
-nxt_php_remove_port(nxt_unit_t *unit, nxt_unit_ctx_t *ctx, nxt_unit_port_t *port)
-{
-    zend_async_poll_event_t  *poll_event;
-
-    if (port->data != NULL) {
-        poll_event = (zend_async_poll_event_t *) port->data;
-
-        /* Dispose using TrueAsync cleanup */
-        poll_event->base.dispose(&poll_event->base);
-
-        port->data = NULL;
-    }
-}
-
-
-/**
- * SHM ACK handler - called when Router releases shared memory
- */
-static void
-nxt_php_shm_ack_handler(nxt_unit_ctx_t *ctx)
-{
-    nxt_php_async_ctx_data_t *async_data = ctx->data;
-    nxt_queue_link_t         *lnk;
-    nxt_php_pending_write_t  *pw;
-    ssize_t                  res;
-    size_t                   remaining;
-
-    if (async_data == NULL) {
-        return;
-    }
-
-    /* Process all pending writes in drain_queue */
-    lnk = nxt_queue_first(&async_data->drain_queue);
-
-    while (lnk != nxt_queue_tail(&async_data->drain_queue)) {
-        pw = nxt_container_of(lnk, nxt_php_pending_write_t, link);
-        lnk = nxt_queue_next(lnk);  /* Save next element before potential removal */
-
-        remaining = ZSTR_LEN(pw->data) - pw->offset;
-
-        /* Try to send remaining data */
-        res = nxt_unit_response_write_nb(pw->req,
-                                         ZSTR_VAL(pw->data) + pw->offset,
-                                         remaining,
-                                         0);
-
-        if (res < 0) {
-            /* Error - remove from queue */
-            nxt_unit_warn(ctx, "drain_queue: write error, removing pending write");
-            nxt_php_drain_queue_remove(pw);
-            continue;
-        }
-
-        if (res == 0) {
-            /* Still no space - stop processing */
-            return;
-        }
-
-        pw->offset += res;
-
-        if (pw->offset >= ZSTR_LEN(pw->data)) {
-            /* ALL SENT! Remove from queue */
-            nxt_php_drain_queue_remove(pw);
-        }
-    }
-}
-
-#endif /* NXT_PHP_TRUEASYNC */
-
-
 static nxt_int_t
 nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
 {
@@ -698,7 +539,6 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
     nxt_conf_value_t       *value;
     nxt_php_app_conf_t     *c;
     nxt_common_app_conf_t  *conf;
-
 
     conf = data->app;
     c = &conf->u.php;
@@ -723,88 +563,33 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
 
             ret = nxt_php_set_target(task, &nxt_php_targets[n], value);
             if (nxt_slow_path(ret != NXT_OK)) {
-                return NXT_ERROR;
+                goto fail;
             }
         }
 
     } else {
         ret = nxt_php_set_target(task, &nxt_php_targets[0], conf->self);
         if (nxt_slow_path(ret != NXT_OK)) {
-            return NXT_ERROR;
+            goto fail;
         }
     }
 
     ret = nxt_unit_default_init(task, &php_init, conf);
     if (nxt_slow_path(ret != NXT_OK)) {
         nxt_alert(task, "nxt_unit_default_init() failed");
-        return ret;
+        goto fail;
     }
 
-    /* Choose request handler based on mode */
-#if NXT_PHP_TRUEASYNC
-    if (c->async && c->entrypoint.length > 0) {
-        nxt_debug(task, "PHP HTTP Server mode enabled with entrypoint: %V", &c->entrypoint);
-        php_init.callbacks.add_port = nxt_php_add_port;
-        php_init.callbacks.remove_port = nxt_php_remove_port;
-        php_init.callbacks.request_handler = nxt_php_request_handler_async;
-        php_init.callbacks.quit = nxt_php_quit_handler;
-        php_init.callbacks.shm_ack_handler = nxt_php_shm_ack_handler;
-
-        if (nxt_slow_path(nxt_php_async_load_entrypoint(task, &c->entrypoint) != NXT_OK)) {
-            nxt_alert(task, "failed to load entrypoint script");
-            return NXT_ERROR;
-        }
-
-        if (nxt_php_request_callback == NULL) {
-            nxt_alert(task, "TrueAsync: Request callback not registered in the entrypoint script!");
-            return NXT_ERROR;
-        }
-
-        if(nxt_slow_path(!nxt_php_activate_true_async(task))) {
-            return NXT_ERROR;
-        }
-    } else {
-#endif /* NXT_PHP_TRUEASYNC */
-        nxt_debug(task, "PHP standard mode");
-        php_init.callbacks.request_handler = nxt_php_request_handler;
-#if NXT_PHP_TRUEASYNC
-    }
-#endif /* NXT_PHP_TRUEASYNC */
+    php_init.callbacks.request_handler = nxt_php_request_handler;
 
     unit_ctx = nxt_unit_init(&php_init);
     if (nxt_slow_path(unit_ctx == NULL)) {
-        return NXT_ERROR;
+        goto fail;
     }
 
     nxt_php_unit_ctx = unit_ctx;
 
-#if NXT_PHP_TRUEASYNC
-    /* Initialize async context data for drain_queue */
-    if (c->async && c->entrypoint.length > 0) {
-        nxt_php_async_ctx_data_t *async_data;
-
-        async_data = malloc(sizeof(nxt_php_async_ctx_data_t));
-        if (async_data == NULL) {
-            nxt_alert(task, "Failed to allocate async context data");
-            nxt_unit_done(unit_ctx);
-            return NXT_ERROR;
-        }
-
-        nxt_queue_init(&async_data->drain_queue);
-        async_data->ctx = unit_ctx;
-
-        unit_ctx->data = async_data;
-    }
-
-    if (c->async && c->entrypoint.length > 0) {
-        /* Suspend main coroutine until the server continues to operate successfully */
-        nxt_php_suspend_coroutine(nxt_php_unit_ctx);
-    } else {
-        nxt_unit_run(nxt_php_unit_ctx);
-    }
-#else
     nxt_unit_run(nxt_php_unit_ctx);
-#endif /* NXT_PHP_TRUEASYNC */
     nxt_unit_done(nxt_php_unit_ctx);
 
     /* Clean up allocated memory before exit */
@@ -813,6 +598,12 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
     exit(0);
 
     return NXT_OK;
+
+fail:
+
+    nxt_php_cleanup_targets();
+
+    return NXT_ERROR;
 }
 
 
@@ -831,7 +622,6 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     static const nxt_str_t  root_str = nxt_string("root");
     static const nxt_str_t  script_str = nxt_string("script");
     static const nxt_str_t  index_str = nxt_string("index");
-    static const nxt_str_t  entrypoint_str = nxt_string("entrypoint");
 
     value = nxt_conf_get_object_member(conf, &root_str, NULL);
 
@@ -850,6 +640,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     p = nxt_realpath(tmp);
     if (nxt_slow_path(p == NULL)) {
         nxt_alert(task, "root realpath(%s) failed %E", tmp, nxt_errno);
+        nxt_free(tmp);
         return NXT_ERROR;
     }
 
@@ -858,18 +649,27 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     target->root.length = nxt_strlen(p);
     target->root.start = p;
 
-    nxt_php_str_trim_trail(&target->root, '/');
+    while (target->root.length > 0
+           && target->root.start[target->root.length - 1] == '/')
+    {
+        target->root.length--;
+    }
+
+    target->root.start[target->root.length] = '\0';
 
     value = nxt_conf_get_object_member(conf, &script_str, NULL);
 
     if (value != NULL) {
         nxt_conf_get_string(value, &str);
 
-        nxt_php_str_trim_lead(&str, '/');
+        while (str.length > 0 && str.start[0] == '/') {
+            str.length--;
+            str.start++;
+        }
 
         tmp = nxt_malloc(target->root.length + 1 + str.length + 1);
         if (nxt_slow_path(tmp == NULL)) {
-            return NXT_ERROR;
+            goto fail;
         }
 
         p = tmp;
@@ -884,7 +684,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
         if (nxt_slow_path(p == NULL)) {
             nxt_alert(task, "script realpath(%s) failed %E", tmp, nxt_errno);
             nxt_free(tmp);
-            return NXT_ERROR;
+            goto fail;
         }
 
         nxt_free(tmp);
@@ -892,19 +692,20 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
         target->script_filename.length = nxt_strlen(p);
         target->script_filename.start = p;
 
-        if (!nxt_str_start(&target->script_filename,
-                           target->root.start, target->root.length))
-        {
+        if (!nxt_php_path_is_under(&target->root, &target->script_filename)) {
             nxt_alert(task, "script is not under php root");
             nxt_free(p);
-            return NXT_ERROR;
+            nxt_str_null(&target->script_filename);
+            goto fail;
         }
 
         ret = nxt_php_dirname(&target->script_filename,
                               &target->script_dirname);
         if (nxt_slow_path(ret != NXT_OK)) {
             nxt_free(target->script_filename.start);
-            return NXT_ERROR;
+            nxt_str_null(&target->script_filename);
+            nxt_str_null(&target->script_dirname);
+            goto fail;
         }
 
         target->script_name.length = target->script_filename.length
@@ -913,74 +714,6 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
                                     + target->root.length;
 
     } else {
-        /* Check for entrypoint (async mode) */
-        value = nxt_conf_get_object_member(conf, &entrypoint_str, NULL);
-
-        if (value != NULL) {
-            nxt_conf_get_string(value, &str);
-
-            /* Check if entrypoint is an absolute path */
-            if (str.length > 0 && str.start[0] == '/') {
-                /* Absolute path - use it directly */
-                tmp = nxt_malloc(str.length + 1);
-                if (nxt_slow_path(tmp == NULL)) {
-                    return NXT_ERROR;
-                }
-
-                nxt_memcpy(tmp, str.start, str.length);
-                tmp[str.length] = '\0';
-
-            } else {
-                /* Relative path - prepend root */
-                nxt_php_str_trim_lead(&str, '/');
-
-                tmp = nxt_malloc(target->root.length + 1 + str.length + 1);
-                if (nxt_slow_path(tmp == NULL)) {
-                    return NXT_ERROR;
-                }
-
-                p = tmp;
-
-                p = nxt_cpymem(p, target->root.start, target->root.length);
-                *p++ = '/';
-
-                p = nxt_cpymem(p, str.start, str.length);
-                *p = '\0';
-            }
-
-            p = nxt_realpath(tmp);
-            if (nxt_slow_path(p == NULL)) {
-                nxt_alert(task, "entrypoint realpath(%s) failed %E", tmp, nxt_errno);
-                nxt_free(tmp);
-                return NXT_ERROR;
-            }
-
-            nxt_free(tmp);
-
-            target->script_filename.length = nxt_strlen(p);
-            target->script_filename.start = p;
-
-            if (!nxt_str_start(&target->script_filename,
-                               target->root.start, target->root.length))
-            {
-                nxt_alert(task, "entrypoint is not under php root");
-                nxt_free(p);
-                return NXT_ERROR;
-            }
-
-            ret = nxt_php_dirname(&target->script_filename,
-                                  &target->script_dirname);
-            if (nxt_slow_path(ret != NXT_OK)) {
-                nxt_free(p);
-                return NXT_ERROR;
-            }
-
-            target->script_name.length = target->script_filename.length
-                                         - target->root.length;
-            target->script_name.start = target->script_filename.start
-                                        + target->root.length;
-        }
-
         value = nxt_conf_get_object_member(conf, &index_str, NULL);
 
         if (value != NULL) {
@@ -988,7 +721,7 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
 
             tmp = nxt_malloc(str.length + 1);
             if (nxt_slow_path(tmp == NULL)) {
-                return NXT_ERROR;
+                goto fail;
             }
 
             nxt_memcpy(tmp, str.start, str.length);
@@ -1004,6 +737,13 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
     }
 
     return NXT_OK;
+
+fail:
+
+    nxt_free(target->root.start);
+    nxt_str_null(&target->root);
+
+    return NXT_ERROR;
 }
 
 
@@ -1317,24 +1057,25 @@ nxt_php_dirname(const nxt_str_t *file, nxt_str_t *dir)
 }
 
 
-static void
-nxt_php_str_trim_trail(nxt_str_t *str, u_char t)
+/*
+ * Checks that "path" names something below "root": "root", then '/', then
+ * at least one more byte.  A plain prefix test would accept "/srv/app2/x.php"
+ * for the root "/srv/app".  It would also accept the root itself.
+ *
+ * Both paths come from realpath(), so they are absolute and have no "."
+ * or ".." components, no symbolic links and no repeated or trailing '/'.
+ * The root "/" is trimmed to length 0.  Every absolute path except "/"
+ * itself is below that root.
+ */
+
+static nxt_bool_t
+nxt_php_path_is_under(const nxt_str_t *root, const nxt_str_t *path)
 {
-    while (str->length > 0 && str->start[str->length - 1] == t) {
-        str->length--;
-    }
-
-    str->start[str->length] = '\0';
-}
-
-
-static void
-nxt_php_str_trim_lead(nxt_str_t *str, u_char t)
-{
-    while (str->length > 0 && str->start[0] == t) {
-        str->length--;
-        str->start++;
-    }
+    return path->length > root->length
+           && path->length - root->length >= 2
+           && path->start[root->length] == '/'
+           && (root->length == 0
+               || memcmp(path->start, root->start, root->length) == 0);
 }
 
 
@@ -1407,12 +1148,14 @@ nxt_php_handle_fs_err(nxt_unit_request_info_t *req)
 {
     switch (nxt_errno) {
     case ELOOP:
+    case EPERM:
     case EACCES:
     case ENFILE:
         return nxt_unit_response_init(req, NXT_HTTP_FORBIDDEN, 0, 0);
     case ENOENT:
     case ENOTDIR:
     case ENAMETOOLONG:
+    case EISDIR:
         return nxt_unit_response_init(req, NXT_HTTP_NOT_FOUND, 0, 0);
     }
 
@@ -1423,12 +1166,14 @@ nxt_php_handle_fs_err(nxt_unit_request_info_t *req)
 static void
 nxt_php_request_handler(nxt_unit_request_info_t *req)
 {
+    uint8_t             app_target;
     nxt_php_target_t    *target;
     nxt_php_run_ctx_t   ctx;
     nxt_unit_request_t  *r;
 
     r = req->request;
-    target = &nxt_php_targets[r->app_target];
+    app_target = r->app_target;
+    target = &nxt_php_targets[app_target];
 
     nxt_memzero(&ctx, sizeof(ctx));
 
@@ -1444,12 +1189,9 @@ nxt_php_request_handler(nxt_unit_request_info_t *req)
     ctx.script_filename = target->script_filename;
     ctx.script_dirname = target->script_dirname;
     ctx.script_name = target->script_name;
-
-    ctx.chdir = (r->app_target != nxt_php_last_target);
+    ctx.static_script = 1;
 
     nxt_php_execute(&ctx, r);
-
-    nxt_php_last_target = ctx.chdir ? -1 : r->app_target;
 }
 
 
@@ -1537,8 +1279,6 @@ nxt_php_dynamic_request(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 
     *p = '\0';
 
-    ctx->chdir = 1;
-
     ret = nxt_php_dirname(&ctx->script_filename, &ctx->script_dirname);
     if (nxt_slow_path(ret != NXT_OK)) {
         nxt_unit_request_done(ctx->req, NXT_UNIT_ERROR);
@@ -1551,8 +1291,6 @@ nxt_php_dynamic_request(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 
     nxt_free(ctx->script_filename.start);
     nxt_free(ctx->script_dirname.start);
-
-    nxt_php_last_target = -1;
 }
 
 
@@ -1571,31 +1309,176 @@ nxt_zend_stream_init_fp(zend_file_handle *handle, FILE *fp,
 #endif
 
 
+#if (PHP_VERSION_ID >= 80100)
+static ssize_t
+nxt_php_stream_read(void *handle, char *buf, size_t size)
+{
+    return php_stream_read((php_stream *) handle, buf, size);
+}
+
+
+static void
+nxt_php_stream_close(void *handle)
+{
+    php_stream_close((php_stream *) handle);
+}
+
+
+static size_t
+nxt_php_stream_size(void *handle)
+{
+    php_stream_statbuf  sb;
+
+    if (php_stream_stat((php_stream *) handle, &sb) == 0) {
+        return sb.sb.st_size;
+    }
+
+    return 0;
+}
+
+
+static zend_result
+nxt_php_stream_open(zend_file_handle *handle)
+{
+    int                 ret;
+    php_stream          *stream;
+    zend_string         *opened_path;
+    php_stream_statbuf  sb;
+
+    opened_path = handle->filename;
+
+    /*
+     * The 'n' mode sets O_NONBLOCK in PHP's plain-file wrapper.  The path
+     * may have become a FIFO since stat(), so classify the opened object
+     * here rather than relying on the earlier path lookup.
+     */
+    stream = php_stream_open_wrapper(ZSTR_VAL(handle->filename), "rbn",
+                                     USE_PATH | REPORT_ERRORS
+                                     | STREAM_OPEN_FOR_ZEND_STREAM,
+                                     &opened_path);
+    if (stream == NULL) {
+        return FAILURE;
+    }
+
+    ret = php_stream_stat(stream, &sb);
+    if (ret != 0 || !S_ISREG(sb.sb.st_mode)) {
+        int  save_errno;
+
+        /* All non-regular script types use the 404 mapping. */
+        save_errno = (ret == 0) ? EISDIR : errno;
+        php_stream_close(stream);
+        if (opened_path != NULL) {
+            zend_string_release(opened_path);
+        }
+        errno = save_errno;
+
+        return FAILURE;
+    }
+
+    handle->type = ZEND_HANDLE_STREAM;
+    handle->opened_path = opened_path;
+    handle->handle.stream.handle = stream;
+    handle->handle.stream.reader = nxt_php_stream_read;
+    handle->handle.stream.closer = nxt_php_stream_close;
+    handle->handle.stream.fsizer = nxt_php_stream_size;
+    handle->handle.stream.isatty = 0;
+    php_stream_auto_cleanup(stream);
+    php_stream_set_option(stream, PHP_STREAM_OPTION_READ_BUFFER,
+                          PHP_STREAM_BUFFER_NONE, NULL);
+
+    return SUCCESS;
+}
+#endif
+
+
 static void
 nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 {
+#if (PHP_VERSION_ID < 80100)
+    int               fd, ret;
     FILE              *fp;
+#endif
 #if (PHP_VERSION_ID < 50600)
     void              *read_post;
+#endif
+#if (PHP_VERSION_ID >= 80100)
+    int               display_errors;
+    zend_result       open_ret;
 #endif
     const char        *filename;
     nxt_unit_field_t  *f;
     zend_file_handle  file_handle;
+    struct stat       sb;
 
     filename = (const char *) ctx->script_filename.start;
 
     nxt_unit_req_debug(ctx->req, "PHP execute script %s", filename);
 
-    fp = fopen(filename, "re");
-    if (fp == NULL) {
-        nxt_int_t  ec;
+    /*
+     * A dynamic target's path comes from the request.  Its errors are
+     * preserved here, before PHP's virtual-CWD resolver changes errno, so an
+     * overlong path gets 404.  A fixed "script" target was resolved with
+     * realpath() when the configuration was loaded, so its path cannot be
+     * overlong, and the nonblocking open below with its descriptor check
+     * answers everything this stat() would: 404 for a missing script, a
+     * directory or a FIFO, and 403 for one that cannot be read.  The stat()
+     * is skipped for it; the open is not, so the file still governs what
+     * runs, whatever OPcache holds.
+     */
+    if (!ctx->static_script) {
+        if (nxt_slow_path(stat(filename, &sb) != 0)) {
+            nxt_int_t  ec;
 
-        nxt_unit_req_debug(ctx->req, "PHP fopen(\"%s\") failed", filename);
+            ec = nxt_php_handle_fs_err(ctx->req);
+            nxt_unit_request_done(ctx->req, ec);
+
+            return;
+        }
+
+        if (nxt_slow_path(!S_ISREG(sb.st_mode))) {
+            nxt_int_t  ec;
+
+            ec = nxt_unit_response_init(ctx->req, NXT_HTTP_NOT_FOUND, 0, 0);
+            nxt_unit_request_done(ctx->req, ec);
+
+            return;
+        }
+    }
+
+#if (PHP_VERSION_ID < 80100)
+    fd = open(filename, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd == -1) {
+        nxt_int_t  ec;
 
         ec = nxt_php_handle_fs_err(ctx->req);
         nxt_unit_request_done(ctx->req, ec);
+
         return;
     }
+
+    ret = fstat(fd, &sb);
+    if (ret != 0 || !S_ISREG(sb.st_mode)) {
+        nxt_int_t  ec;
+        int        save_errno;
+
+        /* All non-regular script types use the 404 mapping. */
+        save_errno = (ret == 0) ? EISDIR : errno;
+        close(fd);
+        errno = save_errno;
+        ec = nxt_php_handle_fs_err(ctx->req);
+        nxt_unit_request_done(ctx->req, ec);
+
+        return;
+    }
+
+    fp = fdopen(fd, "r");
+    if (fp == NULL) {
+        close(fd);
+        nxt_unit_request_done(ctx->req, NXT_UNIT_ERROR);
+
+        return;
+    }
+#endif
 
     SG(server_context) = ctx;
     SG(options) |= SAPI_OPTION_NO_CHDIR;
@@ -1612,6 +1495,9 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
         f = r->fields + r->content_type_field;
 
         SG(request_info).content_type = nxt_unit_sptr_get(&f->value);
+
+    } else {
+        SG(request_info).content_type = NULL;
     }
 
     if (r->cookie_field != NXT_UNIT_NONE_FIELD) {
@@ -1639,6 +1525,19 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 
     SG(request_info).path_translated = NULL;
 
+#if (PHP_VERSION_ID >= 80100)
+    /*
+     * Output from a request-startup handler would send the headers with the
+     * 200 that SG(sapi_headers).http_response_code holds now, before the open
+     * below can answer.  Its diagnostics are off for the startup and for the
+     * open; log_errors still records them and the body stays the
+     * application's.  The value comes back after the open, before the script
+     * runs.
+     */
+    display_errors = PG(display_errors);
+    PG(display_errors) = 0;
+#endif
+
 #ifdef NXT_PHP7
     if (nxt_slow_path(php_request_startup() == FAILURE)) {
 #else
@@ -1646,23 +1545,93 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
 #endif
         nxt_unit_req_debug(ctx->req, "php_request_startup() failed");
 
+#if (PHP_VERSION_ID >= 80100)
+        PG(display_errors) = display_errors;
+#endif
         nxt_unit_request_done(ctx->req, NXT_UNIT_ERROR);
+#if (PHP_VERSION_ID < 80100)
         fclose(fp);
+#endif
 
         return;
     }
 
-    if (ctx->chdir) {
-        ctx->chdir = 0;
-        nxt_php_vcwd_chdir(ctx->req, ctx->script_dirname.start);
-    }
+    /*
+     * The script path of a "script" target was resolved when the
+     * configuration was loaded, and a directory on it can be renamed or
+     * replaced while the process runs.  A script can also call chdir().
+     * So the working directory is set on every request.  It is set before
+     * the open below, so a relative "open_basedir" entry resolves against
+     * the directory of the script being requested, not against the one the
+     * previous request left.
+     */
+    nxt_php_vcwd_chdir(ctx->req, ctx->script_dirname.start);
 
+#if (PHP_VERSION_ID >= 80100)
+    /*
+     * The script is opened once, here, and php_execute_script() runs the
+     * stream this open produced.  Its nonblocking open and descriptor check
+     * also cover a file replaced after the preliminary stat().
+     * PHP's stream layer applies "open_basedir" and its diagnostics are off
+     * for the open, so a refusal is a status from here and not a warning in
+     * the body.
+     */
+    zend_stream_init_filename(&file_handle, filename);
+
+    errno = 0;
+    open_ret = nxt_php_stream_open(&file_handle);
+
+    PG(display_errors) = display_errors;
+
+    if (nxt_slow_path(open_ret == FAILURE)) {
+        int  status;
+
+        switch (errno) {
+        case EACCES:
+        case EPERM:
+        case ELOOP:
+        case ENFILE:
+            status = NXT_HTTP_FORBIDDEN;
+            break;
+        case ENOENT:
+        case ENOTDIR:
+        case ENAMETOOLONG:
+        case EISDIR:
+            status = NXT_HTTP_NOT_FOUND;
+            break;
+        default:
+            status = NXT_HTTP_INTERNAL_SERVER_ERROR;
+            break;
+        }
+
+        nxt_unit_req_debug(ctx->req,
+                           "PHP script \"%s\" cannot be opened (%d: %s)",
+                           filename, errno, strerror(errno));
+
+        SG(sapi_headers).http_response_code = status;
+
+        /*
+         * Nothing writes output on this path, so the status has to be sent
+         * here.  nxt_unit_request_done() would answer its own 200.
+         */
+        (void) sapi_send_headers(TSRMLS_C);
+
+        zend_destroy_file_handle(&file_handle);
+
+        goto shutdown;
+    }
+#endif
+
+#if (PHP_VERSION_ID < 80100)
     nxt_zend_stream_init_fp(&file_handle, fp, filename);
+#endif
 
     php_execute_script(&file_handle TSRMLS_CC);
 
 #if (PHP_VERSION_ID >= 80100)
     zend_destroy_file_handle(&file_handle);
+
+shutdown:
 #endif
 
     /* Prevention of consuming possible unread request body. */
@@ -1719,9 +1688,8 @@ nxt_php_unbuffered_write(const char *str, uint str_length TSRMLS_DC)
 
     ctx = SG(server_context);
 
-    /* During entrypoint execution there's no request context */
+    /* Module startup, opcache.preload included, runs before any request. */
     if (ctx == NULL || ctx->req == NULL) {
-        /* Log output from entrypoint to unit log */
         nxt_unit_log(nxt_php_unit_ctx, NXT_UNIT_LOG_INFO,
                      "PHP output: %.*s", (int)str_length, str);
         return str_length;
@@ -1734,6 +1702,44 @@ nxt_php_unbuffered_write(const char *str, uint str_length TSRMLS_DC)
 
     php_handle_aborted_connection();
     return 0;
+}
+
+
+/*
+ * PHP calls this for flush(), and after each write when implicit_flush is
+ * on.  nxt_php_unbuffered_write() sends each write to the router at once.
+ * Thus only the response header can wait here.  This function does not
+ * empty the output buffers of PHP; ob_flush() does that, as in mod_php.
+ */
+
+static void
+nxt_php_flush(void *server_context)
+{
+    nxt_php_run_ctx_t  *ctx;
+
+    ctx = server_context;
+
+    /*
+     * Module startup has no context.  fastcgi_finish_request() leaves the
+     * context without a request.
+     */
+    if (ctx == NULL || ctx->req == NULL) {
+        return;
+    }
+
+    /*
+     * If the send fails, SG(headers_sent) stays 0.  The next output then
+     * tries again and handles the error, as it does without flush().
+     */
+    if (!SG(headers_sent)) {
+        (void) sapi_send_headers(TSRMLS_C);
+    }
+
+    if (nxt_unit_response_is_init(ctx->req)
+        && !nxt_unit_response_is_sent(ctx->req))
+    {
+        (void) nxt_unit_response_send(ctx->req);
+    }
 }
 
 
@@ -1751,7 +1757,7 @@ nxt_php_send_headers(sapi_headers_struct *sapi_headers TSRMLS_DC)
 
     ctx = SG(server_context);
 
-    /* During entrypoint execution there's no request context */
+    /* Module startup, opcache.preload included, runs before any request. */
     if (ctx == NULL || ctx->req == NULL) {
         return SAPI_HEADER_SENT_SUCCESSFULLY;
     }
@@ -1809,13 +1815,6 @@ nxt_php_send_headers(sapi_headers_struct *sapi_headers TSRMLS_DC)
                                     h->header_len - (value - h->header));
     }
 
-    rc = nxt_unit_response_send(req);
-    if (nxt_slow_path(rc != NXT_UNIT_OK)) {
-        nxt_unit_req_debug(req, "failed to send response");
-
-        return SAPI_HEADER_SEND_FAILED;
-    }
-
     return SAPI_HEADER_SENT_SUCCESSFULLY;
 }
 
@@ -1832,7 +1831,10 @@ nxt_php_read_post(char *buffer, uint count_bytes TSRMLS_DC)
 
     ctx = SG(server_context);
 
-    /* During entrypoint execution there's no request context */
+    /*
+     * fastcgi_finish_request() clears the request while PHP keeps running,
+     * and request_parse_body() can reach this callback afterwards.
+     */
     if (ctx == NULL || ctx->req == NULL) {
         return 0;
     }
@@ -1850,7 +1852,7 @@ nxt_php_read_cookies(TSRMLS_D)
 
     ctx = SG(server_context);
 
-    /* During entrypoint execution there's no request context */
+    /* Module startup runs before any request. */
     if (ctx == NULL) {
         return NULL;
     }
@@ -1865,6 +1867,11 @@ void
 nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
 {
     const char               *name;
+#if NXT_PHP8
+    zval                     value;
+    uint32_t                 size, nfields;
+    HashTable                *ht;
+#endif
     nxt_unit_field_t         *f, *f_end;
     nxt_php_run_ctx_t        *ctx;
     nxt_unit_request_t       *r;
@@ -1872,7 +1879,11 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
 
     ctx = SG(server_context);
 
-    /* During entrypoint execution there's no request context */
+    /*
+     * PHP creates $_SERVER, and with it calls this callback, from script
+     * content rather than from request state, so it can be reached before
+     * the first request.
+     */
     if (ctx == NULL || ctx->req == NULL) {
         return;
     }
@@ -1882,12 +1893,37 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
 
     nxt_unit_req_debug(req, "nxt_php_register_variables");
 
+#if NXT_PHP8
+    if (nxt_slow_path(Z_TYPE_P(track_vars_array) != IS_ARRAY)) {
+        return;
+    }
+
+    ht = Z_ARRVAL_P(track_vars_array);
+
+    /*
+     * PHP creates $_SERVER with 8 slots and doubles it as it fills.  Size
+     * it once for the fixed entries, the header fields, and the five
+     * PHP_AUTH_* and REQUEST_TIME* entries that PHP adds after this callback.
+     */
+    if (HT_FLAGS(ht) & HASH_FLAG_UNINITIALIZED) {
+        nfields = r->fields_count;
+
+        size = NXT_PHP_SERVER_NVARS + 5
+               + nxt_min(nfields, NXT_PHP_SERVER_FIELDS_HINT);
+
+        zend_hash_extend(ht, size, 0);
+    }
+
+    ZVAL_INTERNED_STR(&value, nxt_php_server_software);
+    zend_hash_update(ht, nxt_php_server_keys[NXT_PHP_SERVER_SOFTWARE], &value);
+#else
     php_register_variable_safe((char *) "SERVER_SOFTWARE",
                                (char *) nxt_server.start,
                                nxt_server.length, track_vars_array TSRMLS_CC);
+#endif
 
-    nxt_php_set_sptr(req, "SERVER_PROTOCOL", &r->version, r->version_length,
-                     track_vars_array TSRMLS_CC);
+    nxt_php_set_sptr(req, NXT_PHP_SERVER_PROTOCOL, &r->version,
+                     r->version_length, track_vars_array TSRMLS_CC);
 
     /*
      * 'PHP_SELF'
@@ -1901,14 +1937,14 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
      */
 
     if (ctx->path_info.length != 0) {
-        nxt_php_set_sptr(req, "PHP_SELF", &r->path, r->path_length,
+        nxt_php_set_sptr(req, NXT_PHP_PHP_SELF, &r->path, r->path_length,
                          track_vars_array TSRMLS_CC);
 
-        nxt_php_set_str(req, "PATH_INFO", &ctx->path_info,
+        nxt_php_set_str(req, NXT_PHP_PATH_INFO, &ctx->path_info,
                         track_vars_array TSRMLS_CC);
 
     } else {
-        nxt_php_set_str(req, "PHP_SELF", &ctx->script_name,
+        nxt_php_set_str(req, NXT_PHP_PHP_SELF, &ctx->script_name,
                         track_vars_array TSRMLS_CC);
     }
 
@@ -1919,7 +1955,7 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
      * filename of the current (i.e. included) file.
      */
 
-    nxt_php_set_str(req, "SCRIPT_NAME", &ctx->script_name,
+    nxt_php_set_str(req, NXT_PHP_SCRIPT_NAME, &ctx->script_name,
                     track_vars_array TSRMLS_CC);
 
     /*
@@ -1927,7 +1963,7 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
      * The absolute pathname of the currently executing script.
      */
 
-    nxt_php_set_str(req, "SCRIPT_FILENAME", &ctx->script_filename,
+    nxt_php_set_str(req, NXT_PHP_SCRIPT_FILENAME, &ctx->script_filename,
                     track_vars_array TSRMLS_CC);
 
     /*
@@ -1936,180 +1972,93 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
      * as defined in the server's configuration file.
      */
 
-    nxt_php_set_str(req, "DOCUMENT_ROOT", ctx->root,
+    nxt_php_set_str(req, NXT_PHP_DOCUMENT_ROOT, ctx->root,
                     track_vars_array TSRMLS_CC);
 
-    nxt_php_set_sptr(req, "REQUEST_METHOD", &r->method, r->method_length,
+    nxt_php_set_sptr(req, NXT_PHP_REQUEST_METHOD, &r->method, r->method_length,
                      track_vars_array TSRMLS_CC);
-    nxt_php_set_sptr(req, "REQUEST_URI", &r->target, r->target_length,
+    nxt_php_set_sptr(req, NXT_PHP_REQUEST_URI, &r->target, r->target_length,
                      track_vars_array TSRMLS_CC);
-    nxt_php_set_sptr(req, "QUERY_STRING", &r->query, r->query_length,
-                     track_vars_array TSRMLS_CC);
-
-    nxt_php_set_sptr(req, "REMOTE_ADDR", &r->remote, r->remote_length,
-                     track_vars_array TSRMLS_CC);
-    nxt_php_set_sptr(req, "SERVER_ADDR", &r->local_addr, r->local_addr_length,
+    nxt_php_set_sptr(req, NXT_PHP_QUERY_STRING, &r->query, r->query_length,
                      track_vars_array TSRMLS_CC);
 
-    nxt_php_set_sptr(req, "SERVER_NAME", &r->server_name, r->server_name_length,
+    nxt_php_set_sptr(req, NXT_PHP_REMOTE_ADDR, &r->remote, r->remote_length,
                      track_vars_array TSRMLS_CC);
-    nxt_php_set_sptr(req, "SERVER_PORT", &r->local_port, r->local_port_length,
-                     track_vars_array TSRMLS_CC);
+    nxt_php_set_sptr(req, NXT_PHP_SERVER_ADDR, &r->local_addr,
+                     r->local_addr_length, track_vars_array TSRMLS_CC);
+
+    nxt_php_set_sptr(req, NXT_PHP_SERVER_NAME, &r->server_name,
+                     r->server_name_length, track_vars_array TSRMLS_CC);
+    nxt_php_set_sptr(req, NXT_PHP_SERVER_PORT, &r->local_port,
+                     r->local_port_length, track_vars_array TSRMLS_CC);
 
     if (r->tls) {
-        nxt_php_set_cstr(req, "HTTPS", "on", 2, track_vars_array TSRMLS_CC);
+#if NXT_PHP8
+        nxt_unit_req_debug(req, "php: register HTTPS='on'");
+
+        ZVAL_INTERNED_STR(&value, nxt_php_https_on);
+        zend_hash_update(ht, nxt_php_server_keys[NXT_PHP_HTTPS], &value);
+#else
+        nxt_php_set_cstr(req, NXT_PHP_HTTPS, "on", 2,
+                         track_vars_array TSRMLS_CC);
+#endif
     }
 
     f_end = r->fields + r->fields_count;
     for (f = r->fields; f < f_end; f++) {
         name = nxt_unit_sptr_get(&f->name);
 
-        nxt_php_set_sptr(req, name, &f->value, f->value_length,
-                         track_vars_array TSRMLS_CC);
+        nxt_php_set_field(req, name, &f->value, f->value_length,
+                          track_vars_array TSRMLS_CC);
     }
 
     if (r->content_length_field != NXT_UNIT_NONE_FIELD) {
         f = r->fields + r->content_length_field;
 
-        nxt_php_set_sptr(req, "CONTENT_LENGTH", &f->value, f->value_length,
-                         track_vars_array TSRMLS_CC);
+        nxt_php_set_sptr(req, NXT_PHP_CONTENT_LENGTH, &f->value,
+                         f->value_length, track_vars_array TSRMLS_CC);
     }
 
     if (r->content_type_field != NXT_UNIT_NONE_FIELD) {
         f = r->fields + r->content_type_field;
 
-        nxt_php_set_sptr(req, "CONTENT_TYPE", &f->value, f->value_length,
-                         track_vars_array TSRMLS_CC);
+        nxt_php_set_sptr(req, NXT_PHP_CONTENT_TYPE, &f->value,
+                         f->value_length, track_vars_array TSRMLS_CC);
     }
 }
 
 
-#if NXT_PHP_TRUEASYNC
+/*
+ * The input filter decides whether the value is registered here.  The
+ * filter extension registers the value itself and returns 0.
+ */
 
 static void
-nxt_php_register_variables_async(nxt_unit_request_info_t *req,
-    nxt_php_run_ctx_t *ctx, zval *track_vars_array TSRMLS_DC)
+nxt_php_set_sptr(nxt_unit_request_info_t *req, nxt_uint_t var,
+    nxt_unit_sptr_t *v, uint32_t len, zval *track_vars_array TSRMLS_DC)
 {
-    const char               *name;
-    char                     *str;
-    nxt_unit_field_t         *f, *f_end;
-    nxt_unit_request_t       *r;
+    char          *str, *name;
+#if NXT_PHP7
+    size_t        new_len;
+#else
+    unsigned int  new_len;
+#endif
 
-    r = req->request;
+    name = (char *) nxt_php_server_names[var].start;
+    str = nxt_unit_sptr_get(v);
 
-    nxt_unit_req_debug(req, "nxt_php_register_variables_async");
+    nxt_unit_req_debug(req, "php: register %s='%.*s'", name, (int) len, str);
 
-    /* Register SERVER_SOFTWARE */
-    php_register_variable_safe((char *) "SERVER_SOFTWARE",
-                               (char *) nxt_server.start,
-                               nxt_server.length, track_vars_array TSRMLS_CC);
-
-    /* Register SERVER_PROTOCOL */
-    str = nxt_unit_sptr_get(&r->version);
-    php_register_variable_safe((char *) "SERVER_PROTOCOL", str,
-                               r->version_length, track_vars_array TSRMLS_CC);
-
-    /* Register PHP_SELF and PATH_INFO */
-    if (ctx->path_info.length != 0) {
-        str = nxt_unit_sptr_get(&r->path);
-        php_register_variable_safe((char *) "PHP_SELF", str,
-                                   r->path_length, track_vars_array TSRMLS_CC);
-        php_register_variable_safe((char *) "PATH_INFO",
-                                   (char *) ctx->path_info.start,
-                                   ctx->path_info.length, track_vars_array TSRMLS_CC);
-    } else {
-        php_register_variable_safe((char *) "PHP_SELF",
-                                   (char *) ctx->script_name.start,
-                                   ctx->script_name.length, track_vars_array TSRMLS_CC);
-    }
-
-    /* Register SCRIPT_NAME */
-    php_register_variable_safe((char *) "SCRIPT_NAME",
-                               (char *) ctx->script_name.start,
-                               ctx->script_name.length, track_vars_array TSRMLS_CC);
-
-    /* Register SCRIPT_FILENAME */
-    php_register_variable_safe((char *) "SCRIPT_FILENAME",
-                               (char *) ctx->script_filename.start,
-                               ctx->script_filename.length, track_vars_array TSRMLS_CC);
-
-    /* Register DOCUMENT_ROOT */
-    php_register_variable_safe((char *) "DOCUMENT_ROOT",
-                               (char *) ctx->root->start,
-                               ctx->root->length, track_vars_array TSRMLS_CC);
-
-    /* Register REQUEST_METHOD */
-    str = nxt_unit_sptr_get(&r->method);
-    php_register_variable_safe((char *) "REQUEST_METHOD", str,
-                               r->method_length, track_vars_array TSRMLS_CC);
-
-    /* Register REQUEST_URI */
-    str = nxt_unit_sptr_get(&r->target);
-    php_register_variable_safe((char *) "REQUEST_URI", str,
-                               r->target_length, track_vars_array TSRMLS_CC);
-
-    /* Register QUERY_STRING */
-    str = nxt_unit_sptr_get(&r->query);
-    php_register_variable_safe((char *) "QUERY_STRING", str,
-                               r->query_length, track_vars_array TSRMLS_CC);
-
-    /* Register REMOTE_ADDR */
-    str = nxt_unit_sptr_get(&r->remote);
-    php_register_variable_safe((char *) "REMOTE_ADDR", str,
-                               r->remote_length, track_vars_array TSRMLS_CC);
-
-    /* Register SERVER_ADDR */
-    str = nxt_unit_sptr_get(&r->local_addr);
-    php_register_variable_safe((char *) "SERVER_ADDR", str,
-                               r->local_addr_length, track_vars_array TSRMLS_CC);
-
-    /* Register SERVER_NAME */
-    str = nxt_unit_sptr_get(&r->server_name);
-    php_register_variable_safe((char *) "SERVER_NAME", str,
-                               r->server_name_length, track_vars_array TSRMLS_CC);
-
-    /* Register SERVER_PORT */
-    str = nxt_unit_sptr_get(&r->local_port);
-    php_register_variable_safe((char *) "SERVER_PORT", str,
-                               r->local_port_length, track_vars_array TSRMLS_CC);
-
-    /* Register HTTPS if TLS is enabled */
-    if (r->tls) {
-        php_register_variable_safe((char *) "HTTPS", (char *) "on",
-                                   2, track_vars_array TSRMLS_CC);
-    }
-
-    /* Register HTTP headers */
-    f_end = r->fields + r->fields_count;
-    for (f = r->fields; f < f_end; f++) {
-        name = nxt_unit_sptr_get(&f->name);
-        str = nxt_unit_sptr_get(&f->value);
-        php_register_variable_safe((char *) name, str,
-                                   f->value_length, track_vars_array TSRMLS_CC);
-    }
-
-    /* Register CONTENT_LENGTH */
-    if (r->content_length_field != NXT_UNIT_NONE_FIELD) {
-        f = r->fields + r->content_length_field;
-        str = nxt_unit_sptr_get(&f->value);
-        php_register_variable_safe((char *) "CONTENT_LENGTH", str,
-                                   f->value_length, track_vars_array TSRMLS_CC);
-    }
-
-    /* Register CONTENT_TYPE */
-    if (r->content_type_field != NXT_UNIT_NONE_FIELD) {
-        f = r->fields + r->content_type_field;
-        str = nxt_unit_sptr_get(&f->value);
-        php_register_variable_safe((char *) "CONTENT_TYPE", str,
-                                   f->value_length, track_vars_array TSRMLS_CC);
+    if (sapi_module.input_filter(PARSE_SERVER, name, &str, len,
+                                 &new_len TSRMLS_CC))
+    {
+        nxt_php_register(var, str, new_len, track_vars_array TSRMLS_CC);
     }
 }
 
-#endif /* NXT_PHP_TRUEASYNC */
-
 
 static void
-nxt_php_set_sptr(nxt_unit_request_info_t *req, const char *name,
+nxt_php_set_field(nxt_unit_request_info_t *req, const char *name,
     nxt_unit_sptr_t *v, uint32_t len, zval *track_vars_array TSRMLS_DC)
 {
     char          *str;
@@ -2133,11 +2082,35 @@ nxt_php_set_sptr(nxt_unit_request_info_t *req, const char *name,
 
 
 nxt_inline void
-nxt_php_set_str(nxt_unit_request_info_t *req, const char *name,
+nxt_php_set_str(nxt_unit_request_info_t *req, nxt_uint_t var,
     nxt_str_t *s, zval *track_vars_array TSRMLS_DC)
 {
-    nxt_php_set_cstr(req, name, (char *) s->start, s->length,
+    nxt_php_set_cstr(req, var, (char *) s->start, s->length,
                      track_vars_array TSRMLS_CC);
+}
+
+
+/*
+ * A fixed name needs none of the checks and none of the mangling that
+ * php_register_variable_safe() applies, so with PHP 8 its interned key
+ * goes into the array directly.
+ */
+
+nxt_inline void
+nxt_php_register(nxt_uint_t var, const char *str, size_t len,
+    zval *track_vars_array TSRMLS_DC)
+{
+#if NXT_PHP8
+    zval  value;
+
+    ZVAL_STRINGL_FAST(&value, str, len);
+
+    zend_hash_update(Z_ARRVAL_P(track_vars_array), nxt_php_server_keys[var],
+                     &value);
+#else
+    php_register_variable_safe((char *) nxt_php_server_names[var].start,
+                               (char *) str, len, track_vars_array TSRMLS_CC);
+#endif
 }
 
 
@@ -2177,17 +2150,18 @@ nxt_php_hash_str_find_ptr(const HashTable *ht, const nxt_str_t *str)
 
 
 static void
-nxt_php_set_cstr(nxt_unit_request_info_t *req, const char *name,
+nxt_php_set_cstr(nxt_unit_request_info_t *req, nxt_uint_t var,
     const char *cstr, uint32_t len, zval *track_vars_array TSRMLS_DC)
 {
     if (nxt_slow_path(cstr == NULL)) {
         return;
     }
 
-    nxt_unit_req_debug(req, "php: register %s='%.*s'", name, (int) len, cstr);
+    nxt_unit_req_debug(req, "php: register %s='%.*s'",
+                       (char *) nxt_php_server_names[var].start, (int) len,
+                       cstr);
 
-    php_register_variable_safe((char *) name, (char *) cstr, len,
-                               track_vars_array TSRMLS_CC);
+    nxt_php_register(var, cstr, len, track_vars_array TSRMLS_CC);
 }
 
 
@@ -2208,6 +2182,7 @@ nxt_php_log_message(char *message TSRMLS_DC)
 
     ctx = SG(server_context);
 
+    /* fastcgi_finish_request() leaves the context without a request. */
     if (ctx != NULL && ctx->req != NULL) {
         nxt_unit_req_log(ctx->req, NXT_UNIT_LOG_NOTICE,
                          "php message: %s", message);
@@ -2217,463 +2192,3 @@ nxt_php_log_message(char *message TSRMLS_DC)
                      "php message: %s", message);
     }
 }
-
-
-#if NXT_PHP_TRUEASYNC
-
-/* TrueAsync Mode Implementation */
-
-/* External globals */
-extern zval  *nxt_php_request_callback;
-
-/**
- * The request handler invoked from NGINX UNIT.
- * The handler uses a PHP callback function (nxt_php_request_callback) to process the request.
- *
- **/
-static void
-nxt_php_request_handler_async(nxt_unit_request_info_t *req)
-{
-    zend_async_scope_t    *request_scope;
-    zend_coroutine_t      *coroutine;
-    nxt_php_run_ctx_t     run_ctx;
-    nxt_php_target_t      *target;
-    nxt_unit_request_t    *r;
-    nxt_unit_field_t      *f;
-    void                  *saved_server_context;
-
-    r = req->request;
-    target = &nxt_php_targets[r->app_target];
-
-    /* 1. Create new Scope for this request with its own superglobals */
-    request_scope = ZEND_ASYNC_NEW_SCOPE(ZEND_ASYNC_CURRENT_SCOPE);
-
-    if (request_scope == NULL) {
-        nxt_unit_req_alert(req, "Failed to create request scope");
-        nxt_unit_request_done(req, NXT_UNIT_ERROR);
-        return;
-    }
-
-    /* 2. DISABLE inheriting global superglobals - each request has its own */
-    ZEND_ASYNC_SCOPE_CLR_INHERIT_SUPERGLOBALS(request_scope);
-
-    /* 3. Setup SG(server_context) and SG(request_info) for superglobals population */
-    saved_server_context = SG(server_context);
-
-    /* Prepare run context */
-    nxt_memzero(&run_ctx, sizeof(run_ctx));
-    run_ctx.req = req;
-    run_ctx.root = &target->root;
-    run_ctx.index = &target->index;
-    run_ctx.script_filename = target->script_filename;
-    run_ctx.script_dirname = target->script_dirname;
-    run_ctx.script_name = target->script_name;
-
-    /* Extract cookie if present */
-    if (r->cookie_field != NXT_UNIT_NONE_FIELD) {
-        f = r->fields + r->cookie_field;
-        run_ctx.cookie = nxt_unit_sptr_get(&f->value);
-    }
-
-    /* Setup SG(server_context) */
-    SG(server_context) = &run_ctx;
-
-    /* Setup SG(request_info) for php_default_treat_data */
-    SG(request_info).request_method = nxt_unit_sptr_get(&r->method);
-    SG(request_info).query_string = r->query.offset ? nxt_unit_sptr_get(&r->query) : NULL;
-    SG(request_info).content_length = r->content_length;
-
-    if (r->content_type_field != NXT_UNIT_NONE_FIELD) {
-        f = r->fields + r->content_type_field;
-        SG(request_info).content_type = nxt_unit_sptr_get(&f->value);
-    } else {
-        SG(request_info).content_type = NULL;
-    }
-
-    /* 4. Populate superglobals with data from HTTP request */
-    nxt_php_scope_populate_superglobals(request_scope);
-
-    /* 5. Restore original SG(server_context) */
-    SG(server_context) = saved_server_context;
-
-    /* 6. Create coroutine within this Scope */
-    coroutine = ZEND_ASYNC_NEW_COROUTINE(request_scope);
-    if (coroutine == NULL) {
-        nxt_unit_req_alert(req, "Failed to create coroutine");
-        /* Scope will be automatically cleaned up */
-        nxt_unit_request_done(req, NXT_UNIT_ERROR);
-        return;
-    }
-
-    /* 5. Setup coroutine entry point and data */
-    coroutine->internal_entry = nxt_php_request_coroutine_entry;
-    coroutine->extended_data = req;
-
-    /* 6. Enqueue coroutine for execution */
-    if (!ZEND_ASYNC_ENQUEUE_COROUTINE(coroutine)) {
-        nxt_unit_req_alert(req, "Failed to enqueue coroutine");
-        nxt_unit_request_done(req, NXT_UNIT_ERROR);
-        return;
-    }
-}
-
-/* Load and execute entrypoint script in async mode */
-static nxt_int_t
-nxt_php_async_load_entrypoint(nxt_task_t *task, nxt_str_t *entrypoint)
-{
-    FILE              *fp;
-    const char        *filename;
-    zend_file_handle  file_handle;
-
-    nxt_log(task, NXT_LOG_INFO, "TrueAsync: nxt_php_async_load_entrypoint called, PID=%d", getpid());
-
-
-    /* Create null-terminated filename */
-    char *filename_buf = nxt_malloc(entrypoint->length + 1);
-    if (filename_buf == NULL) {
-        nxt_alert(task, "TrueAsync: Failed to allocate filename buffer");
-        return NXT_ERROR;
-    }
-
-    nxt_memcpy(filename_buf, entrypoint->start, entrypoint->length);
-    filename_buf[entrypoint->length] = '\0';
-    filename = filename_buf;
-
-
-    fp = fopen(filename, "re");
-    if (fp == NULL) {
-        nxt_alert(task, "TrueAsync: Failed to open entrypoint %s", filename);
-        nxt_free(filename_buf);
-        return NXT_ERROR;
-    }
-
-    /* Initialize minimal SG() fields like CLI does */
-    SG(request_info).argc = 0;
-    SG(request_info).argv = NULL;
-    SG(request_info).path_translated = (char*)filename;
-    SG(server_context) = NULL;
-
-    /* Call php_request_startup() like CLI does */
-#ifdef NXT_PHP7
-    if (nxt_slow_path(php_request_startup() == FAILURE)) {
-#else
-    if (nxt_slow_path(php_request_startup(TSRMLS_C) == FAILURE)) {
-#endif
-        nxt_alert(task, "TrueAsync: php_request_startup() failed");
-        fclose(fp);
-        nxt_free(filename_buf);
-        return NXT_ERROR;
-    }
-
-    nxt_zend_stream_init_fp(&file_handle, fp, filename);
-
-    /* Execute entrypoint script */
-    int result = php_execute_script(&file_handle TSRMLS_CC);
-
-    if (result == FAILURE) {
-        nxt_alert(task, "TrueAsync: php_execute_script() FAILED!");
-        fclose(fp);
-        nxt_free(filename_buf);
-        return NXT_ERROR;
-    }
-
-#if (PHP_VERSION_ID >= 80100)
-    zend_destroy_file_handle(&file_handle);
-#endif
-
-    nxt_free(filename_buf);
-
-    /* Check if callback was registered */
-    if (nxt_php_request_callback == NULL) {
-        nxt_alert(task, "TrueAsync: No request handler registered! Call HttpServer->onRequest() in your entrypoint.");
-        return NXT_ERROR;
-    }
-
-    /* Check callback is callable */
-    if (nxt_php_request_callback != NULL && Z_TYPE_P(nxt_php_request_callback) == IS_OBJECT) {
-        nxt_log(task, NXT_LOG_INFO, "TrueAsync: Callback is object, type OK");
-    } else {
-        nxt_alert(task, "TrueAsync: Callback has wrong type: %d",
-                  nxt_php_request_callback ? Z_TYPE_P(nxt_php_request_callback) : -1);
-    }
-
-    /*
-     * DON'T call php_request_shutdown() — we want the callback zval to
-     * persist across the prototype → worker fork.  But scrub any
-     * pending exception left in EG: if the entrypoint script raised
-     * something that wasn't caught before HttpServer->onRequest()
-     * stored the callback, every forked worker would inherit the
-     * exception on its first request.  The callback zval itself
-     * (nxt_php_request_callback) is not on the exception path; it
-     * was registered explicitly by the userland code.
-     *
-     * Other EG globals (output buffers, error_reporting, the symbol
-     * table) are also inherited, but those are reset implicitly when
-     * the worker enters a fresh request_init.  Exception state is
-     * the one that bites hardest because the next request's
-     * php_execute_script() can early-exit on a stale EG(exception).
-     */
-    if (EG(exception) != NULL) {
-        zend_clear_exception();
-    }
-
-    return NXT_OK;
-}
-
-
-/* Quit handler for graceful shutdown */
-static void
-nxt_php_quit_handler(nxt_unit_ctx_t *ctx)
-{
-    nxt_unit_debug(ctx, "TrueAsync: quit handler called, triggering graceful shutdown");
-
-    /* Call ZEND_ASYNC_SHUTDOWN to trigger graceful shutdown of all coroutines */
-    ZEND_ASYNC_SHUTDOWN();
-}
-
-
-/* Server wait event methods */
-static bool
-nxt_php_server_wait_event_start(zend_async_event_t *event)
-{
-    /* No action needed - event waits indefinitely */
-    return true;
-}
-
-static bool
-nxt_php_server_wait_event_stop(zend_async_event_t *event)
-{
-    /* No action needed */
-    return true;
-}
-
-static bool
-nxt_php_server_wait_event_add_callback(zend_async_event_t *event, zend_async_event_callback_t *callback)
-{
-    return zend_async_callbacks_push(event, callback);
-}
-
-static bool
-nxt_php_server_wait_event_del_callback(zend_async_event_t *event, zend_async_event_callback_t *callback)
-{
-    return zend_async_callbacks_remove(event, callback);
-}
-
-static bool
-nxt_php_server_wait_event_replay(zend_async_event_t *event, zend_async_event_callback_t *callback, zval *result, zend_object **exception)
-{
-    /* Event never resolves - cannot replay */
-    return false;
-}
-
-static zend_string *
-nxt_php_server_wait_event_info(zend_async_event_t *event)
-{
-    return zend_string_init("NGINX Unit server waiting", sizeof("NGINX Unit server waiting") - 1, 0);
-}
-
-static bool
-nxt_php_server_wait_event_dispose(zend_async_event_t *event)
-{
-    if (ZEND_ASYNC_EVENT_REFCOUNT(event) > 1) {
-        ZEND_ASYNC_EVENT_DEL_REF(event);
-        return true;
-    }
-
-    if (ZEND_ASYNC_EVENT_REFCOUNT(event) == 1) {
-        ZEND_ASYNC_EVENT_DEL_REF(event);
-    }
-
-    /* Notify all callbacks that event is disposed */
-    ZEND_ASYNC_CALLBACKS_NOTIFY(event, NULL, NULL);
-
-    /* Free the event */
-    efree(event);
-
-    return true;
-}
-
-static bool
-nxt_php_activate_true_async(nxt_task_t *task)
-{
-    if (ZEND_ASYNC_IS_OFF) {
-        nxt_alert(task, "TrueAsync: async mode is off");
-        return false;
-    }
-
-    if (ZEND_ASYNC_IS_READY) {
-        if (!ZEND_ASYNC_SCHEDULER_LAUNCH()) {
-            nxt_alert(task, "TrueAsync: Failed to launch scheduler");
-            return false;
-        }
-    }
-
-    return ZEND_ASYNC_IS_ACTIVE;
-}
-
-/**
- * Suspend coroutine until application should finish
- * Event handlers registered via add_port/remove_port will be triggered by scheduler
- */
-static void
-nxt_php_suspend_coroutine(nxt_unit_ctx_t *ctx)
-{
-    zend_coroutine_t *coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
-    if (coroutine == NULL) {
-        nxt_unit_alert(ctx, "TrueAsync: Failed to get current coroutine");
-        return;
-    }
-
-    /* Create server wait event (it's custom nginx unit trigger for TrueAsync) */
-    zend_async_event_t *event = emalloc(sizeof(zend_async_event_t));
-    if (event == NULL) {
-        nxt_unit_alert(ctx, "TrueAsync: Failed to allocate server wait event");
-        return;
-    }
-
-    /* Initialize event structure */
-    memset(event, 0, sizeof(zend_async_event_t));
-
-    /* Set event methods */
-    event->start = nxt_php_server_wait_event_start;
-    event->stop = nxt_php_server_wait_event_stop;
-    event->add_callback = nxt_php_server_wait_event_add_callback;
-    event->del_callback = nxt_php_server_wait_event_del_callback;
-    event->replay = nxt_php_server_wait_event_replay;
-    event->info = nxt_php_server_wait_event_info;
-    event->dispose = nxt_php_server_wait_event_dispose;
-
-    /* Create waker for coroutine */
-    if (UNEXPECTED(zend_async_waker_new(coroutine) == NULL)) {
-        nxt_unit_alert(ctx, "TrueAsync: Failed to create waker");
-        event->dispose(event);
-        return;
-    }
-
-    /* Attach coroutine to wait event - it will suspend until GRACEFUL_SHUTDOWN */
-    zend_async_resume_when(coroutine, event, true, zend_async_waker_callback_resolve, NULL);
-
-    if (UNEXPECTED(EG(exception) != NULL)) {
-        nxt_unit_alert(ctx, "TrueAsync: Failed to attach coroutine to wait event");
-        zend_async_waker_clean(coroutine);
-        event->dispose(event);
-        return;
-    }
-
-    ZEND_ASYNC_SUSPEND();
-    zend_async_waker_clean(coroutine);
-}
-
-
-static void
-nxt_php_scope_init_superglobals(zend_async_scope_t *scope)
-{
-    zval tmp;
-
-    if (scope->superglobals != NULL) {
-        return;
-    }
-
-    ALLOC_HASHTABLE(scope->superglobals);
-    zend_hash_init(scope->superglobals, 8, NULL, ZVAL_PTR_DTOR, 0);
-
-    array_init(&tmp);
-    zend_hash_str_add_new(scope->superglobals, "_GET", sizeof("_GET") - 1, &tmp);
-
-    array_init(&tmp);
-    zend_hash_str_add_new(scope->superglobals, "_POST", sizeof("_POST") - 1, &tmp);
-
-    array_init(&tmp);
-    zend_hash_str_add_new(scope->superglobals, "_COOKIE", sizeof("_COOKIE") - 1, &tmp);
-
-    array_init(&tmp);
-    zend_hash_str_add_new(scope->superglobals, "_SERVER", sizeof("_SERVER") - 1, &tmp);
-
-    array_init(&tmp);
-    zend_hash_str_add_new(scope->superglobals, "_ENV", sizeof("_ENV") - 1, &tmp);
-
-    array_init(&tmp);
-    zend_hash_str_add_new(scope->superglobals, "_FILES", sizeof("_FILES") - 1, &tmp);
-
-    array_init(&tmp);
-    zend_hash_str_add_new(scope->superglobals, "_REQUEST", sizeof("_REQUEST") - 1, &tmp);
-}
-
-
-static void
-nxt_php_scope_populate_superglobals(zend_async_scope_t *scope)
-{
-    zval               *server_array, *get_array, *post_array, *cookie_array;
-    nxt_php_run_ctx_t  *ctx;
-    nxt_unit_request_t *r;
-    nxt_unit_field_t   *f;
-
-    if (scope->superglobals == NULL) {
-        nxt_php_scope_init_superglobals(scope);
-    }
-
-    ctx = SG(server_context);
-    if (ctx == NULL || ctx->req == NULL) {
-        return;
-    }
-
-    r = ctx->req->request;
-
-    server_array = zend_hash_str_find(scope->superglobals, "_SERVER", sizeof("_SERVER") - 1);
-    get_array    = zend_hash_str_find(scope->superglobals, "_GET", sizeof("_GET") - 1);
-    post_array   = zend_hash_str_find(scope->superglobals, "_POST", sizeof("_POST") - 1);
-    cookie_array = zend_hash_str_find(scope->superglobals, "_COOKIE", sizeof("_COOKIE") - 1);
-
-    /* Populate $_SERVER */
-    if (server_array != NULL) {
-        nxt_php_register_variables_async(ctx->req, ctx, server_array);
-    }
-
-    /* Populate $_GET - use PARSE_STRING to write into our array */
-    if (get_array != NULL && r->query_length > 0) {
-        char *query = estrndup((char *)nxt_unit_sptr_get(&r->query), r->query_length);
-        php_default_treat_data(PARSE_STRING, query, get_array);
-    }
-
-    /* Populate $_COOKIE - use PARSE_STRING to write into our array */
-    if (cookie_array != NULL && ctx->cookie != NULL) {
-        char *cookie = estrdup(ctx->cookie);
-        php_default_treat_data(PARSE_STRING, cookie, cookie_array);
-    }
-
-    /* Populate $_POST - use PARSE_STRING for application/x-www-form-urlencoded */
-    if (post_array != NULL &&
-        SG(request_info).request_method &&
-        !strcasecmp(SG(request_info).request_method, "POST"))
-    {
-        /* Check if content type is application/x-www-form-urlencoded */
-        if (r->content_type_field != NXT_UNIT_NONE_FIELD) {
-            f = r->fields + r->content_type_field;
-            const char *content_type = nxt_unit_sptr_get(&f->value);
-
-            /* Only parse if it's form-urlencoded (simple POST data) */
-            if (content_type &&
-                strncasecmp(content_type, "application/x-www-form-urlencoded", 33) == 0)
-            {
-                /* Read POST body into memory */
-                size_t post_len = r->content_length;
-                if (post_len > 0) {
-                    char *post_data = nxt_malloc(post_len + 1);
-                    if (post_data != NULL) {
-                        size_t read_bytes = nxt_unit_request_read(ctx->req, post_data, post_len);
-                        if (read_bytes > 0) {
-                            post_data[read_bytes] = '\0';
-                            /* php_default_treat_data will modify and free the string, so use estrndup */
-                            char *post_copy = estrndup(post_data, read_bytes);
-                            php_default_treat_data(PARSE_STRING, post_copy, post_array);
-                        }
-                        nxt_free(post_data);
-                    }
-                }
-            }
-            /* For multipart/form-data and others - not supported yet in async mode */
-        }
-    }
-}
-
-#endif /* NXT_PHP_TRUEASYNC */

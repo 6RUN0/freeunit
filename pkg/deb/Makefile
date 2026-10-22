@@ -310,16 +310,35 @@ debuild/$(SRCDIR)/debian/changelog: ../../docs/changes.xml debuild/$(SRCDIR)/.de
 		-e "s#%%CODENAME%%#$(CODENAME)#g" \
 		> $@
 
+# The source tarball holds only the files that git tracks under the paths
+# in $files.  A new top-level file or directory that the build needs must
+# be added there; the recipe fails if a listed path yields no files.
+#
 # Order-only on the prune stamp: pruning deletes stale top-level files in
 # debuild/, so it must not run concurrently with the packing below (-j) —
 # the transient $(SRCDIR).tar.gz does not match the keep pattern — yet a
 # re-run of the prune does not invalidate the tarball itself.
 debuild/$(BRAND)_$(VERSION).orig.tar.gz: | debuild/.prune-stamp
 	mkdir -p debuild
-	cd ../.. && tar -czf pkg/deb/debuild/$(SRCDIR).tar.gz \
-		--transform "s#^#$(SRCDIR)/#" \
-		LICENSE NOTICE CHANGES README.md CONTRIBUTING.md configure auto src \
-		test tools version go pkg/contrib docs/man/man8/unitd.8.in
+	cd ../.. && \
+	files="LICENSE NOTICE CHANGES README.md CONTRIBUTING.md configure auto src \
+		test tools version go pkg/contrib docs/man/man8/unitd.8.in" && \
+	epoch=$${SOURCE_DATE_EPOCH:-`git log -1 --format=%ct 2>/dev/null || echo 0`} && \
+	out=pkg/deb/debuild/$(SRCDIR).tar.gz && list=$$out.list && rm -f $$out $$list && \
+	( git ls-files -z -- $$files 2>/dev/null || \
+	  find $$files ! -type d -print0 | LC_ALL=C sort -z ) > $$list && \
+	for f in $$files; do \
+		tr '\0' '\n' < $$list | awk -v p="$$f" \
+			'$$0 == p || index($$0, p "/") == 1 { n++ } END { exit !n }' || \
+		{ echo "$@: no tracked files under $$f" >&2; rm -f $$list; exit 1; }; \
+	done && \
+	tar --null -T $$list --sort=name --mtime=@$$epoch --owner=0 --group=0 \
+		--numeric-owner --mode='go+u,go-w' --transform "s#^#$(SRCDIR)/#" -cf - | \
+	gzip -n > $$out && \
+	if [ `tr -cd '\0' < $$list | wc -c` -ne `tar -tzf $$out | wc -l` ]; then \
+		echo "$@: $$out is incomplete" >&2; rm -f $$out $$list; exit 1; \
+	fi && \
+	rm -f $$list
 	mv debuild/$(SRCDIR).tar.gz debuild/$(BRAND)_$(VERSION).orig.tar.gz
 
 # The unpacked source tree gets its own stamp: a deleted tree (or an

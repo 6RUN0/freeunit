@@ -1,0 +1,330 @@
+name: "Build & Test (macOS)"
+
+on:
+  pull_request:
+    paths:
+      - configure
+      - 'auto/**'
+      - 'src/**'
+      - '.github/workflows/build-test-macos.yml'
+  push:
+    branches: master
+    paths:
+      - configure
+      - 'auto/**'
+      - 'src/**'
+      - '.github/workflows/build-test-macos.yml'
+
+concurrency:
+  # Same grouping as build-test.yml: cancel superseded PR runs, never group
+  # pushes.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The C test programs on arm64 macOS, which has 16 KiB pages (issue 595,
+  # https://github.com/freeunitorg/freeunit/issues/595).  macos-15 is pinned
+  # so that an image change is a deliberate commit.  No modules, no pytest,
+  # no sudo.
+  c-tests-macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    env:
+      # The default macOS TMPDIR is long; a unix socket path under it can
+      # pass the 104-byte sun_path limit.
+      TMPDIR: /tmp
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Setup block: packages and the Homebrew paths.  Keep it together so it
+      # can become a composite action with a Brewfile later.
+      - name: Install packages
+        run: brew install make openssl@3 pcre2
+
+      - name: Show the machine and the page size
+        run: |
+          uname -m
+          sysctl hw.pagesize
+
+      # auto/ssltls probes plain -lssl, and macOS has no OpenSSL headers, so
+      # the Homebrew paths go in by hand.  rpath, not DYLD_LIBRARY_PATH: SIP
+      # strips DYLD_* from the environment of /bin/sh.
+      - name: Configure unit (--tests --openssl)
+        run: |
+          OSSL="$(brew --prefix openssl@3)"
+          PCRE="$(brew --prefix pcre2)"
+          ./configure --tests --openssl \
+            --cc-opt="-I${OSSL}/include -I${PCRE}/include" \
+            --ld-opt="-L${OSSL}/lib -Wl,-rpath,${OSSL}/lib -L${PCRE}/lib -Wl,-rpath,${PCRE}/lib"
+      # End of the setup block.
+
+      - name: Build unitd and libunit
+        run: |
+          gmake -j3
+          gmake -j3 build/lib/libunit.a
+
+      - name: Build C tests
+        run: gmake -j3 tests
+
+      - name: Run C tests
+        run: ./build/tests
+
+      # The segment table sends a real shm object of PORT_MMAP_SIZE bytes.
+      # Here fstat() reports it rounded up to a 16 KiB page.
+      - name: Run libunit malformed port message test
+        run: ./build/unit_msg_test
+
+      - name: Run libunit close-provenance test
+        run: ./build/unit_close_test
+
+      - name: Run libunit port_recv fd-ownership test
+        run: ./build/unit_port_recv_test
+
+      # The C suites call the library in this process and never start the
+      # daemon.  This step does: unitd, the control API, and a real request
+      # answered by build/unit_app_test.  That is the path issue 595 came
+      # through, the router's half of the shared memory size check, which no
+      # C program exercises.  It also covers the shared memory of the port
+      # queue and the state store on 16 KiB pages.
+      - name: Run unitd and serve a request from unit_app_test
+        run: |
+          set -eu
+
+          smoke_dir="$PWD/.macos-smoke"
+          rm -rf "$smoke_dir"
+          mkdir -p "$smoke_dir/state"
+
+          port=8391
+          control_sock="$smoke_dir/control.unit.sock"
+          unitd_log="$smoke_dir/unit.log"
+
+          # A daemon that exits early fails the request below, and the log
+          # printed on failure says why.
+          ./build/sbin/unitd --no-daemon \
+              --statedir "$smoke_dir/state" \
+              --pid "$smoke_dir/unit.pid" \
+              --log "$unitd_log" \
+              --control "unix:$control_sock" \
+              --tmpdir "$smoke_dir" &
+          unitd_pid=$!
+
+          # On every exit of the step: print the log when the step failed,
+          # then stop unitd, so that no path leaves it running.
+          cleanup() {
+              rc=$?
+              [ "$rc" -eq 0 ] || cat "$unitd_log" || true
+              kill "$unitd_pid" 2> /dev/null || true
+              wait "$unitd_pid" || true
+          }
+          trap cleanup EXIT
+
+          # The control API answering means unitd finished initializing and
+          # created the shared memory the router allocates on 16 KiB pages.
+          up=0
+          i=0
+          while [ "$i" -lt 100 ]; do
+              if curl -sS -m 2 --unix-socket "$control_sock" \
+                       http://localhost/certificates > /dev/null 2>&1; then
+                  up=1
+                  break
+              fi
+              i=$((i + 1))
+              sleep 0.2
+          done
+
+          if [ "$up" -eq 0 ]; then
+              echo "the control API did not answer within 20 s"
+              exit 1
+          fi
+
+          # One json line, so the step needs no heredoc: a heredoc terminator
+          # would have to start at column 0, outside this YAML block scalar.
+          config=$(printf '{"listeners":{"127.0.0.1:%s":{"pass":"applications/smoke"}},"applications":{"smoke":{"type":"external","executable":"%s","processes":1}}}' "$port" "$PWD/build/unit_app_test")
+
+          printf '%s\n' "$config"
+          printf '%s\n' "$config" > "$smoke_dir/config.json"
+
+          # --fail-with-body: a 4xx or 5xx from the control API fails the
+          # step here, with the error body, instead of 20 s later with no
+          # listener.
+          curl -sS -m 10 --fail-with-body --unix-socket "$control_sock" \
+               -X PUT -d @"$smoke_dir/config.json" http://localhost/config
+          echo
+
+          why="the listener did not answer"
+          answer=0
+          last=""
+          i=0
+          while [ "$i" -lt 100 ]; do
+              last=$(printf 'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' \
+                     | nc -w 5 127.0.0.1 "$port" || true)
+
+              case "$last" in
+                  *"Hello world!"*)
+                      answer=1
+                      break
+                      ;;
+                  *" 500 "*)
+                      why="the request got 500"
+                      ;;
+              esac
+
+              i=$((i + 1))
+              sleep 0.2
+          done
+
+          printf '%s\n' "$last"
+
+          if [ "$answer" -ne 1 ]; then
+              echo "$why"
+              exit 1
+          fi
+
+          if ! kill -0 "$unitd_pid" 2> /dev/null; then
+              echo "unitd died while the request was served"
+              exit 1
+          fi
+
+          # "failed to start" also matches "failed to start a process".
+          case "$(cat "$unitd_log")" in
+              *"failed to start"* | *"failed to apply new conf"*)
+                  echo "unitd logged a start failure"
+                  exit 1
+                  ;;
+          esac
+
+      # The step above answers one request and returns.  This one answers
+      # detached, the path nxt_unit_request_done_detached() and the FINISH
+      # retry handling of nxt_unit_run() take.  PHP's fastcgi_finish_request()
+      # and the ASGI background tasks use it, and nothing on macOS ran it
+      # through unitd before.  unit_app_test -d fails the first two FINISH
+      # sends and nothing else, so libunit runs the retries and reports the
+      # finish on the third attempt; a finish that cannot be reported retires
+      # the worker after about 0.8 s, which the second request would then
+      # find.  The application exits non-zero if the injected failures reach
+      # another edge, because then FINISH went out on its first attempt and
+      # this step tested nothing.  That exit shows up here as a 502 for both
+      # requests, with the application's own line in the log.
+      - name: Serve a detached request from unit_app_test
+        run: |
+          set -eu
+
+          smoke_dir="$PWD/.macos-detached"
+          rm -rf "$smoke_dir"
+          mkdir -p "$smoke_dir/state"
+
+          port=8392
+          control_sock="$smoke_dir/control.unit.sock"
+          unitd_log="$smoke_dir/unit.log"
+
+          ./build/sbin/unitd --no-daemon \
+              --statedir "$smoke_dir/state" \
+              --pid "$smoke_dir/unit.pid" \
+              --log "$unitd_log" \
+              --control "unix:$control_sock" \
+              --tmpdir "$smoke_dir" &
+          unitd_pid=$!
+
+          cleanup() {
+              rc=$?
+              [ "$rc" -eq 0 ] || cat "$unitd_log" || true
+              kill "$unitd_pid" 2> /dev/null || true
+              wait "$unitd_pid" || true
+          }
+          trap cleanup EXIT
+
+          up=0
+          i=0
+          while [ "$i" -lt 100 ]; do
+              if curl -sS -m 2 --unix-socket "$control_sock" \
+                       http://localhost/certificates > /dev/null 2>&1; then
+                  up=1
+                  break
+              fi
+              i=$((i + 1))
+              sleep 0.2
+          done
+
+          if [ "$up" -eq 0 ]; then
+              echo "the control API did not answer within 20 s"
+              exit 1
+          fi
+
+          config=$(printf '{"listeners":{"127.0.0.1:%s":{"pass":"applications/detached"}},"applications":{"detached":{"type":"external","executable":"%s","arguments":["-d"],"processes":1}}}' "$port" "$PWD/build/unit_app_test")
+
+          printf '%s\n' "$config" > "$smoke_dir/config.json"
+
+          curl -sS -m 10 --fail-with-body --unix-socket "$control_sock" \
+               -X PUT -d @"$smoke_dir/config.json" http://localhost/config
+          echo
+
+          request() {
+              printf 'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' \
+              | nc -w 5 127.0.0.1 "$port" || true
+          }
+
+          first=$(request)
+
+          case "$first" in
+              *"Hello world!"*) ;;
+              *)
+                  printf '%s\n' "$first"
+                  echo "the detached request did not answer"
+                  exit 1
+                  ;;
+          esac
+
+          # The retries give up after about 0.8 s.  Wait past that and ask
+          # again: a worker retired by a finish it could not report is gone.
+          sleep 2
+
+          second=$(request)
+
+          case "$second" in
+              *"Hello world!"*) ;;
+              *)
+                  printf '%s\n' "$second"
+                  echo "the worker did not survive the detached finish"
+                  exit 1
+                  ;;
+          esac
+
+          if ! kill -0 "$unitd_pid" 2> /dev/null; then
+              echo "unitd died while the request was served"
+              exit 1
+          fi
+
+          # A give-up logs one of these and retires the worker.  The second
+          # request above fails then too; this line names the reason.
+          case "$(cat "$unitd_log")" in
+              *"failed to report a detached"* | *"failed to report detached"*)
+                  echo "the detached finish was not reported"
+                  exit 1
+                  ;;
+          esac
+
+          # The second request makes the helper check the first one's FINISH
+          # failures, and the shutdown makes it check the second one's.  On a
+          # miss it logs this and exits, and unitd may serve the request from
+          # a fresh process, so the log is the signal.
+          case "$(cat "$unitd_log")" in
+              *"the injected failures did not reach the detached finish"*)
+                  echo "the injected failures missed the detached finish"
+                  exit 1
+                  ;;
+          esac
+
+          # And the verdict itself, required rather than optional: a run
+          # that never armed the injection reports nothing, and both
+          # requests above pass, so without this the step is green on the
+          # empty test.
+          case "$(cat "$unitd_log")" in
+              *"unit_app_test: "*" injected failures, all spent on FINISH"*)
+                  ;;
+              *)
+                  echo "the application did not report on its injection"
+                  exit 1
+                  ;;
+          esac

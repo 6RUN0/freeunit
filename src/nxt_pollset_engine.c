@@ -29,6 +29,8 @@ static void nxt_pollset_enable(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static void nxt_pollset_disable(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static nxt_bool_t nxt_pollset_close(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+static void nxt_pollset_cancel_changes(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev);
 static void nxt_pollset_enable_read(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static void nxt_pollset_enable_write(nxt_event_engine_t *engine,
@@ -64,6 +66,7 @@ const nxt_event_interface_t  nxt_pollset_engine = {
     nxt_pollset_disable,
     nxt_pollset_disable,
     nxt_pollset_close,
+    nxt_pollset_cancel_changes,
     nxt_pollset_enable_read,
     nxt_pollset_enable_write,
     nxt_pollset_disable_read,
@@ -213,7 +216,15 @@ nxt_pollset_enable_read(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_uint_t  op, events;
 
-    if (ev->read != NXT_EVENT_BLOCKED) {
+    /*
+     * A side that nxt_fd_event_is_active() reports is registered already,
+     * and this engine reports it while it is ready, so there is nothing to
+     * change.  The port layer enables an active write event on purpose to
+     * re-arm it; adding the descriptor again would fail and raise the
+     * event's error handler.
+     */
+
+    if (ev->read != NXT_EVENT_BLOCKED && !nxt_fd_event_is_active(ev->read)) {
 
         events = POLLIN;
 
@@ -241,7 +252,15 @@ nxt_pollset_enable_write(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
 {
     nxt_uint_t  op, events;
 
-    if (ev->write != NXT_EVENT_BLOCKED) {
+    /*
+     * A side that nxt_fd_event_is_active() reports is registered already,
+     * and this engine reports it while it is ready, so there is nothing to
+     * change.  The port layer enables an active write event on purpose to
+     * re-arm it; adding the descriptor again would fail and raise the
+     * event's error handler.
+     */
+
+    if (ev->write != NXT_EVENT_BLOCKED && !nxt_fd_event_is_active(ev->write)) {
 
         events = POLLOUT;
 
@@ -373,6 +392,46 @@ nxt_pollset_change(nxt_event_engine_t *engine, nxt_fd_event_t *ev,
     change->cmd = (op == NXT_POLLSET_DELETE) ? PS_DELETE : PS_MOD;
     change->events = events;
     change->event = ev;
+}
+
+
+/*
+ * Take this event's pending changes out of the batch, so that a struct that
+ * is about to be freed is not dereferenced by nxt_pollset_commit_changes().
+ *
+ * The change is dropped rather than committed: the descriptor is closed, or
+ * is about to be, so the change would name a descriptor number that may
+ * already belong to somebody else.
+ */
+
+static void
+nxt_pollset_cancel_changes(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
+{
+    nxt_pollset_change_t  *change, *dst, *end;
+
+    if (!ev->changing) {
+        return;
+    }
+
+    dst = engine->u.pollset.changes;
+    end = dst + engine->u.pollset.nchanges;
+
+    for (change = dst; change < end; change++) {
+
+        if (change->event == ev) {
+            continue;
+        }
+
+        if (dst != change) {
+            *dst = *change;
+        }
+
+        dst++;
+    }
+
+    engine->u.pollset.nchanges = (int) (dst - engine->u.pollset.changes);
+
+    ev->changing = 0;
 }
 
 

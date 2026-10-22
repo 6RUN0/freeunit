@@ -1,6 +1,6 @@
 openapi: 3.0.0
 info:
-  title: "FreeUnit 1.36.0 (ex NGINX Unit)"
+  title: "FreeUnit 1.37.0 (ex NGINX Unit)"
   description: "FreeUnit (ex NGINX Unit) is a lightweight and versatile application runtime
     that provides the essential components for your web application as a
     single open-source server: running application code, serving static assets,
@@ -112,9 +112,28 @@ paths:
 
     put:
       operationId: putCertBundle
-      summary: "Create or overwrite the actual certificate bundle"
-      description: "Creates or overwrites the [stored certificate bundle]
-        (https://unit.nginx.org/certificates/) in Unit."
+      summary: "Create or replace the actual certificate bundle"
+      description: "Creates the [stored certificate bundle]
+        (https://unit.nginx.org/certificates/) in Unit, or replaces it in
+        place when the name exists.  The body is a PEM bundle: the server
+        certificate first, then its chain, then the private key.  Main
+        writes the bundle to a temporary file and renames it over the old
+        one.  When the current configuration names the bundle, the
+        controller applies the configuration again before it answers with
+        `Certificate chain updated.`; new handshakes get the new
+        certificate, accepted connections finish with the old one.
+        Otherwise the answer is `Certificate chain uploaded.`.  A bundle
+        whose key does not belong to the first certificate is refused with
+        400 `Invalid certificate.`, a name that starts with `.` or is over
+        255 bytes with 400 `Invalid certificate name.`, and a bundle over
+        1 MiB with 413
+        `Certificate bundle is too large.`; the old bundle stays in use.
+        500 `Certificate stored but not applied.` means the bundle is on
+        disk, but the router refused the configuration with it and keeps
+        the old certificate.  A bundle with the same certificates as the
+        stored one is not stored again and causes no reconfiguration; the
+        answer is the one a store gives.  The request waits while a
+        reconfiguration is in progress, as a configuration change does."
 
       tags:
         - certificates
@@ -139,6 +158,9 @@ paths:
 
         "404":
           $ref: "#/components/responses/responseNotFound"
+
+        "413":
+          $ref: "#/components/responses/responsePayloadTooLarge"
 
         "500":
           $ref: "#/components/responses/responseInternalError"
@@ -170,6 +192,40 @@ paths:
               examples:
                 Key:
                   value: "RSA (4096 bits)"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /certificates/{bundleName}/fingerprint:
+    summary: "Endpoint for the certificate bundle fingerprint"
+    get:
+      operationId: getCertBundleFingerprint
+      summary: "Retrieve the fingerprint of the server certificate"
+      description: "Retrieves the SHA-256 fingerprint of the first
+        certificate in a [stored certificate bundle]
+        (https://unit.nginx.org/certificates/), in the form
+        `openssl x509 -fingerprint -sha256` prints it."
+
+      tags:
+        - certificates
+
+      parameters:
+        - $ref: "#/components/parameters/bundleName"
+
+      responses:
+        "200":
+          description: "OK; the certificate bundle exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                type: string
+
+              examples:
+                Fingerprint:
+                  value: "5F:0A:3E:8B:1C:27:9D:44:B6:E1:72:C8:0D:35:9A:F4:\
+                    6B:E8:21:7C:D3:90:4E:AB:15:66:F2:8D:3C:71:B9:02"
 
         "404":
           $ref: "#/components/responses/responseNotFound"
@@ -945,6 +1001,90 @@ paths:
       operationId: deleteAccessLogFormat
       summary: "Delete the access log format"
       description: "Deletes the `format` option from the `access_log` object."
+      tags:
+        - access log
+        - config
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkDeleted"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /config/access_log/if:
+    summary: "Endpoint for the `if` access log option"
+    get:
+      operationId: getAccessLogIf
+      summary: "Retrieve the access log if option"
+      description: "Retrieves the `if` option that represents the condition a
+        request must meet to be
+        [logged](https://unit.nginx.org/configuration/#access-log)
+        in the `access_log` object."
+
+      tags:
+        - access log
+        - config
+
+      responses:
+        "200":
+          description: "OK; the `if` option exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                type: string
+
+              examples:
+                if:
+                  value: "`${vars.status != 200}`"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+    put:
+      operationId: updateAccessLogIf
+      summary: "Create or overwrite the access log if option"
+      description: "Creates or overwrites the `if` option in the `access_log`
+        object. A request is logged when the condition renders to anything
+        other than an empty string, `0`, `false`, `null`, or `undefined`; a
+        leading `!` negates the result. A condition that cannot be rendered,
+        such as a JS expression that throws, is not true: the request is not
+        logged. A JS expression that throws is reported in the error log."
+
+      tags:
+        - access log
+        - config
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: string
+
+            examples:
+              if:
+                value: "`${vars.status != 200}`"
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkUpdated"
+
+        "400":
+          $ref: "#/components/responses/responseBadRequest"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+        "500":
+          $ref: "#/components/responses/responseInternalError"
+
+    delete:
+      operationId: deleteAccessLogIf
+      summary: "Delete the access log if option"
+      description: "Deletes the `if` option from the `access_log` object;
+        every request is logged again."
       tags:
         - access log
         - config
@@ -3229,6 +3369,87 @@ paths:
         "404":
           $ref: "#/components/responses/responseNotFound"
 
+  /config/settings/http/body_min_rate:
+    summary: "Endpoint for the `body_min_rate` option in `http`"
+    get:
+      operationId: getSettingsHttpBodyMinRate
+      summary: "Retrieve the body_min_rate option from http settings"
+      description: "Retrieves the `body_min_rate` option that represents
+        the minimum rate of the client request body, in bytes per second.
+        The value 0 disables the check."
+
+      tags:
+        - settings
+        - config
+
+      responses:
+        "200":
+          description: "OK; the `body_min_rate` option exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+
+              examples:
+                BodyMinRate:
+                  value: 256
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+    put:
+      operationId: updateSettingsHttpBodyMinRate
+      summary: "Create or overwrite the body_min_rate option"
+      description: "Creates or overwrites the `body_min_rate` option in
+        the configuration."
+
+      tags:
+        - settings
+        - config
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: integer
+
+            examples:
+              BodyMinRate:
+                value: 256
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkUpdated"
+
+        "400":
+          $ref: "#/components/responses/responseBadRequest"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+        "500":
+          $ref: "#/components/responses/responseInternalError"
+
+    delete:
+      operationId: deleteSettingsHttpBodyMinRate
+      summary: "Delete the body_min_rate option"
+      description: "Deletes the `body_min_rate` option from the
+        configuration."
+
+      tags:
+        - settings
+        - config
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkDeleted"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /config/settings/http/body_read_timeout:
     summary: "Endpoint for the `body_read_timeout` option in `http`"
     get:
@@ -4469,6 +4690,87 @@ paths:
         "404":
           $ref: "#/components/responses/responseNotFound"
 
+  /config/settings/http/send_min_rate:
+    summary: "Endpoint for the `send_min_rate` option in `http`"
+    get:
+      operationId: getSettingsHttpSendMinRate
+      summary: "Retrieve the send_min_rate option from http settings"
+      description: "Retrieves the `send_min_rate` option that represents
+        the minimum rate at which the client reads the response, in bytes
+        per second.  The value 0 disables the check."
+
+      tags:
+        - settings
+        - config
+
+      responses:
+        "200":
+          description: "OK; the `send_min_rate` option exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+
+              examples:
+                SendMinRate:
+                  value: 16384
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+    put:
+      operationId: updateSettingsHttpSendMinRate
+      summary: "Create or overwrite the send_min_rate option"
+      description: "Creates or overwrites the `send_min_rate` option in
+        the configuration."
+
+      tags:
+        - settings
+        - config
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: integer
+
+            examples:
+              SendMinRate:
+                value: 16384
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkUpdated"
+
+        "400":
+          $ref: "#/components/responses/responseBadRequest"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+        "500":
+          $ref: "#/components/responses/responseInternalError"
+
+    delete:
+      operationId: deleteSettingsHttpSendMinRate
+      summary: "Delete the send_min_rate option"
+      description: "Deletes the `send_min_rate` option from the
+        configuration."
+
+      tags:
+        - settings
+        - config
+
+      responses:
+        "200":
+          $ref: "#/components/responses/responseOkDeleted"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /config/settings/http/send_timeout:
     summary: "Endpoint for the `send_timeout` option in `http`"
     get:
@@ -5051,6 +5353,7 @@ paths:
             application/json:
               schema:
                 type: integer
+                format: int64
 
               examples:
                 Accepted:
@@ -5075,6 +5378,7 @@ paths:
             application/json:
               schema:
                 type: integer
+                format: int64
 
               examples:
                 Active:
@@ -5098,6 +5402,7 @@ paths:
             application/json:
               schema:
                 type: integer
+                format: int64
 
               examples:
                 Idle:
@@ -5122,6 +5427,7 @@ paths:
             application/json:
               schema:
                 type: integer
+                format: int64
 
               examples:
                 Closed:
@@ -5171,10 +5477,210 @@ paths:
             application/json:
               schema:
                 type: integer
+                format: int64
 
               examples:
                 Closed:
                   value: 1307
+
+  /status/access_log:
+    summary: "Endpoint for the `access_log` status object"
+    get:
+      operationId: getStatusAccessLog
+      summary: "Retrieve the access log status object"
+      description: "Retrieves the `access_log` status object that represents
+        the access log's write health."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `access_log` object exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/statusAccessLog"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusAccessLog"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/access_log/path:
+    summary: "Endpoint for the access log path"
+    get:
+      operationId: getStatusAccessLogPath
+      summary: "Retrieve the access log path"
+      description: "Retrieves the path of the configured access log."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `path` string exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                type: string
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusAccessLogPath"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/access_log/lost:
+    summary: "Endpoint for the lost access log records number"
+    get:
+      operationId: getStatusAccessLogLost
+      summary: "Retrieve the lost access log records number"
+      description: "Retrieves the number of access log records dropped
+        because the record could not be built or the write did not
+        complete."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `lost` number exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+                format: int64
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusAccessLogLost"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/telemetry:
+    summary: "Endpoint for the `telemetry` status object"
+    get:
+      operationId: getStatusTelemetry
+      summary: "Retrieve the telemetry status object"
+      description: "Retrieves the `telemetry` status object that represents
+        Unit's [OpenTelemetry export statistics]
+        (https://unit.nginx.org/statusapi/)."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `telemetry` object exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/statusTelemetry"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusTelemetry"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/telemetry/spans:
+    summary: "Endpoint for the `spans` telemetry object"
+    get:
+      operationId: getStatusTelemetrySpans
+      summary: "Retrieve the telemetry spans object"
+      description: "Retrieves the `spans` object that represents Unit's
+        [OpenTelemetry span export counters]
+        (https://unit.nginx.org/statusapi/)."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `spans` object exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/statusTelemetrySpans"
+
+              examples:
+                example1:
+                  $ref: "#/components/examples/statusTelemetrySpans"
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/telemetry/spans/exported:
+    summary: "Endpoint for the `exported` spans number"
+    get:
+      operationId: getStatusTelemetrySpansExported
+      summary: "Retrieve the exported spans number"
+      description: "Retrieves the `exported` spans number from Unit's
+        [telemetry statistics](https://unit.nginx.org/statusapi/), the spans
+        the collector accepted."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `exported` number exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+                format: int64
+
+              examples:
+                Exported:
+                  value: 4096
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/telemetry/spans/failed:
+    summary: "Endpoint for the `failed` spans number"
+    get:
+      operationId: getStatusTelemetrySpansFailed
+      summary: "Retrieve the failed spans number"
+      description: "Retrieves the `failed` spans number from Unit's
+        [telemetry statistics](https://unit.nginx.org/statusapi/), the spans
+        whose export failed."
+
+      tags:
+        - status
+
+      responses:
+        "200":
+          description: "OK; the `failed` number exists in the configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+                format: int64
+
+              examples:
+                Failed:
+                  value: 0
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
 
   /status/applications:
     summary: "Endpoint for the `applications` status object"
@@ -5324,6 +5830,72 @@ paths:
         "404":
           $ref: "#/components/responses/responseNotFound"
 
+  /status/applications/{appName}/processes/unaccounted:
+    summary: "Endpoint for the `unaccounted` processes number"
+    get:
+      operationId: getStatusApplicationsAppProcessesUnaccounted
+      summary: "Retrieve the unaccounted processes app status number"
+      description: "Retrieves the `unaccounted` processes number that
+        represents Unit's per-app
+        [process statistics](https://unit.nginx.org/statusapi/)."
+
+      tags:
+        - status
+
+      parameters:
+        - $ref: "#/components/parameters/appName"
+
+      responses:
+        "200":
+          description: "OK; the `unaccounted` number exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+                format: int64
+
+              examples:
+                Unaccounted:
+                  value: 0
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
+  /status/applications/{appName}/processes/detached:
+    summary: "Endpoint for the `detached` processes number"
+    get:
+      operationId: getStatusApplicationsAppProcessesDetached
+      summary: "Retrieve the detached processes app status number"
+      description: "Retrieves the `detached` processes number that
+        represents Unit's per-app
+        [process statistics](https://unit.nginx.org/statusapi/)."
+
+      tags:
+        - status
+
+      parameters:
+        - $ref: "#/components/parameters/appName"
+
+      responses:
+        "200":
+          description: "OK; the `detached` number exists in the
+            configuration."
+
+          content:
+            application/json:
+              schema:
+                type: integer
+                format: int64
+
+              examples:
+                Detached:
+                  value: 0
+
+        "404":
+          $ref: "#/components/responses/responseNotFound"
+
   /status/applications/{appName}/processes/idle:
     summary: "Endpoint for the `idle` processes number"
     get:
@@ -5443,11 +6015,17 @@ components:
 
     bundleName:
       in: path
-      description: "A certificate bundle's name"
+      description: "A certificate bundle's name.  It is not empty, it is
+        255 bytes or less, and it does not start with \".\" (such names
+        are reserved for the certificate store).  An invalid name gives
+        400 on PUT and DELETE."
       name: bundleName
       required: true
       schema:
         type: string
+        minLength: 1
+        maxLength: 255
+        pattern: "^[^.].*"
 
     langMod:
       in: path
@@ -5495,6 +6073,15 @@ components:
           line: 1
           column: 0
 
+    errorUnknownParameter:
+      summary: "400 error response for an unknown parameter"
+      value:
+        error: "Invalid configuration."
+        detail: 'Unknown parameter "pas".'
+        location:
+          path: "/routes/0/action"
+        suggestion: "pass"
+
     errorValueDoesntExist:
       summary: "404 error response"
       value:
@@ -5518,6 +6105,8 @@ components:
       value:
         bundle:
           key: "RSA (4096 bits)"
+          fingerprint: "5F:0A:3E:8B:1C:27:9D:44:B6:E1:72:C8:0D:35:9A:F4:\
+            6B:E8:21:7C:D3:90:4E:AB:15:66:F2:8D:3C:71:B9:02"
           chain:
             - subject:
                 common_name: "example.com"
@@ -5559,6 +6148,8 @@ components:
       summary: "Single certificate bundle"
       value:
         key: "RSA (4096 bits)"
+        fingerprint: "5F:0A:3E:8B:1C:27:9D:44:B6:E1:72:C8:0D:35:9A:F4:\
+          6B:E8:21:7C:D3:90:4E:AB:15:66:F2:8D:3C:71:B9:02"
         chain:
           - subject:
               common_name: "example.com"
@@ -5757,12 +6348,14 @@ components:
 
         settings:
           http:
+            body_min_rate: 256
             body_read_timeout: 30
             discard_unsafe_fields: true
             header_read_timeout: 30
             idle_timeout: 180
             log_route: true
             max_body_size: 8388608
+            send_min_rate: 16384
             send_timeout: 30
             server_version: false
 
@@ -6029,6 +6622,7 @@ components:
       summary: "Global settings"
       value:
         http:
+          body_min_rate: 256
           body_read_timeout: 30
           compression:
           types:
@@ -6043,6 +6637,7 @@ components:
           idle_timeout: 180
           log_route: true
           max_body_size: 8388608
+          send_min_rate: 16384
           send_timeout: 30
           server_version: false
           static:
@@ -6055,6 +6650,7 @@ components:
     configSettingsHttp:
       summary: "HTTP settings"
       value:
+        body_min_rate: 256
         body_read_timeout: 30
         compression:
           types:
@@ -6069,6 +6665,7 @@ components:
         idle_timeout: 180
         log_route: true
         max_body_size: 8388608
+        send_min_rate: 16384
         send_timeout: 30
         server_version: false
         static:
@@ -6170,12 +6767,21 @@ components:
           closed: 1050
         requests:
           total: 1307
+        access_log:
+          path: "/var/log/unit/access.log"
+          lost: 0
+        telemetry:
+          spans:
+            exported: 4096
+            failed: 0
         applications:
           wp:
             processes:
               running: 9
               starting: 1
+              unaccounted: 0
               idle: 0
+              detached: 0
             requests:
               active: 15
 
@@ -6235,7 +6841,9 @@ components:
           processes:
             running: 9
             starting: 1
+            unaccounted: 0
             idle: 0
+            detached: 0
           requests:
             active: 15
 
@@ -6246,7 +6854,9 @@ components:
         processes:
           running: 9
           starting: 1
+          unaccounted: 0
           idle: 0
+          detached: 0
         requests:
           active: 15
 
@@ -6256,7 +6866,9 @@ components:
       value:
         running: 9
         starting: 1
+        unaccounted: 0
         idle: 0
+        detached: 0
 
     # /status/applications/{appName}/requests
     statusApplicationsAppRequests:
@@ -6269,6 +6881,36 @@ components:
       summary: "Regular requests status object"
       value:
         total: 1307
+
+    # /status/access_log
+    statusAccessLog:
+      summary: "Regular access log status object"
+      value:
+        path: "/var/log/unit/access.log"
+        lost: 0
+
+    statusAccessLogPath:
+      summary: "Path of the configured access log"
+      value: "/var/log/unit/access.log"
+
+    statusAccessLogLost:
+      summary: "Access log records dropped by the writer"
+      value: 0
+
+    # /status/telemetry
+    statusTelemetry:
+      summary: "Regular telemetry status object"
+      value:
+        spans:
+          exported: 4096
+          failed: 0
+
+    # /status/telemetry/spans
+    statusTelemetrySpans:
+      summary: "Regular telemetry spans status object"
+      value:
+        exported: 4096
+        failed: 0
 
   # -- RESPONSES --
 
@@ -6309,6 +6951,9 @@ components:
             example1:
               $ref: "#/components/examples/errorInvalidJson"
 
+            example2:
+              $ref: "#/components/examples/errorUnknownParameter"
+
     responseNotFound:
       description: "Not Found; the value does not exist in the configuration.
         This may occur if any part of the path is non-existent."
@@ -6321,6 +6966,14 @@ components:
           examples:
             example1:
               $ref: "#/components/examples/errorValueDoesntExist"
+
+    responsePayloadTooLarge:
+      description: "Payload Too Large.  The certificate bundle is over 1 MiB."
+
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/jsonErrorMessage"
 
     responseInternalError:
       description: "Internal server error; the configuration wasn't applied.
@@ -6360,9 +7013,66 @@ components:
 
     jsonErrorMessage:
       type: object
-      description: "JSON message on error."
+      description: "JSON message on error. Only `error` is always present;
+        each of the others is omitted where it does not apply."
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: "What went wrong, in a human-readable sentence."
+
+        detail:
+          type: string
+          description: "A longer explanation of the error, where one adds
+            anything to the message."
+
+        location:
+          $ref: "#/components/schemas/errorLocation"
+
+        suggestion:
+          type: string
+          description: "The name the request most likely meant, reported when
+            an unknown parameter is a close and unambiguous typo of a known
+            one."
+
       additionalProperties:
         type: string
+
+    errorLocation:
+      type: object
+      description: "Where the error is. Present when it can be placed. Which
+        members appear depends on how it was found, and they do not index the
+        same document: `offset`, `line` and `column` locate the error in the
+        request body, while `path` locates it in the resulting configuration."
+      properties:
+        offset:
+          type: integer
+          description: "Byte offset into the request body, reported only for
+            an error found while parsing it. A leading UTF-8 byte order mark
+            is skipped before parsing, so the offset is relative to the JSON
+            that follows it rather than to the bytes sent."
+
+        line:
+          type: integer
+          description: "Line number, reported with `column` and only for an
+            error found while parsing."
+
+        column:
+          type: integer
+          description: "Column number, reported with `line`."
+
+        path:
+          type: string
+          description: "An RFC 6901 JSON Pointer to the member whose value
+            failed validation, to the member a required parameter is missing
+            from, or to the containing object when the failure is an unknown
+            parameter, whose name the message itself carries. It points into
+            the configuration the request would produce, not into the request
+            body: a request to a path below \"/config\" is validated against a
+            copy of the whole configuration with the change applied, so the
+            pointer is rooted at the configuration and an empty string is the
+            configuration itself."
 
     # Configuration sections as data types; hugely reliant on each other
 
@@ -6381,6 +7091,12 @@ components:
         key:
           type: string
           description: "Certificate bundle's key type, i. e. RSA, ECDSA, etc."
+
+        fingerprint:
+          type: string
+          description: "SHA-256 fingerprint of the first certificate in the
+            bundle, in the form `openssl x509 -fingerprint -sha256` prints
+            it: uppercase hex, a colon between the bytes."
 
         chain:
           $ref: "#/components/schemas/certBundleChain"
@@ -6493,6 +7209,17 @@ components:
 
           default: '$remote_addr - - [$time_local] "$request_line" $status
             $body_bytes_sent "$header_referer" "$header_user_agent"'
+
+        if:
+          description: "Condition that must be true for a request to be
+            logged. The value is a template string; it is false when it
+            renders to an empty string, `0`, `false`, `null`, or
+            `undefined`, and true otherwise. A leading `!` negates the
+            result. A condition that cannot be rendered, such as a JS
+            expression that throws, is not true: the request is not logged.
+            A JS expression that throws is reported in the error log."
+
+          type: string
 
         path:
           type: string
@@ -6694,6 +7421,12 @@ components:
               type: integer
               description: "Request timeout in seconds."
 
+            start_timeout:
+              type: integer
+              description: "Time in seconds an application process may take to
+                announce itself before Unit fails the start request; 0, the
+                default, means no limit."
+
         processes:
           description: "Governs the behavior of app processes."
           anyOf:
@@ -6883,6 +7616,17 @@ components:
                 filesystem:
                   $ref: "#/components/schemas/stringArray"
                   description:  "Host directories this application may have access to."
+
+            execution_timeout:
+              type: integer
+              description: "Time in seconds a component may run for one request
+                before Unit stops it; 0, the default, means no limit. Unit
+                answers 500 if the component has not begun its response; once
+                its headers are sent, the client sees a truncated response
+                instead. This bounds the guest, not the request: it runs from
+                the guest's first instruction until it returns, waits inside
+                host calls included. To bound what the client waits for, use
+                limits/timeout, which answers 503."
 
     configApplicationPHP:
       description: "PHP application on Unit."
@@ -7131,6 +7875,14 @@ components:
         host:
           description: "Host header field."
           $ref: "#/components/schemas/stringOrStringArray"
+
+        if:
+          description: "Condition that must be true for the step to match.
+            The value is a template string; it is false when it renders to
+            an empty string, `0`, `false`, `null`, or `undefined`, and true
+            otherwise. A leading `!` negates the result."
+
+          type: string
 
         method:
           description: "Method from the request line."
@@ -7485,6 +8237,41 @@ components:
         in Unit."
 
       properties:
+        body_buffer_size:
+          type: integer
+          format: int64
+          minimum: 0
+          description: "Maximum number of bytes of a client’s request body
+            that Unit keeps in memory.  A larger body is stored in a
+            temporary file.  On 32-bit platforms, less than 2147483648."
+
+          default: 16384
+
+        body_min_rate:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+          description: "Minimum rate of the client request body, in bytes
+            per second.  Only HTTP/1 connections use this check.  The check
+            starts after a grace time.  The grace
+            time is equal to `body_read_timeout`.  After the grace time,
+            if the client sent fewer bytes than `body_min_rate` multiplied
+            by the elapsed seconds, Unit sends 408 and closes the
+            connection.  The rate is checked for each window of at least
+            the grace time, so bytes sent early give no credit later.  Unit
+            counts the body bytes that it reads after the request header.
+            The read that completes the body is not checked, because the
+            body is then complete.  If `body_read_timeout` is 0, there is
+            no grace time.  Each read is then checked against the time
+            since the previous read, or since Unit started to read the
+            body.  A `body_read_timeout` of 0 also turns off the timer that
+            stops a client that sends nothing.  The check runs only when
+            a read completes, so a client that stops sending is then never
+            stopped.  A `body_min_rate` of 0 disables the check.  Use the
+            value 256 to stop slow clients (\"slow POST\")."
+
+          default: 0
+
         body_read_timeout:
           type: integer
           description: "Maximum number of seconds to read data from the body of
@@ -7517,6 +8304,26 @@ components:
 
           default: 180
 
+        large_header_buffer_size:
+          type: integer
+          format: int64
+          minimum: 0
+          description: "Size in bytes of each buffer for a request header
+            that does not fit in the first 2048 bytes.  A header field must
+            fit in one buffer.  On 32-bit platforms, less than 2147483648."
+
+          default: 8192
+
+        large_header_buffers:
+          type: integer
+          format: int64
+          minimum: 0
+          description: "Maximum number of buffers of
+            `large_header_buffer_size` bytes for a request header.
+            On 32-bit platforms, less than 2147483648."
+
+          default: 4
+
         log_route:
           type: boolean
           description: "Enables or disables router logging."
@@ -7524,10 +8331,40 @@ components:
 
         max_body_size:
           type: integer
+          format: int64
+          minimum: 0
           description: "Maximum number of bytes in the body of a
-            client’s request."
+            client’s request.  On 32-bit platforms, less than 2147483648."
 
           default: 8388608
+
+        send_min_rate:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+          description: "Minimum rate at which the client reads the response,
+            in bytes per second.  Only HTTP/1 connections use this check.
+            Unit measures only the time when response
+            data waits for the client.  The check starts after a grace time.
+            The grace time is equal to `send_timeout`.  After the grace
+            time, if the client accepted fewer bytes than `send_min_rate`
+            multiplied by the elapsed seconds, Unit closes the connection.
+            The rate is checked for each window of at least the grace time.
+            Unit counts the bytes that the kernel accepts into the socket
+            send buffer.  The kernel sizes this buffer to the link, so the
+            measured rate is near the real download rate of the client.  A
+            floor above the bandwidth of honest slow clients stops their
+            downloads.  Use a small value, for example 16384.  If
+            `send_timeout` is 0, there is no grace time.  Each write is
+            then checked against the time since the previous write, but
+            only the time when response data waits for the client is
+            counted.  A `send_timeout` of 0 also turns off the timer that
+            stops a client that reads nothing.  The check runs only when
+            a write completes, so a client that stops reading is then never
+            stopped.  A `send_min_rate` of 0 disables the check.  WebSocket
+            connections do not use this check."
+
+          default: 0
 
         send_timeout:
           type: integer
@@ -7589,7 +8426,10 @@ components:
 
           min_length:
             type: integer
-            description: "Minimum amount of data to consider for compressing."
+            format: int64
+            minimum: 0
+            description: "Minimum amount of data to consider for compressing.
+              On 32-bit platforms, less than 2147483648."
 
     # /config/settings/http/compression/compressors/{arrayIndex}/encoding
     configSettingsHttpCompressionCompressorsCompressorEncoding:
@@ -7604,8 +8444,11 @@ components:
     # /config/settings/http/compression/compressors/{arrayIndex}/min_length
     configSettingsHttpCompressionCompressorsCompressorMinLength:
       type: integer
+      format: int64
+      minimum: 0
       description: "An integer describing the minimum length of data to
-        consider ofr compression."
+        consider ofr compression.  On 32-bit platforms, less than
+        2147483648."
 
     # /config/settings/http/static
     configSettingsHttpStatic:
@@ -7645,6 +8488,12 @@ components:
 
         requests:
           $ref: "#/components/schemas/statusRequests"
+
+        access_log:
+          $ref: "#/components/schemas/statusAccessLog"
+
+        telemetry:
+          $ref: "#/components/schemas/statusTelemetry"
 
         applications:
           $ref: "#/components/schemas/statusApplications"
@@ -7703,6 +8552,23 @@ components:
           type: integer
           description: "Current starting app processes."
 
+        unaccounted:
+          type: integer
+          format: int64
+          description: "App processes Unit started and can no longer see: a
+            worker that a `limits/start_timeout` deadline gave up on is still
+            running, but never announced itself, so Unit has no pid for it.
+            They count against `processes/max` until they announce themselves
+            after all, or exit."
+
+        detached:
+          type: integer
+          format: int64
+          description: "App processes that answered a request and kept
+            running, such as a PHP script after `fastcgi_finish_request()`.
+            They are counted in `running`, never in `idle`, and hold their
+            slot under `processes/max` until the work ends."
+
         idle:
           type: integer
           description: "Current idle app processes."
@@ -7723,7 +8589,56 @@ components:
       properties:
         total:
           type: integer
+          format: int64
           description: "Total non-API requests during the instance’s lifetime."
+
+    # /status/access_log
+    statusAccessLog:
+      description: "Represents the access log's write health. The object is
+        omitted unless the configuration has an access log, so its absence is
+        how a client tells a log that is off from a log that lost nothing."
+      type: object
+      properties:
+        path:
+          type: string
+          description: "Path of the configured access log."
+
+        lost:
+          type: integer
+          format: int64
+          description: "Records dropped because the record could not be
+            built or the write did not complete. Cumulative for the live
+            log."
+
+    # /status/telemetry
+    statusTelemetry:
+      description: "Represents the health of Unit's OpenTelemetry span
+        export. The object is omitted entirely unless Unit was built with
+        OpenTelemetry support, `/config/settings/telemetry` is set, and the
+        exporter was built successfully, so its absence is how a client tells
+        telemetry that is off from telemetry that is idle."
+      type: object
+      properties:
+        spans:
+          $ref: "#/components/schemas/statusTelemetrySpans"
+
+    # /status/telemetry/spans
+    statusTelemetrySpans:
+      description: "Represents Unit's OpenTelemetry span export counters.
+        Both are cumulative since the exporter was last built, so changing
+        any telemetry setting restarts them, while re-applying an identical
+        configuration does not."
+      type: object
+      properties:
+        exported:
+          type: integer
+          format: int64
+          description: "Spans the collector accepted."
+
+        failed:
+          type: integer
+          format: int64
+          description: "Spans whose export failed."
 
     # /status/connections
     statusConnections:
@@ -7732,19 +8647,23 @@ components:
       properties:
         accepted:
           type: integer
+          format: int64
           description: "Total accepted connections during the
             instance’s lifetime."
 
         active:
           type: integer
+          format: int64
           description: "Current active connections for the instance."
 
         idle:
           type: integer
+          format: int64
           description: "Current idle connections for the instance."
 
         closed:
           type: integer
+          format: int64
           description: "Total closed connections during
             the instance’s lifetime."
 

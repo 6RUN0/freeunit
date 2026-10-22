@@ -76,6 +76,9 @@ single `grep` finds every side of a case. E.g. token `chunked_response`:
 
 | Port | Token | Mode (CLI) | Rust handler | pytest |
 |------|-------|-----------|--------------|--------|
+| 7976 | — | — (plain-Python upstream in the test file) | — | `test_proxy_te.py` (upstream Transfer-Encoding framing: `chunked` in any letter case, lists, several field lines, Transfer-Encoding together with Content-Length) |
+| 7977 | — | — (plain-Python upstream in the test file) | — | `test_proxy_interim.py` (the proxy drops upstream 1xx responses and sends the final one) |
+| 7978 | — | — (plain-Python upstream in the test file) | — | `test_proxy_head.py` (bodyless upstream response: header block, with or without trailing bytes, then close — not a `fake_upstream` mode, reserved here so the 79xx block stays in one registry) |
 | 7979 | `dup_cl` | `dup-cl` | `respond_dup_cl` | `test_proxy_dup_cl_keepalive_disabled` (duplicate upstream Content-Length disables downstream keepalive for a keep-alive client; complete body keeps its terminal chunk) — out of the 7983–7999 block below, which is exhausted; 7980–7982 are `fake_otlp`, so 7974–7979 is the free gap |
 | 7983 | `dup_cl` | `dup-cl` | `respond_dup_cl` | `test_proxy_dup_cl_raw` (zero raw `Content-Length` occurrences on the wire, complete re-framed chunked body) |
 | 7984 | `dup_cl` | `dup-cl` | `respond_dup_cl` | `test_proxy_dup_cl` (duplicate upstream Content-Length → neither forwarded, body re-framed, #113) |
@@ -96,12 +99,21 @@ single `grep` finds every side of a case. E.g. token `chunked_response`:
 
 > **7999 is not available here.** `test/test_proxy.py` and `test/test_proxy_chunked.py`
 > already bind `SERVER_PORT = 7999` for their own upstream, so this registry ends at
-> 7998. New `fake_upstream` slots go to the 7974–7979 gap (7980–7982 are `fake_otlp`).
+> 7998. New `fake_upstream` slots go to the 7974–7975 gap (7976 is taken by
+> `test_proxy_te.py` and 7977 by `test_proxy_interim.py` above, 7978–7979 are
+> taken above, 7980–7982 are `fake_otlp`).
+>
+> `--port` (see `test/unit/port.py`) moves 7976–7999 together with the
+> listeners, so two test runs can use different bases at the same time. A test
+> reads its port through `port_map.port()`. A new slot below 7976 must also be
+> added to `LITERALS` in `test/unit/port.py`; `test_port_map.py` checks that
+> every port in this table is in the map, and `unit/port_lint.py` refuses a
+> `port_map.port()` call with a port that is not.
 
 A test pins its port as a module constant referencing this table:
 
 ```python
-UPSTREAM_PORT = 7994                       # reserved here for #72
+UPSTREAM_PORT = port_map.port(7994)        # reserved here for #72
 proc = _run_chunked_response()             # --mode chunked-response --size 64
 try:
     client.conf({... "proxy": f"http://127.0.0.1:{UPSTREAM_PORT}" ...})

@@ -54,10 +54,23 @@ typedef off_t                nxt_off_t;
  */
 #if (NXT_QNX)
 /*
- * QNX defines time_t as uint32_t.
- * Y2038 fix: "typedef int64_t  nxt_time_t".
+ * QNX before SDP 8.0 defines time_t as an unsigned 32-bit type, so the
+ * signed type of the same width this arm used could not represent any
+ * instant past 2038-01-19.  SDP 8.0 and later use a signed 64-bit time_t
+ * (https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.prog/topic/
+ * timing_Time_functions.html), where this arm matches the generic branch
+ * and the typedef below is a no-op.
+ *
+ * NXT_TIME_T_SIZE is probed by auto/types from the native sizeof(time_t),
+ * which is 4 on a pre-8.0 QNX, but every user of the macro -- the NXT_TIME_T_*
+ * macros below, the Y2038 guard in nxt_time_parse(), and the gmtime test --
+ * asks it about nxt_time_t rather than about time_t.  Redefine it to match
+ * the type it is read as.
  */
-typedef int32_t              nxt_time_t;
+typedef int64_t              nxt_time_t;
+
+#undef NXT_TIME_T_SIZE
+#define NXT_TIME_T_SIZE      8
 
 #else
 /* Y2038, if time_t is 32-bit integer. */
@@ -121,6 +134,16 @@ typedef uint32_t             nxt_uoff_t;
 #define NXT_OFF_T_HEXLEN     NXT_INT32_T_HEXLEN
 #define NXT_OFF_T_MAX        NXT_INT32_T_MAX
 #endif
+
+/*
+ * configure measures off_t with _FILE_OFFSET_BITS 64.  A source file that
+ * includes a system header before this one without that macro gets a
+ * different off_t on a system where off_t is 32 bits by default (32-bit
+ * glibc, Solaris, HP-UX, QNX), and the layout of each struct with an off_t
+ * differs between the files.
+ */
+nxt_static_assert(sizeof(off_t) == NXT_OFF_T_SIZE,
+                  "off_t does not have the size that configure measured");
 
 
 #if (NXT_SIZE_T_SIZE == 8)

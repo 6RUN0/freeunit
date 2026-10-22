@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from unit.applications.lang.php import ApplicationPHP
+from unit import port as port_map
 from unit.option import option
 
 prerequisites = {'modules': {'php': 'all'}}
@@ -236,6 +237,109 @@ def test_php_application_fastcgi_finish_request_2(findall, unit_pid):
     errs = findall(r'Error in fastcgi_finish_request')
 
     assert len(errs) == 0, 'no error'
+
+
+def get_flushed(method, url, **kwargs):
+    # The "flush" app sleeps after flush().  Read for less time than the
+    # sleep: what arrives in that time is what flush() sent.  Then read
+    # the rest of the response.
+    sock = client.http(method, url=url, no_recv=True, **kwargs)
+
+    early = client.recvall(sock, read_timeout=0.5).decode()
+    rest = client.recvall(sock).decode()
+    sock.close()
+
+    resp = client._resp_to_dict(early + rest)
+
+    if resp['headers'].get('Transfer-Encoding') == 'chunked':
+        resp['body'] = client._parse_chunked_body(resp['body']).decode()
+
+    return early, resp
+
+
+def test_php_application_flush_headers():
+    client.load('flush', options={'admin': {'output_buffering': '0'}})
+
+    resp = client.get()
+    assert resp['status'] == 200, 'start the application'
+    assert resp['headers']['X-OB-Level'] == '0', 'no output buffer'
+
+    early, resp = get_flushed('GET', '/?sleep=2')
+
+    assert resp['status'] == 200
+    assert resp['body'] == 'part2;headers_sent=true;part3;', 'headers_sent()'
+    assert early.startswith('HTTP/1.1 200 OK\r\n'), 'status line before sleep'
+    assert 'X-Flush: 1\r\n' in early, 'headers before sleep'
+    assert 'Transfer-Encoding: chunked\r\n' in early, 'chunked'
+    assert early.endswith('\r\n\r\n'), 'header end before sleep'
+    assert 'part2' not in early, 'no body before sleep'
+
+    # A response to HTTP/1.0 is not chunked.  The connection close ends
+    # its body.
+    early, resp = get_flushed('GET', '/?sleep=2', http_10=True)
+
+    assert resp['body'] == 'part2;headers_sent=true;part3;', 'HTTP/1.0 body'
+    assert early.startswith('HTTP/1.1 200 OK\r\n'), 'HTTP/1.0 status line'
+    assert 'X-Flush: 1\r\n' in early, 'HTTP/1.0 headers'
+    assert early.endswith('\r\n\r\n'), 'HTTP/1.0 header end'
+
+    early, resp = get_flushed('HEAD', '/?sleep=2')
+
+    assert resp['status'] == 200
+    assert resp['headers']['X-Flush'] == '1'
+    assert resp['body'] == '', 'HEAD body'
+    assert early.startswith('HTTP/1.1 200 OK\r\n'), 'HEAD status line'
+    assert early.endswith('\r\n\r\n'), 'HEAD header end'
+
+
+def test_php_application_flush_output_buffering():
+    client.load('flush', options={'admin': {'output_buffering': '4096'}})
+
+    resp = client.get()
+    assert resp['status'] == 200, 'start the application'
+    assert resp['headers']['X-OB-Level'] == '1', 'output buffer'
+
+    early, resp = get_flushed('GET', '/?sleep=2&part1')
+
+    assert resp['status'] == 200
+    assert (
+        resp['body'] == 'part1;part2;headers_sent=true;part3;'
+    ), 'headers_sent()'
+    assert early.startswith('HTTP/1.1 200 OK\r\n'), 'status line before sleep'
+    assert 'X-Flush: 1\r\n' in early, 'headers before sleep'
+
+    # flush() does not empty the output buffers of PHP, as in mod_php.
+    # ob_flush() does that.  So only the header comes before the sleep.
+    assert early.endswith('\r\n\r\n'), 'header end before sleep'
+    assert 'part1' not in early, 'part1 stays in the output buffer'
+
+
+def test_php_application_flush_after_finish(findall, wait_for_record):
+    # fastcgi_finish_request() ends the response and leaves the context
+    # without a request.  The script then calls flush() twice.
+    client.load('flush_after_finish')
+
+    resp = client.get()
+    assert resp['status'] == 200
+    # The client parses the chunked body, so a cut body fails here.
+    assert resp['headers']['Transfer-Encoding'] == 'chunked'
+    assert resp['body'] == 'before;', 'only the output before the finish'
+
+    pid = resp['headers']['X-Pid']
+
+    # The worker is busy until the script ends.  Then it serves the next
+    # request.
+    resp = client.get()
+    assert resp['status'] == 200
+    assert resp['body'] == 'before;', 'second request'
+
+    assert findall(r'.+\[alert\].+') == [], 'no alert'
+    assert resp['headers']['X-Pid'] == pid, 'the same process'
+
+    assert (
+        wait_for_record(r'php message: flush after finish: done') is not None
+    ), 'the script ran past flush()'
+    assert findall(r'Error in fastcgi_finish_request') == []
 
 
 def test_php_application_query_string_absent():
@@ -705,6 +809,84 @@ def test_php_application_script():
     assert resp['body'] != '', 'body not empty'
 
 
+def php_script_conf(root, script):
+    return client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "applications/script"}},
+            "applications": {
+                "script": {
+                    "type": client.get_application_type(),
+                    "processes": {"spare": 0},
+                    "root": root,
+                    "script": script,
+                }
+            },
+        }
+    )
+
+
+def php_script_tree(temp_dir):
+    Path(f'{temp_dir}/app/sub').mkdir(parents=True)
+    Path(f'{temp_dir}/app2').mkdir()
+
+    for path in ('app/sub', 'app2'):
+        Path(f'{temp_dir}/{path}/index.php').write_text(
+            '<?php echo $_SERVER["SCRIPT_NAME"]; ?>', encoding='utf-8'
+        )
+
+
+def test_php_application_script_under_root(temp_dir):
+    php_script_tree(temp_dir)
+
+    assert 'success' in php_script_conf(f'{temp_dir}/app', 'sub/index.php')
+
+    resp = client.get()
+    assert resp['status'] == 200, 'script in a subdirectory of the root'
+    assert resp['body'] == '/sub/index.php', 'SCRIPT_NAME'
+
+    # The root "/" is trimmed to an empty string, and every absolute path is
+    # under it.  The script is appended to the root, so it can be absolute.
+    script = os.path.realpath(f'{temp_dir}/app/sub/index.php')
+
+    assert 'success' in php_script_conf('/', script)
+
+    resp = client.get()
+    assert resp['status'] == 200, 'script under the root "/"'
+    assert resp['body'] == script, 'SCRIPT_NAME under the root "/"'
+
+
+def test_php_application_script_outside_root(
+    temp_dir, skip_alert, wait_for_record
+):
+    skip_alert(r'script is not under php root')
+    php_script_tree(temp_dir)
+
+    # "<temp_dir>/app2" starts with the bytes of "<temp_dir>/app", but it is
+    # a sibling directory, not a subdirectory.
+    assert 'success' in php_script_conf(
+        f'{temp_dir}/app', '../app2/index.php'
+    )
+
+    assert client.get()['status'] == 503, 'script in a sibling directory'
+    assert (
+        wait_for_record(r'script is not under php root') is not None
+    ), 'sibling directory alert'
+
+
+def test_php_application_script_is_root(
+    temp_dir, skip_alert, wait_for_record
+):
+    skip_alert(r'script is not under php root')
+    php_script_tree(temp_dir)
+
+    assert 'success' in php_script_conf(f'{temp_dir}/app', '.')
+
+    assert client.get()['status'] == 503, 'script is the root directory'
+    assert (
+        wait_for_record(r'script is not under php root') is not None
+    ), 'root directory alert'
+
+
 def test_php_application_index_default():
     assert 'success' in client.conf(
         {
@@ -756,7 +938,8 @@ def test_php_application_trailing_slash(temp_dir):
     resp = client.get(url='/path?q=a')
     assert resp['status'] == 301, 'uri without trailing /'
     assert (
-        resp['headers']['Location'] == 'http://localhost:8080/path/?q=a'
+        resp['headers']['Location']
+        == f'http://localhost:{port_map.port(8080)}/path/?q=a'
     ), 'Location with query string'
 
     resp = client.get(
@@ -970,3 +1153,100 @@ def test_php_application_content_length_not_reinstated():
         resp['headers']['Transfer-Encoding'] == 'chunked'
     ), 'chunked framing'
     assert resp['body'] == '0123456789', 'body intact'
+
+
+def test_php_application_content_type_reset(findall):
+    client.load('content_type_reset', processes=1)
+
+    # Request 1: a POST with a form content type, same worker.
+    resp1 = client.post(
+        headers={
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Host': 'localhost',
+            'Connection': 'close',
+        },
+        body='a=1&b=2',
+    )
+    assert 'post=a,b' in resp1['body']
+
+    # Request 1 may read the body once: that is the form handler this
+    # request asked for. A request without the header must not read it at
+    # all, because PHP reads the body at request startup when the SAPI
+    # content type is set. nxt_php_read_post() records each read, and its
+    # record is compiled out without --debug, so only the sanitize (php)
+    # leg, which builds --debug and runs this file, fails on the code
+    # before the fix. The release legs carry the assertions on $_POST and
+    # php://input only.
+    debug = bool(findall(r'\[debug\]'))
+    reads = len(findall(r'nxt_php_read_post'))
+
+    # Request 2: a POST with NO Content-Type header, same worker.
+    resp2 = client.post(
+        headers={'Host': 'localhost', 'Connection': 'close'},
+        body='c=3&d=4',
+    )
+    assert '|post=empty' in resp2['body'], 'body must not be parsed as a form'
+
+    if debug:
+        reads_after = len(findall(r'nxt_php_read_post'))
+        assert reads_after == reads, (
+            'a request without a "Content-Type" header read the body: '
+            f'{reads} reads before it, {reads_after} after'
+        )
+
+    # Request 3: the raw body is still available through php://input when
+    # the script asks for it.
+    resp3 = client.post(
+        url='/?raw',
+        headers={'Host': 'localhost', 'Connection': 'close'},
+        body='e=5&f=6',
+    )
+    assert '|post=empty' in resp3['body']
+    assert '|raw=e=5&f=6' in resp3['body']
+
+
+@pytest.mark.parametrize(
+    'method,header,status',
+    [('get', 'Location: /x', 302), ('head', 'X-Custom: val', 200)],
+)
+def test_php_application_header_only(
+    method, header, status, findall, wait_for_record
+):
+    client.load('header')
+
+    resp = getattr(client, method)(
+        url=f'/?header_only={method}',
+        headers={
+            'Host': 'localhost',
+            'Connection': 'close',
+            'X-Header': header,
+        }
+    )
+    name, value = header.split(': ', 1)
+    assert resp['status'] == status, 'status'
+    assert resp['headers'][name] == value, 'response header'
+    assert resp['body'] == '', 'body empty'
+
+    # RPC debug records count messages for both the socket and queue paths.
+    # The PHP sanitizer CI leg builds with --debug and runs this file.
+    if not findall(r'\[debug\]'):
+        pytest.skip('response message count needs a --debug build')
+
+    streams = findall(
+        rf'\[unit\] #(\d+): {method.upper()} '
+        rf'/\?header_only={method} \(0\)$'
+    )
+    assert len(streams) == 1, f'{method} request stream'
+    stream = streams[0]
+
+    last = wait_for_record(
+        rf'rpc: stream #{stream} last handler, type (\d+)$'
+    )
+    assert last is not None, f'{method} response completed'
+
+    # Ignore the request-header acknowledgement: DATA has the same type
+    # as the final response message, and must occur exactly once.
+    messages = findall(
+        rf'rpc: stream #{stream} (?:last )?handler, type {last[1]}$'
+    )
+    assert len(messages) == 1, f'{method} response messages: {len(messages)}'

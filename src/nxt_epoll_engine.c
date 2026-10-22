@@ -47,6 +47,8 @@ static void nxt_epoll_disable(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static void nxt_epoll_delete(nxt_event_engine_t *engine, nxt_fd_event_t *ev);
 static nxt_bool_t nxt_epoll_close(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
+static void nxt_epoll_cancel_changes(nxt_event_engine_t *engine,
+    nxt_fd_event_t *ev);
 static void nxt_epoll_enable_read(nxt_event_engine_t *engine,
     nxt_fd_event_t *ev);
 static void nxt_epoll_enable_write(nxt_event_engine_t *engine,
@@ -126,6 +128,7 @@ const nxt_event_interface_t  nxt_epoll_edge_engine = {
     nxt_epoll_disable,
     nxt_epoll_delete,
     nxt_epoll_close,
+    nxt_epoll_cancel_changes,
     nxt_epoll_enable_read,
     nxt_epoll_enable_write,
     nxt_epoll_disable_read,
@@ -172,6 +175,7 @@ const nxt_event_interface_t  nxt_epoll_level_engine = {
     nxt_epoll_disable,
     nxt_epoll_delete,
     nxt_epoll_close,
+    nxt_epoll_cancel_changes,
     nxt_epoll_enable_read,
     nxt_epoll_enable_write,
     nxt_epoll_disable_read,
@@ -409,6 +413,47 @@ nxt_epoll_close(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
     nxt_epoll_delete(engine, ev);
 
     return ev->changing;
+}
+
+
+/*
+ * Take this event's pending changes out of the batch, so that a struct that
+ * is about to be freed is not dereferenced by nxt_epoll_commit_changes().
+ *
+ * The change is dropped rather than committed: the descriptor is closed, or
+ * is about to be, and close() removes it from the epoll set on its own.
+ * Committing instead would epoll_ctl() a descriptor number that may already
+ * name somebody else's file.
+ */
+
+static void
+nxt_epoll_cancel_changes(nxt_event_engine_t *engine, nxt_fd_event_t *ev)
+{
+    nxt_epoll_change_t  *change, *dst, *end;
+
+    if (!ev->changing) {
+        return;
+    }
+
+    dst = engine->u.epoll.changes;
+    end = dst + engine->u.epoll.nchanges;
+
+    for (change = dst; change < end; change++) {
+
+        if (change->event.data.ptr == ev) {
+            continue;
+        }
+
+        if (dst != change) {
+            *dst = *change;
+        }
+
+        dst++;
+    }
+
+    engine->u.epoll.nchanges = (nxt_uint_t) (dst - engine->u.epoll.changes);
+
+    ev->changing = 0;
 }
 
 
@@ -727,7 +772,7 @@ nxt_epoll_add_signal(nxt_event_engine_t *engine)
 static void
 nxt_epoll_signalfd_handler(nxt_task_t *task, void *obj, void *data)
 {
-    int                      n;
+    int                      n, err;
     nxt_fd_event_t           *ev;
     nxt_work_handler_t       handler;
     struct signalfd_siginfo  sfd;
@@ -737,19 +782,45 @@ nxt_epoll_signalfd_handler(nxt_task_t *task, void *obj, void *data)
 
     nxt_debug(task, "signalfd handler");
 
-    n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
+    for ( ;; ) {
+        n = read(ev->fd, &sfd, sizeof(struct signalfd_siginfo));
+        err = nxt_errno;
 
-    nxt_debug(task, "read signalfd(%d): %d", ev->fd, n);
+        nxt_debug(task, "read signalfd(%d): %d", ev->fd, n);
 
-    if (n != sizeof(struct signalfd_siginfo)) {
-        nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, nxt_errno);
-        return;
+        if (nxt_epoll_signalfd_eagain(n, err)) {
+            return;
+        }
+
+        if (n != sizeof(struct signalfd_siginfo)) {
+            if (n == -1) {
+                nxt_alert(task, "read signalfd(%d) failed %E", ev->fd, err);
+            } else {
+                nxt_alert(task, "read signalfd(%d) returned %d", ev->fd, n);
+            }
+
+            return;
+        }
+
+        nxt_debug(task, "signalfd(%d) signo:%d", ev->fd, sfd.ssi_signo);
+
+        handler(task, (void *) (uintptr_t) sfd.ssi_signo, NULL);
     }
-
-    nxt_debug(task, "signalfd(%d) signo:%d", ev->fd, sfd.ssi_signo);
-
-    handler(task, (void *) (uintptr_t) sfd.ssi_signo, NULL);
 }
+
+
+#if (NXT_TESTS)
+
+/* For src/test/nxt_signalfd_test.c. */
+
+void
+nxt_epoll_test_signalfd_handler(nxt_task_t *task, nxt_fd_event_t *ev,
+    nxt_work_handler_t handler)
+{
+    nxt_epoll_signalfd_handler(task, ev, handler);
+}
+
+#endif
 
 #endif
 

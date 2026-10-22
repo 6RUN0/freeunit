@@ -1,17 +1,31 @@
 import io
+import os
+import re
+import shutil
+import socket
 import ssl
+import struct
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+from conftest import unit_run, unit_stop
 from unit.applications.tls import ApplicationTLS
 from unit.option import option
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any', 'openssl': 'any'}}
 
 client = ApplicationTLS()
+
+
+def server_cert(**kwargs):
+    return ssl.get_server_certificate(
+        ('127.0.0.1', port_map.port(8080)), **kwargs
+    )
 
 
 def add_tls(application='empty', cert='default', port=8080):
@@ -81,6 +95,12 @@ basicConstraints = critical,CA:TRUE""",
     Path(f'{option.temp_dir}/certserial').write_text('1000', encoding='utf-8')
     Path(f'{option.temp_dir}/certindex').touch()
     Path(f'{option.temp_dir}/certindex.attr').touch()
+
+
+def replace_cert(name='default'):
+    # Make a new key pair under the same name and store it over the old one.
+    client.certificate(name, False)
+    return client.certificate_load(name)
 
 
 def remove_tls(application='empty', port=8080):
@@ -168,7 +188,6 @@ def test_tls_certificate_remove_nonexisting():
     ), 'remove nonexistings certificate'
 
 
-@pytest.mark.skip('not yet')
 def test_tls_certificate_update():
     client.load('empty')
 
@@ -176,38 +195,823 @@ def test_tls_certificate_update():
 
     add_tls()
 
-    cert_old = ssl.get_server_certificate(('127.0.0.1', 8080))
+    cert_old = server_cert()
+
+    # The listener names the bundle, so Unit applies the configuration
+    # again before it answers.
+    assert (
+        replace_cert().get('success') == 'Certificate chain updated.'
+    ), 'replaced'
+
+    assert cert_old != server_cert(), 'update certificate'
+
+    assert 'chain' in client.conf_get('/certificates/default'), 'listed'
+
+
+def test_tls_certificate_update_unused():
+    client.load('empty')
+
+    client.certificate()
+    client.certificate('unused')
+
+    add_tls()
+
+    # No listener names the bundle, so there is no reconfiguration.
+    assert (
+        replace_cert('unused').get('success') == 'Certificate chain uploaded.'
+    ), 'stored'
+
+
+def test_tls_certificate_update_unchanged():
+    client.load('empty')
 
     client.certificate()
 
-    assert cert_old != ssl.get_server_certificate(
-        ('127.0.0.1', 8080)
-    ), 'update certificate'
+    # Tickets are off by default.  With "tickets": true and no key in the
+    # configuration, the key is a random one of the SSL_CTX that issued the
+    # ticket.  A reconfiguration builds a new context with a new key, so a
+    # resumed session proves that the listener kept its context.
+    assert 'success' in client.conf(
+        {
+            "pass": "applications/empty",
+            "tls": {"certificate": "default", "session": {"tickets": True}},
+        },
+        'listeners/*:8080',
+    )
+
+    path = f'{option.temp_dir}/state/certs/default'
+    stored = os.stat(path)
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.maximum_version = ssl.TLSVersion.TLSv1_2
+
+    def connect(session=None):
+        with socket.create_connection(
+            ('127.0.0.1', port_map.port(8080))
+        ) as sock:
+            with context.wrap_socket(sock, session=session) as ssock:
+                ssock.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
+
+                resp = b''
+                while b'\r\n\r\n' not in resp:
+                    resp += ssock.recv(4096)
+
+                assert resp.startswith(b'HTTP/1.1 200'), 'request'
+
+                return ssock.session, ssock.session_reused
+
+    try:
+        session, reused = connect()
+    except ssl.SSLError as e:
+        # Ticket resumption needs TLS 1.2.  A system crypto policy can
+        # turn it off.
+        pytest.skip(f'TLS 1.2 is not available: {e}')
+
+    assert not reused, 'new session'
+
+    _, reused = connect(session)
+    assert reused, 'session resumed'
+
+    # The same bundle again.  The answer is the one a store gives, but
+    # main writes nothing, and the router keeps its contexts.
+    assert (
+        client.certificate_load('default').get('success')
+        == 'Certificate chain updated.'
+    ), 'unchanged in use'
+
+    stored_default = os.stat(path)
+    assert (stored.st_ino, stored.st_mtime_ns) == (
+        stored_default.st_ino,
+        stored_default.st_mtime_ns,
+    ), 'not stored again'
+
+    _, reused = connect(session)
+    assert reused, 'no reconfiguration'
+
+    # The same bundle under a name no listener uses.
+    client.certificate('unused')
+
+    path_unused = f'{option.temp_dir}/state/certs/unused'
+    stored = os.stat(path_unused)
+
+    assert (
+        client.certificate_load('unused').get('success')
+        == 'Certificate chain uploaded.'
+    ), 'unchanged unused'
+
+    after = os.stat(path_unused)
+    assert stored.st_ino == after.st_ino, 'unused not stored again'
+
+    # A new certificate is stored and applied, as before.
+    assert (
+        replace_cert().get('success') == 'Certificate chain updated.'
+    ), 'replaced'
+
+    assert os.stat(path).st_ino != stored_default.st_ino, 'new bundle stored'
+
+    _, reused = connect(session)
+    assert not reused, 'reconfigured'
+
+
+def test_tls_certificate_update_keepalive():
+    client.load('empty')
+
+    client.certificate()
+
+    add_tls()
+
+    (resp, sock) = client.get_ssl(
+        headers={'Host': 'localhost', 'Connection': 'keep-alive'},
+        start=True,
+        read_timeout=1,
+    )
+
+    assert resp['status'] == 200, 'keepalive 1'
+
+    cert_old = sock.getpeercert(True)
+
+    assert 'success' in replace_cert(), 'replaced'
+
+    # The accepted connection keeps its old TLS context.
+    (resp, sock) = client.get_ssl(
+        headers={'Host': 'localhost', 'Connection': 'close'},
+        sock=sock,
+        start=True,
+    )
+
+    assert resp['status'] == 200, 'keepalive 2'
+    assert sock.getpeercert(True) == cert_old, 'old connection, old cert'
+    sock.close()
+
+    (resp, sock) = client.get_ssl(
+        headers={'Host': 'localhost', 'Connection': 'close'}, start=True
+    )
+
+    assert resp['status'] == 200, 'new connection'
+    assert sock.getpeercert(True) != cert_old, 'new connection, new cert'
+
+
+def test_tls_certificate_update_inflight():
+    client.load('empty')
+
+    client.certificate()
+
+    add_tls()
+
+    # Send half of the request before the replacement and the rest after.
+    sock = client.http(
+        b'GET / HTTP/1.1\r\nHost: localhost\r\n',
+        raw=True,
+        no_recv=True,
+        wrapper=client._default_context.wrap_socket,
+    )
+
+    cert_old = sock.getpeercert(True)
+
+    assert 'success' in replace_cert(), 'replaced'
+
+    resp = client.http(b'Connection: close\r\n\r\n', raw=True, sock=sock)
+
+    assert resp['status'] == 200, 'in-flight request'
+    assert cert_old != server_cert(), 'new handshake, new cert'
+
+
+def test_tls_certificate_update_mismatch(skip_alert):
+    skip_alert(r'certificate and private key do not match')
+
+    client.load('empty')
+
+    client.certificate()
+
+    add_tls()
+
+    cert_old = server_cert()
+
+    # Unit refuses a bundle with the wrong key.  Nothing changes.
+    client.certificate('other', False)
+
+    assert 'error' in client.certificate_load('default', 'other'), 'refused'
+
+    assert cert_old == server_cert(), 'old certificate still served'
+
+    assert 'chain' in client.conf_get('/certificates/default'), 'still listed'
+
+
+def test_tls_certificate_update_store_fail(skip_alert):
+    skip_alert(r'unlink.*failed', r'failed to store certificate')
+
+    client.load('empty')
+
+    client.certificate()
+
+    add_tls()
+
+    cert_old = server_cert()
+    info_old = client.conf_get('/certificates/default')
+
+    # A directory with a file in it blocks the temporary file of main.
+    tmp = f'{option.temp_dir}/state/certs/.store.tmp'
+    os.makedirs(tmp)
+    Path(f'{tmp}/block').touch()
+
+    assert (
+        replace_cert()['error'] == 'Failed to store certificate.'
+    ), 'store failed'
+
+    # The old metadata is back, and the old bundle stays in use.
+    assert client.conf_get('/certificates/default') == info_old, 'old info'
+    assert cert_old == server_cert(), 'old certificate still served'
+
+    # A new name is removed from the metadata.
+    assert 'error' in replace_cert('new'), 'new store failed'
+    assert 'new' not in client.conf_get('/certificates'), 'no new info'
+    assert 'new' not in client.conf_get('/')['certificates'], 'not in root'
+
+    shutil.rmtree(tmp)
+
+
+def test_tls_certificate_upload_stored():
+    """The 200 of an upload comes only when main has stored the bundle.
+    Main stores it in a child process
+    (https://github.com/freeunitorg/freeunit/issues/516) and answers when
+    the child exits.  Two uploads sent at the same time both land."""
+
+    names = ('first', 'second', 'third')
+
+    bundles = {}
+
+    for name in names:
+        client.certificate(name, False)
+
+        with open(f'{option.temp_dir}/{name}.key', 'rb') as k, open(
+            f'{option.temp_dir}/{name}.crt', 'rb'
+        ) as c:
+            bundles[name] = k.read() + c.read()
+
+    certs = Path(f'{option.temp_dir}/state/certs')
+
+    # One upload.  The file is complete when the answer arrives.
+    assert 'success' in client.conf(
+        bundles['first'], '/certificates/first'
+    ), 'first uploaded'
+    assert (certs / 'first').read_bytes() == bundles['first'], 'first stored'
+
+    # Two uploads at the same time.  The controller runs one after the
+    # other, and main stores each one.
+    def upload(name):
+        return ApplicationTLS().conf(bundles[name], f'/certificates/{name}')
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        answers = list(pool.map(upload, ('second', 'third')))
+
+    for name, answer in zip(('second', 'third'), answers):
+        assert 'success' in answer, f'{name} uploaded'
+        assert (certs / name).read_bytes() == bundles[name], f'{name} stored'
+
+    assert set(names) <= set(client.conf_get('/certificates')), 'listed'
+    assert not (certs / '.store.tmp').exists(), 'no temporary file'
+
+
+def unit_children(unit_pid, name):
+    out = subprocess.check_output(
+        ['ps', 'ax', '-o', 'pid=,ppid=,args=']
+    ).decode()
+    return [
+        f[0]
+        for f in (line.split(None, 2) for line in out.splitlines())
+        if len(f) == 3 and f[1] == str(unit_pid) and name in f[2]
+    ]
+
+
+def trace_fsync(unit_pid):
+    """Delay each fsync(2) of main and its children by 2 s with strace.
+    Skip the test when strace is not installed or cannot attach."""
+
+    strace = shutil.which('strace')
+    if strace is None:
+        pytest.skip('strace is not installed')
+
+    tracer = subprocess.Popen(
+        [
+            strace,
+            '-f',
+            '-p',
+            str(unit_pid),
+            '-o',
+            '/dev/null',
+            '-e',
+            'trace=fsync',
+            '-e',
+            'inject=fsync:delay_exit=2000000',
+        ],
+        stderr=subprocess.PIPE,
+    )
+
+    # strace says "Process N attached" on stderr once it traces main.
+    line = tracer.stderr.readline().decode()
+    if 'attached' not in line:
+        tracer.kill()
+        tracer.wait()
+        pytest.skip(f'strace cannot attach: {line.strip()}')
+
+    return tracer
+
+
+def test_tls_certificate_upload_router_restart(
+    skip_alert, skip_fds_check, unit_pid
+):
+    """A router that restarts while main stores a bundle does not make the
+    controller run the upload again.  The upload gets one 200, a change
+    sent during the store runs after it, and the controller survives.
+
+    strace delays each fsync(2) of main and its children by 2 s, so the
+    store child of the upload runs for about 4 s."""
+
+    def children(name):
+        return unit_children(unit_pid, name)
+
+    client.certificate('slow', False)
+
+    with open(f'{option.temp_dir}/slow.key', 'rb') as k, open(
+        f'{option.temp_dir}/slow.crt', 'rb'
+    ) as c:
+        bundle = k.read() + c.read()
+
+    controller = children('unit: controller')
+    router = children('unit: router')
+    assert len(controller) == 1 and len(router) == 1, 'processes'
+
+    tracer = trace_fsync(unit_pid)
+
+    done = {}
+    stored = Path(f'{option.temp_dir}/state/certs/slow')
+
+    def upload():
+        body = ApplicationTLS().conf(bundle, '/certificates/slow')
+        on_disk = stored.exists() and stored.read_bytes() == bundle
+        done['upload'] = (body, on_disk)
+
+    def change():
+        start = time.monotonic()
+        body = ApplicationTLS().conf(
+            {"http": {"idle_timeout": 77}}, 'settings'
+        )
+        done['change'] = (time.monotonic() - start, body)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(upload)
+
+            # The store child is in its first fsync(2) now.
+            time.sleep(1)
+
+            skip_fds_check(router=True)
+            skip_alert(fr'process {router[0]} exited on signal 9')
+            subprocess.call(['kill', '-9', router[0]])
+
+            for _ in range(50):
+                new = children('unit: router')
+                if new and new != router:
+                    break
+                time.sleep(0.1)
+
+            # Let the new router get the configuration.
+            time.sleep(0.5)
+
+            second = pool.submit(change)
+
+            first.result(timeout=30)
+            second.result(timeout=30)
+
+    finally:
+        tracer.terminate()
+        tracer.wait(10)
+
+    assert 'success' in done['upload'][0], 'one 200 for the upload'
+    assert done['upload'][1], 'the bundle is on disk at the 200'
+    assert 'success' in done['change'][1], 'the change is applied'
+
+    # The store runs about 4 s, and it started about 1.5 s before the
+    # change was sent.  A change that did not wait takes milliseconds.
+    assert done['change'][0] > 1, 'the change waited for the store'
+
+    # Main has answered the upload; the controller must still run.
+    time.sleep(0.5)
+
+    assert children('unit: controller') == controller, 'controller survived'
+    assert client.conf_get('settings/http/idle_timeout') == 77
+
+
+def test_tls_certificate_update_router_restart(
+    skip_alert, skip_fds_check, unit_pid
+):
+    """A listener uses the bundle, and the router restarts while main
+    stores it.  The store ends while the new router still applies its
+    first configuration, because the application takes 8 s to start.  The
+    controller sends the configuration again only after that apply ends.
+    Before, it sent it at once.  The two applies ran at the same time in
+    the router: the upload got 500, the listener stopped answering, and the
+    next change crashed the router.
+
+    strace delays each fsync(2) of main and its children by 2 s, so the
+    store child of the upload runs for about 4 s."""
+
+    def children(name):
+        return unit_children(unit_pid, name)
+
+    bundles = {}
+
+    for name in ('old', 'new'):
+        client.certificate(name, False)
+
+        with open(f'{option.temp_dir}/{name}.key', 'rb') as k, open(
+            f'{option.temp_dir}/{name}.crt', 'rb'
+        ) as c:
+            bundles[name] = k.read() + c.read()
+
+    def served():
+        pem = server_cert(timeout=10)
+        return ssl.PEM_cert_to_DER_cert(pem)
+
+    def der(name):
+        pem = Path(f'{option.temp_dir}/{name}.crt').read_text(encoding='utf-8')
+        return ssl.PEM_cert_to_DER_cert(pem)
+
+    assert 'success' in client.conf(bundles['old'], '/certificates/c')
+
+    app = f'{option.test_dir}/python/slow_start'
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "applications/slow_start",
+                    "tls": {"certificate": "c"},
+                }
+            },
+            "applications": {
+                "slow_start": {
+                    "type": "python",
+                    "processes": 1,
+                    "path": app,
+                    "working_directory": app,
+                    "module": "wsgi",
+                    "environment": {"UNIT_SLOW_START": "8"},
+                }
+            },
+        }
+    )
+
+    assert served() == der('old'), 'the old certificate before'
+
+    router = children('unit: router')
+    assert len(router) == 1, 'one router'
+
+    stored = Path(f'{option.temp_dir}/state/certs/c')
+
+    tracer = trace_fsync(unit_pid)
+
+    done = {}
+
+    def upload():
+        start = time.monotonic()
+        body = ApplicationTLS().conf(bundles['new'], '/certificates/c')
+        done['upload'] = (time.monotonic() - start, body)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(upload)
+
+            # The store child is in its first fsync(2) now.
+            time.sleep(1)
+
+            assert stored.read_bytes() == bundles['old'], 'store not done'
+
+            skip_fds_check(router=True)
+            skip_alert(fr'process {router[0]} exited on signal 9')
+            subprocess.call(['kill', '-9', router[0]])
+
+            first.result(timeout=60)
+
+    finally:
+        tracer.terminate()
+        tracer.wait(10)
+
+    elapsed, body = done['upload']
+
+    assert body.get('success') == 'Certificate chain updated.', 'applied'
+
+    # The store ends after about 4 s.  The first configuration of the new
+    # router ends after the application starts, 8 s after the kill.
+    assert elapsed > 6, 'the upload waited for the first configuration'
+
+    assert served() == der('new'), 'the new certificate'
+
+    router = children('unit: router')
+    assert len(router) == 1, 'one new router'
+
+    assert 'success' in client.conf(
+        {"http": {"idle_timeout": 77}}, 'settings'
+    ), 'a later change'
+
+    assert served() == der('new'), 'the new certificate after the change'
+    assert client.get_ssl()['status'] == 200, 'the listener answers'
+    assert children('unit: router') == router, 'the router survived'
+
+
+def test_tls_certificate_update_controller_restart(
+    skip_alert, skip_fds_check, unit_pid
+):
+    """A listener uses the bundle, and the controller exits while main
+    stores a new one.  Main starts the new controller only when the store
+    ends, so the new controller reads the new bundle from disk.  It lists
+    the new certificate, and the router serves it.  When main started the
+    controller at once, the new controller read the old bundle.  The answer
+    of the store went to the controller that had gone, so the router served
+    the old certificate after the store ended.
+
+    strace delays each fsync(2) of main and its children by 2 s, so the
+    store child of the upload runs for about 4 s."""
+
+    def children(name):
+        return unit_children(unit_pid, name)
+
+    bundles = {}
+
+    for name in ('old', 'new'):
+        client.certificate(name, False)
+
+        with open(f'{option.temp_dir}/{name}.key', 'rb') as k, open(
+            f'{option.temp_dir}/{name}.crt', 'rb'
+        ) as c:
+            bundles[name] = k.read() + c.read()
+
+    def served():
+        pem = server_cert(timeout=10)
+        return ssl.PEM_cert_to_DER_cert(pem)
+
+    def der(name):
+        pem = Path(f'{option.temp_dir}/{name}.crt').read_text(encoding='utf-8')
+        return ssl.PEM_cert_to_DER_cert(pem)
+
+    client.load('empty')
+
+    assert 'success' in client.conf(bundles['old'], '/certificates/c')
+
+    add_tls(cert='c')
+
+    assert served() == der('old'), 'the old certificate before'
+
+    controller = children('unit: controller')
+    assert len(controller) == 1, 'one controller'
+
+    stored = Path(f'{option.temp_dir}/state/certs/c')
+
+    tracer = trace_fsync(unit_pid)
+
+    done = {}
+
+    def upload():
+        done['upload'] = ApplicationTLS().put(
+            url='/certificates/c',
+            sock_type='unix',
+            addr=f'{option.temp_dir}/control.unit.sock',
+            body=bundles['new'],
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(upload)
+
+            # The store child is in its first fsync(2) now.
+            time.sleep(1)
+
+            assert stored.read_bytes() == bundles['old'], 'store not done'
+
+            skip_fds_check(controller=True)
+            skip_alert(fr'process {controller[0]} exited on signal 9')
+            subprocess.call(['kill', '-9', controller[0]])
+
+            first.result(timeout=30)
+
+            # The store child is a fork of main, with the title of main.
+            for _ in range(100):
+                if not children('unit: main'):
+                    break
+                time.sleep(0.1)
+
+            assert not children('unit: main'), 'the store ended'
+
+            for _ in range(100):
+                new = children('unit: controller')
+                if new and new != controller:
+                    break
+                time.sleep(0.1)
+
+            assert new and new != controller, 'a new controller'
+
+    finally:
+        tracer.terminate()
+        tracer.wait(10)
+
+    assert done['upload'] == {}, 'the controller exited before it answered'
+    assert stored.read_bytes() == bundles['new'], 'the new bundle on disk'
+
+    # The new controller listens after the router applies its configuration.
+    assert (
+        client.conf_get('/certificates/c/chain/0/subject/common_name')
+        == 'new'
+    ), 'the controller lists the new certificate'
+
+    assert served() == der('new'), 'the router serves the new certificate'
+    assert client.get_ssl()['status'] == 200, 'the listener answers'
+
+
+def test_tls_certificate_update_long_name():
+    client.certificate('default', False)
+
+    with open(f'{option.temp_dir}/default.key', 'rb') as k, open(
+        f'{option.temp_dir}/default.crt', 'rb'
+    ) as c:
+        bundle = k.read() + c.read()
+
+    # The longest file name on most file systems.  The temporary file of
+    # main has a fixed name, so the store does not need a longer name.
+    name = 'a' * 255
+
+    for _ in range(2):
+        assert 'success' in client.conf(
+            bundle, f'/certificates/{name}'
+        ), 'stored'
+
+    assert 'chain' in client.conf_get(f'/certificates/{name}'), 'listed'
+
+    # One byte more cannot be a file name.  The controller refuses it before
+    # main sees it, so the answer is 400 and not 500.
+    assert (
+        client.conf(bundle, f'/certificates/{name}a').get('error')
+        == 'Invalid certificate name.'
+    ), 'name too long'
+
+    assert 'error' in client.conf_get(f'/certificates/{name}a'), 'not stored'
+
+
+def test_tls_certificate_fingerprint():
+    client.certificate()
+
+    # The same value that the OpenSSL command line prints, after the "=".
+    out = subprocess.check_output(
+        [
+            'openssl',
+            'x509',
+            '-noout',
+            '-fingerprint',
+            '-sha256',
+            '-in',
+            f'{option.temp_dir}/default.crt',
+        ]
+    )
+
+    expected = out.decode().split('=', 1)[1].strip()
+
+    assert len(expected) == 95, 'openssl fingerprint'
+
+    assert (
+        client.conf_get('/certificates/default/fingerprint') == expected
+    ), 'fingerprint'
+
+    assert (
+        client.conf_get('/certificates')['default']['fingerprint'] == expected
+    ), 'fingerprint listed'
+
+    # A new certificate under the same name gets a new fingerprint.
+    assert 'success' in replace_cert(), 'replaced'
+
+    assert (
+        client.conf_get('/certificates/default/fingerprint') != expected
+    ), 'fingerprint changed'
+
+
+def test_tls_certificate_update_sni():
+    client.load('empty')
+
+    client.certificate('default')
+    client.certificate('localhost')
+
+    add_tls(cert=['default', 'localhost'])
+
+    def peer_cert(host):
+        (resp, sock) = client.get_ssl(
+            headers={'Host': host, 'Connection': 'close'}, start=True
+        )
+
+        assert resp['status'] == 200, host
+        return sock.getpeercert(True)
+
+    default_old = peer_cert('default')
+    localhost_old = peer_cert('localhost')
+
+    assert default_old != localhost_old, 'sni selects the bundle'
+
+    # Replace one bundle of the array.  The other bundle does not change.
+    assert (
+        replace_cert('localhost').get('success')
+        == 'Certificate chain updated.'
+    ), 'replaced'
+
+    assert peer_cert('default') == default_old, 'other element untouched'
+    assert peer_cert('localhost') != localhost_old, 'element replaced'
+
+
+def test_tls_certificate_update_restart(requires_restart):
+    client.certificate()
+
+    # Use no application.  unit_run() expects a restarted instance to have
+    # no applications.
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {"pass": "routes", "tls": {"certificate": "default"}}
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    )
+
+    assert 'success' in replace_cert(), 'replaced'
+
+    cert_new = server_cert()
+
+    temp_dir_old = option.temp_dir
+    statedir = f'{temp_dir_old}/state'
+
+    # Main renamed the bundle into place.  No temporary file is left.
+    assert [
+        name for name in os.listdir(f'{statedir}/certs') if name[0] == '.'
+    ] == [], 'no temporary left'
+
+    unit_stop()
+
+    try:
+        # The fixture owns the new instance.  The fixture stops it, checks
+        # its log, and removes its temp dir.  This test removes the old one.
+        unit_run(state_dir=statedir)
+
+        assert cert_new == server_cert(), 'replaced bundle survives a restart'
+
+        assert 'chain' in client.conf_get('/certificates/default'), 'listed'
+
+    finally:
+        unit_stop()
+        shutil.rmtree(temp_dir_old, ignore_errors=True)
+
+
+def test_tls_certificate_too_large():
+    client.load('empty')
+
+    # The bundle is over the 1 MiB limit.  The controller refuses it, not main.
+    resp = client.put(
+        **client._get_args('/certificates/big', b'-' * (1024 * 1024 + 1))
+    )
+
+    assert resp['status'] == 413, resp['body']
+    assert 'too large' in resp['body'], 'too large message'
+
+    assert 'error' in client.conf_get('/certificates/big'), 'not stored'
 
 
 def test_tls_certificate_key_incorrect(skip_alert):
-    skip_alert(r'nxt_openssl_chain_file\(\) failed', r'failed to apply new conf')
+    skip_alert(r'certificate and private key do not match')
 
     client.load('empty')
 
     client.certificate('first', False)
     client.certificate('second', False)
 
-    # A structurally valid bundle (a private key + a certificate) is stored
-    # fine -- the cert store only checks PEM structure. The key/cert
-    # *mismatch* is caught later, when the router builds the listener's
-    # SSL_CTX (SSL_CTX_check_private_key), rather than being left to fail at
-    # the first handshake.
-    assert 'success' in client.certificate_load(
+    # The bundle is structurally valid (a private key + a certificate), but
+    # the key belongs to another certificate.  The store refuses it at
+    # upload, so a listener can never name it.
+    assert 'error' in client.certificate_load(
         'first', 'second'
-    ), 'mismatched bundle stored'
+    ), 'mismatched bundle refused'
 
-    # pass at the existing app so the mismatched cert is the only reason
-    # the listener config can be rejected.
-    assert 'error' in client.conf(
-        {"pass": "applications/empty", "tls": {"certificate": 'first'}},
-        'listeners/*:8080',
-    ), 'mismatched key/cert rejected at listener config'
+    assert 'error' in client.conf_get('/certificates/first'), 'not stored'
+
+
+def test_tls_certificate_dot_name():
+    client.load('empty')
+
+    client.certificate('default', False)
+
+    # Names starting with "." are reserved for the store's own files.
+    for name in ['.', '..', '.default', '.default.tmp']:
+        assert 'error' in client.conf(
+            b'', f'/certificates/{name}'
+        ), f'dot name {name}'
+
+    assert 'success' in client.certificate_load('default'), 'plain name'
 
 
 def test_tls_certificate_change():
@@ -218,13 +1022,11 @@ def test_tls_certificate_change():
 
     add_tls()
 
-    cert_old = ssl.get_server_certificate(('127.0.0.1', 8080))
+    cert_old = server_cert()
 
     add_tls(cert='new')
 
-    assert cert_old != ssl.get_server_certificate(
-        ('127.0.0.1', 8080)
-    ), 'change certificate'
+    assert cert_old != server_cert(), 'change certificate'
 
 
 def test_tls_certificate_key_rsa():
@@ -803,3 +1605,345 @@ def test_tls_certificate_cstring_nul():
 
     resp = conf_cert(["default\0junk"])
     assert 'null character' in resp.get('detail', ''), 'array nul'
+
+
+def test_tls_handshake_old_version_log_level(wait_for_record, findall):
+    client.certificate()
+
+    resp = client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {
+                        "certificate": "default",
+                        "conf_commands": {"MinProtocol": "TLSv1.2"},
+                    },
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    )
+
+    if 'built without' in resp.get('detail', ''):
+        pytest.skip('built without conf_commands support')
+
+    assert 'success' in resp, 'load application configuration'
+
+    # A TLS 1.0 ClientHello with no extensions, as scanners send.  The
+    # server refuses it with "unsupported protocol" (258) or "version too
+    # low" (396) on OpenSSL, and "wrong version number" (267) on LibreSSL.
+    # All are the peer's fault and are logged at info.
+    # MinProtocol makes the server refuse TLS 1.0 whatever the library or
+    # distribution default is.
+    ciphers = b'\x00\x2f\xc0\x13'
+    body = (
+        b'\x03\x01'
+        + os.urandom(32)
+        + b'\x00'
+        + len(ciphers).to_bytes(2, 'big')
+        + ciphers
+        + b'\x01\x00'
+    )
+    handshake = b'\x01' + len(body).to_bytes(3, 'big') + body
+    record = b'\x16\x03\x01' + len(handshake).to_bytes(2, 'big') + handshake
+
+    with socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout=5
+    ) as sock:
+        sock.sendall(record)
+        try:
+            sock.recv(1024)
+        except OSError:
+            pass
+
+    pattern = r'SSL_do_handshake.*(unsupported protocol|version too low|wrong version number)'
+
+    assert wait_for_record(rf'\[info\].*{pattern}') is not None
+    assert not findall(rf'\[alert\].*{pattern}')
+
+
+def test_tls_handshake_no_supported_groups_log_level(wait_for_record, findall):
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {"certificate": "default"},
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load application configuration'
+
+    # A TLS 1.3 ClientHello with a key share and no supported_groups
+    # extension, which RFC 8446 requires.  OpenSSL refuses it with
+    # "missing supported groups extension" (209): the client left the
+    # extension out, so the router logs it at info, not alert.
+    def ext(kind, data):
+        return kind.to_bytes(2, 'big') + len(data).to_bytes(2, 'big') + data
+
+    share = b'\x00\x1d' + (32).to_bytes(2, 'big') + os.urandom(32)
+    sigalgs = b'\x04\x03\x08\x04\x04\x01'
+    exts = (
+        ext(0x002B, b'\x02\x03\x04')  # supported_versions: TLS 1.3
+        + ext(0x000D, len(sigalgs).to_bytes(2, 'big') + sigalgs)
+        + ext(0x0033, len(share).to_bytes(2, 'big') + share)  # key_share
+    )
+    ciphers = b'\x13\x01\x13\x02'
+    body = (
+        b'\x03\x03'
+        + os.urandom(32)
+        + b'\x00'
+        + len(ciphers).to_bytes(2, 'big')
+        + ciphers
+        + b'\x01\x00'
+        + len(exts).to_bytes(2, 'big')
+        + exts
+    )
+    handshake = b'\x01' + len(body).to_bytes(3, 'big') + body
+    record = b'\x16\x03\x01' + len(handshake).to_bytes(2, 'big') + handshake
+
+    with socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout=5
+    ) as sock:
+        sock.sendall(record)
+        try:
+            sock.recv(1024)
+        except OSError:
+            pass
+
+    pattern = r'SSL_do_handshake.*missing supported groups extension'
+
+    # LibreSSL has no reason 209 and refuses the hello for another reason.
+    assert wait_for_record(r'SSL_do_handshake') is not None
+    if not findall(pattern):
+        pytest.skip('the TLS library has no "missing supported groups"')
+
+    assert findall(rf'\[info\].*{pattern}')
+    assert not findall(rf'\[alert\].*{pattern}')
+
+
+def test_tls_handshake_bad_binder_log_level(temp_dir, wait_for_record, findall):
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {
+                        "certificate": "default",
+                        "session": {"cache_size": 10, "tickets": True},
+                    },
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load application configuration'
+
+    # A TLS 1.3 resumption whose binder does not verify.  The client saves
+    # a session, one byte of its resumption secret is changed, and the
+    # client resumes with it.  The server refuses the binder (253): the
+    # client sent it, so the router logs it at info, not alert.
+    connect = f'127.0.0.1:{port_map.port(8080)}'
+    good = f'{temp_dir}/session.pem'
+    bad = f'{temp_dir}/session-bad.pem'
+
+    def s_client(*args):
+        return subprocess.run(
+            ['openssl', 's_client', '-connect', connect, '-tls1_3', '-ign_eof']
+            + list(args),
+            input=b'GET / HTTP/1.0\r\n\r\n',
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+    s_client('-sess_out', good)
+
+    text = subprocess.check_output(
+        ['openssl', 'sess_id', '-in', good, '-text', '-noout']
+    ).decode()
+    # LibreSSL labels the field "Master-Key" and does not resume TLS 1.3
+    # sessions with a PSK, so there is no binder to refuse.
+    m = re.search(r'Resumption PSK: ([0-9A-F]+)', text)
+    if m is None:
+        pytest.skip('the TLS library offers no TLS 1.3 resumption PSK')
+
+    psk = bytes.fromhex(m.group(1))
+
+    der = subprocess.check_output(
+        ['openssl', 'sess_id', '-in', good, '-outform', 'DER']
+    )
+    i = der.find(psk)
+    assert i > 0, 'resumption secret in the session'
+
+    der = der[:i] + bytes([der[i] ^ 1]) + der[i + 1 :]
+    subprocess.run(
+        ['openssl', 'sess_id', '-inform', 'DER', '-out', bad],
+        input=der,
+        check=True,
+    )
+
+    s_client('-sess_in', bad)
+
+    pattern = r'SSL_do_handshake.*binder does not verify'
+
+    assert wait_for_record(rf'\[info\].*{pattern}') is not None
+    assert not findall(rf'\[alert\].*{pattern}')
+
+
+def tls_alert_in_handshake(alert):
+    # Stop the server in SSL_do_handshake() with a fatal alert from the
+    # client.  The alert goes before ChangeCipherSpec, so it is a plaintext
+    # record and needs no TLS stack on the client.  The server turns alert N
+    # into reason SSL_AD_REASON_OFFSET + N (1000 + N).
+
+    client.certificate()
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {
+                "*:8080": {
+                    "pass": "routes",
+                    "tls": {"certificate": "default"},
+                }
+            },
+            "routes": [{"action": {"return": 200}}],
+            "applications": {},
+        }
+    ), 'load configuration'
+
+    def ext(ext_type, data):
+        length = len(data).to_bytes(2, 'big')
+        return ext_type.to_bytes(2, 'big') + length + data
+
+    # A TLS 1.2 ClientHello: no supported_versions extension, ECDHE and
+    # RSA key exchange suites for the RSA default certificate.
+    ciphers = b'\xc0\x2f\xc0\x13\x00\x9c\x00\x2f'
+    extensions = (
+        ext(0x000A, b'\x00\x04\x00\x1d\x00\x17')  # x25519, secp256r1
+        + ext(0x000B, b'\x01\x00')  # uncompressed points
+        + ext(0x000D, b'\x00\x04\x08\x04\x04\x01')  # rsa_pss, rsa_pkcs1
+    )
+    body = (
+        b'\x03\x03'
+        + os.urandom(32)
+        + b'\x00'
+        + len(ciphers).to_bytes(2, 'big')
+        + ciphers
+        + b'\x01\x00'
+        + len(extensions).to_bytes(2, 'big')
+        + extensions
+    )
+    hello = b'\x01' + len(body).to_bytes(3, 'big') + body
+    record = b'\x16\x03\x01' + len(hello).to_bytes(2, 'big') + hello
+
+    def recv_exact(sock, n):
+        data = b''
+
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            assert chunk, 'connection closed in the first flight'
+            data += chunk
+
+        return data
+
+    with socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout=5
+    ) as sock:
+        sock.sendall(record)
+
+        # Read the first flight up to ServerHelloDone, so that the server
+        # waits for the next client flight when the alert comes.
+        handshake = b''
+        done = False
+
+        while not done:
+            rtype, _, length = struct.unpack('!BHH', recv_exact(sock, 5))
+            payload = recv_exact(sock, length)
+
+            assert rtype == 0x16, f'record type {rtype} in the first flight'
+
+            handshake += payload
+
+            while len(handshake) >= 4:
+                mlen = int.from_bytes(handshake[1:4], 'big')
+
+                if len(handshake) < 4 + mlen:
+                    break
+
+                done = done or handshake[0] == 14  # ServerHelloDone
+                handshake = handshake[4 + mlen :]
+
+        sock.sendall(b'\x15\x03\x03\x00\x02\x02' + bytes([alert]))
+
+        try:
+            while sock.recv(1024):
+                pass
+        except OSError:
+            pass
+
+
+@pytest.mark.parametrize(
+    'alert, text',
+    [
+        (10, 'unexpected message'),
+        (20, 'bad record mac'),
+        (21, 'decryption failed'),
+        (22, 'record overflow'),
+        (30, 'decompression failure'),
+        (40, 'handshake failure'),
+        (47, 'illegal parameter'),
+        (110, 'unsupported extension'),
+        (112, 'unrecognized name'),
+    ],
+)
+def test_tls_handshake_alert_info_log_level(
+    alert, text, findall, wait_for_record
+):
+    # nxt_openssl_log_error_level() logs an alert from the peer at info in
+    # two ways.  Alerts 10, 20, 21, 22, 30, 40 and 47 (reasons 1010 to 1047)
+    # are in the explicit info list.  unsupported_extension (110) and
+    # unrecognized_name (112), reasons 1110 and 1112, are in no list: an
+    # alert in the 1000..1255 range that is not listed is the peer's
+    # decision and reaches info through the range default.
+    tls_alert_in_handshake(alert)
+
+    pattern = (
+        rf'SSL_do_handshake\(\d+\) failed \({1000 + alert}: [^)]*{text}\)'
+    )
+
+    assert wait_for_record(rf'\[info\].*{pattern}') is not None, 'info'
+    assert not findall(rf'\[alert\].*{pattern}'), 'no alert'
+
+
+# The alerts listed at err in nxt_openssl_log_error_level(): the
+# certificate alerts (bad_certificate is 42) and the others that point at
+# the server's setup.  None of them may fall into the info default of the
+# alert range.
+#
+# The source guards 1111, 1113 and 1114 with #ifdef.  On a library that
+# does not define SSL_R_TLSV1_CERTIFICATE_UNOBTAINABLE,
+# SSL_R_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE or
+# SSL_R_TLSV1_BAD_CERTIFICATE_HASH_VALUE, that reason reaches the range
+# default and logs at info, so the 111, 113 or 114 case fails there
+# although the code is correct.
+@pytest.mark.parametrize(
+    'alert',
+    [41, 42, 43, 44, 45, 46, 48, 49, 50, 51, 60, 70, 71, 80, 90, 100]
+    + [111, 113, 114],
+)
+def test_tls_handshake_alert_err_log_level(alert, findall, wait_for_record):
+    tls_alert_in_handshake(alert)
+
+    pattern = rf'SSL_do_handshake\(\d+\) failed \({1000 + alert}: '
+
+    assert wait_for_record(rf'\[error\].*{pattern}') is not None, 'error'
+    assert not findall(rf'\[info\].*{pattern}'), 'no info'
