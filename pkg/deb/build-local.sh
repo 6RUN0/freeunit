@@ -64,7 +64,7 @@
 #   SURY_MIRROR         replacement base for packages.sury.org (php8.3/8.5).
 #   RUSTUP_DIST_SERVER  rustup toolchain dist server (default static.rust-lang.org).
 #   RUSTUP_UPDATE_ROOT  rustup self-update root.
-#   RUSTUP_INIT_URL     rustup installer URL (default https://sh.rustup.rs).
+#   RUSTUP_INIT_URL     rustup installer URL (default https://static.rust-lang.org/rustup/rustup-init.sh).
 #   CARGO_MIRROR        crates.io registry replacement (e.g. sparse+https://host/index/).
 #   Plus BRAND / RUNTIME (package identity) and RUST_TOOLCHAIN / RUSTUP_INIT_SHA256.
 #   PKG_VERSION        override the .deb package version outright; by default a
@@ -125,7 +125,7 @@ RUNDIR="${RUNDIR:-/var/run}"
 # reproducibility: the merged 1.35.6 otel stack needs rustc >= 1.88 while Debian
 # trixie ships 1.85, so rustup installs this exact version. 1.88.0 is the stated
 # floor; bump deliberately when a dependency needs newer. Set RUSTUP_INIT_SHA256
-# to the known-good sha256 of sh.rustup.rs to verify the installer before it runs
+# to the known-good sha256 of rustup-init.sh to verify it before it runs
 # (empty = skip verification).
 RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-1.88.0}"
 RUSTUP_INIT_SHA256="${RUSTUP_INIT_SHA256:-}"
@@ -141,7 +141,7 @@ DEB_MIRROR="${DEB_MIRROR:-}"
 SURY_MIRROR="${SURY_MIRROR:-}"
 RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER:-}"
 RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-}"
-RUSTUP_INIT_URL="${RUSTUP_INIT_URL:-https://sh.rustup.rs}"
+RUSTUP_INIT_URL="${RUSTUP_INIT_URL:-https://static.rust-lang.org/rustup/rustup-init.sh}"
 CARGO_MIRROR="${CARGO_MIRROR:-}"
 
 # PHP versions packaged here. php8.4 ships in the Debian trixie base archive;
@@ -454,7 +454,7 @@ fi
 # from silently downgrading the transport.
 rustup_init="$(mktemp)"
 trap 'rm -f "$rustup_init"' EXIT
-rustup_url="${RUSTUP_INIT_URL:-https://sh.rustup.rs}"
+rustup_url="${RUSTUP_INIT_URL:-https://static.rust-lang.org/rustup/rustup-init.sh}"
 case "$rustup_url" in
     https://*)
         curl --proto '=https' --proto-redir '=https' -fsSL "$rustup_url" -o "$rustup_init"
