@@ -5,7 +5,6 @@
 !/.gitattributes
 !/.github/
 !/.mailmap
-!/.mcp.json
 !/.rustfmt.toml
 !/CHANGES
 !/CLAUDE.md
