@@ -116,6 +116,7 @@ nxt_int_t nxt_main_store_test(nxt_thread_t *thr);
 nxt_int_t nxt_proto_creating_wedge_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_whoami_test(nxt_thread_t *thr);
 nxt_int_t nxt_main_remove_child_pid_test(nxt_thread_t *thr);
+nxt_int_t nxt_main_port_gate_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_change_file_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_ctrunc_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_fd_test(nxt_thread_t *thr);
@@ -123,6 +124,7 @@ nxt_int_t nxt_port_rpc_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_queued_fd_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_doorbell_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_share_test(nxt_thread_t *thr);
+nxt_int_t nxt_cloexec_test(nxt_thread_t *thr);
 nxt_int_t nxt_checked_test(nxt_thread_t *thr);
 nxt_int_t nxt_conn_close_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_response_parse_test(nxt_thread_t *thr);
@@ -133,6 +135,7 @@ nxt_int_t nxt_nncq_bound_test(nxt_thread_t *thr);
 nxt_int_t nxt_nncq_wrap_test(nxt_thread_t *thr);
 nxt_int_t nxt_app_queue_test(nxt_thread_t *thr);
 nxt_int_t nxt_size_bound_test(nxt_thread_t *thr);
+nxt_int_t nxt_casecmp_test(nxt_thread_t *thr);
 #if (NXT_HAVE_REGEX)
 nxt_int_t nxt_regex_test(nxt_thread_t *thr);
 #endif
@@ -142,6 +145,7 @@ nxt_int_t nxt_usdt_test(nxt_thread_t *thr);
 nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
 nxt_int_t nxt_controller_peer_test(nxt_thread_t *thr);
 nxt_int_t nxt_cpu_limit_test(nxt_thread_t *thr);
+nxt_int_t nxt_process_nofile_test(nxt_thread_t *thr);
 nxt_int_t nxt_clone_creds_test(nxt_thread_t *thr);
 #if (NXT_HAVE_ISOLATION_ROOTFS)
 nxt_int_t nxt_isolation_mount_dst_test(nxt_thread_t *thr);

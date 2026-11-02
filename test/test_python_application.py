@@ -49,7 +49,7 @@ custom-header: BLAH
 
     date = headers.pop('Date')
     assert date[-4:] == ' GMT', 'date header timezone'
-    assert abs(date_to_sec_epoch(date) - sec_epoch) < 5, 'date header'
+    assert abs(date_to_sec_epoch(date) - sec_epoch()) < 5, 'date header'
 
     assert headers == {
         'Connection': 'close',
@@ -106,6 +106,27 @@ a""".encode(),
         raw=True,
     )
     assert resp['headers']['Request-Uri'] == '/bar', 'REQUEST_URI unchanged'
+
+
+def test_python_application_header_dup():
+    client.load('header_dup')
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Cookie': ['a=1', 'b=2'],
+            'X-Dup': ['1', '2'],
+            'Content-Type': ['text/plain', 'text/html'],
+            'Connection': 'close',
+        }
+    )
+
+    assert resp['status'] == 200, 'status'
+    headers = resp['headers']
+    assert headers['X-Cookie'] == 'a=1; b=2', 'Cookie lines joined with "; "'
+    assert headers['X-Dup'] == '1, 2', 'other lines joined with ", "'
+    assert headers['X-Http-Content-Type'] == 'text/plain, text/html'
+    assert headers['X-Content-Type'] == 'text/plain, text/html', 'CONTENT_TYPE'
 
 
 def test_python_application_query_string():
