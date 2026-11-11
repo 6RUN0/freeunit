@@ -328,7 +328,7 @@ ENTRYPOINT ["bash", "-c", "\
         --tests \
         --modulesdir=/usr/lib/unit/debug-modules \
         --debug && \
-    make -j $NCPU unitd && \
+    make -j $NCPU unitd build/unit_app_test && \
     ./configure python --config=/usr/local/bin/python3-config && \
     printf 'NXT_INCS += -I%s/pkg/contrib/njs/src -I%s/pkg/contrib/njs/build\\n' \
         $(pwd) $(pwd) >> build/Makefile && \
