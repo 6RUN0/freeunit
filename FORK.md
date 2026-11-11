@@ -110,10 +110,13 @@ TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
 BASE="https://github.com/$REPO/releases/download/$TAG"
 
 curl -fLO "$BASE/SHA256SUMS"
-# The .deb asset names embed the package version; read it from SHA256SUMS:
+# SHA256SUMS lists the files under the package version; the asset URLs carry
+# the same version with GitHub's '.' for '~':
 DEB=$(sed -nE 's/^[0-9a-f]+  freeunit_(.+)_amd64\.deb$/\1/p' SHA256SUMS)
-curl -fLO "$BASE/freeunit_${DEB}_amd64.deb"
-curl -fLO "$BASE/freeunit-${MOD}_${DEB}_amd64.deb"
+ASSET=$(printf '%s\n' "$DEB" | tr '~' '.')
+curl -fL -o "freeunit_${DEB}_amd64.deb" "$BASE/freeunit_${ASSET}_amd64.deb"
+curl -fL -o "freeunit-${MOD}_${DEB}_amd64.deb" \
+  "$BASE/freeunit-${MOD}_${ASSET}_amd64.deb"
 
 sha256sum -c --ignore-missing SHA256SUMS
 sudo apt-get install -y \
@@ -123,7 +126,9 @@ sudo apt-get install -y \
 `sha256sum -c --ignore-missing` checks only the files you downloaded and
 fails if any digest does not match; it covers integrity, not authenticity.
 The asset file names use `X.Y.Z-1.trixie` while the installed package version
-is `X.Y.Z-1~trixie` (GitHub renders `~` as `.` in asset names). Optional
+is `X.Y.Z-1~trixie` (GitHub renders `~` as `.` in asset names). The snippet
+saves each download under the name `SHA256SUMS` lists, so it works with
+releases whose `SHA256SUMS` carries either form. Optional
 `-dbg` and `-dev` packages are attached to the same release.
 
 ### Run and verify

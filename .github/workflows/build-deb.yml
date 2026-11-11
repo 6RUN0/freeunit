@@ -752,21 +752,21 @@ jobs:
           PKG_VERSION="$(pkg_version .)"
           echo "snapshot tag/version: ${PKG_VERSION}"
           echo "tag=${PKG_VERSION}" >> "$GITHUB_OUTPUT"
-          # As in the release job, SHA256SUMS must list the PUBLISHED asset
-          # names: on upload GitHub renames '~' to '.' but keeps '+' as is
-          # (verified empirically on the first snapshot prerelease,
-          # 2026-07-27), so of the X.Y.Z+git...-1~trixie version only the
-          # suite separator changes. The digests are hex, so the sed can
-          # only touch the file names.
-          ( cd debs && sha256sum -- *.deb | sed 's/~/./g' > SHA256SUMS )
+          # Same scheme as the release job: SHA256SUMS lists the .deb files
+          # under the package version DEB (X.Y.Z+git...-1~trixie). On upload
+          # GitHub renames '~' to '.' but keeps '+' as is (verified on the
+          # first snapshot prerelease, 2026-07-27), so the asset URLs use
+          # ASSET, and the notes download each ASSET URL to the DEB file name.
+          ( cd debs && sha256sum -- *.deb > SHA256SUMS )
           core=(debs/"${BRAND}"_*_amd64.deb)
           DEB="$(basename "${core[0]}" \
             | sed -E "s#^${BRAND}_(.+)_amd64\.deb\$#\1#")"
-          DEB="${DEB//\~/.}"
+          ASSET="$(printf '%s\n' "$DEB" | tr '~' '.')"
           # '#' as the sed delimiter: @TAG@ never contains one, and @BRANCH@
           # (a branch name, which may carry '/') must not terminate the
           # expression early.
           sed -e "s#@TAG@#${PKG_VERSION}#g" -e "s#@DEB@#${DEB}#g" \
+              -e "s#@ASSET@#${ASSET}#g" \
               -e "s#@BRAND@#${BRAND}#g" -e "s#@BRANCH@#${GITHUB_REF_NAME}#g" \
               -e "s#@SHA@#${GITHUB_SHA}#g" \
             > SNAPSHOT_NOTES.md <<'NOTES'
@@ -783,13 +783,15 @@ jobs:
           see step 1 of any stable release's notes.
 
           ```bash
-          DEB=@DEB@                 # version inside the asset file names
+          DEB=@DEB@                 # package version, as listed in SHA256SUMS
+          ASSET=@ASSET@             # the same version in the asset URLs (GitHub renames ~ to .)
           MOD=php8.4                # php8.3 | php8.4 | php8.5 | python3.13
           BASE="https://github.com/${{ github.repository }}/releases/download/@TAG@"
 
           curl -fLO "$BASE/SHA256SUMS"
-          curl -fLO "$BASE/@BRAND@_${DEB}_amd64.deb"
-          curl -fLO "$BASE/@BRAND@-${MOD}_${DEB}_amd64.deb"
+          curl -fL -o "@BRAND@_${DEB}_amd64.deb" "$BASE/@BRAND@_${ASSET}_amd64.deb"
+          curl -fL -o "@BRAND@-${MOD}_${DEB}_amd64.deb" \
+            "$BASE/@BRAND@-${MOD}_${ASSET}_amd64.deb"
 
           sha256sum -c --ignore-missing SHA256SUMS
           sudo apt-get install -y \
