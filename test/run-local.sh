@@ -267,7 +267,8 @@ RUN set -ex \
     && apt-get install --no-install-recommends --no-install-suggests -y \
          ca-certificates git build-essential libssl-dev openssl libpcre2-dev \
          zlib1g-dev libzstd-dev libbrotli-dev curl wget pkg-config pkgconf \
-         libclang-dev cmake python3-pytest python3-openssl sudo procps \
+         libclang-dev cmake python3-pytest python3-openssl python3-zstandard \
+         python3-brotli sudo procps \
     && export RUST_VERSION=1.95.0 \
     && export RUSTUP_HOME=/usr/src/unit/rustup \
     && export CARGO_HOME=/usr/src/unit/cargo \
